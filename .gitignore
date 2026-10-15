@@ -33,3 +33,9 @@ logs/
 
 # Render
 .render/
+
+# Google OAuth Secrets
+credentials.json
+token.json
+client_secret*.json
+*.token
