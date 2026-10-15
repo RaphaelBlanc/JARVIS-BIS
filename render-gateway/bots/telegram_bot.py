@@ -183,14 +183,30 @@ def track_chat_message(chat_id: int, message_id: int) -> None:
     _TRACKED_CHAT_MESSAGES[chat_id].append(message_id)
 
 
-async def clear_telegram_chat(bot, chat_id: int) -> None:
-    """Efface les messages précédents enregistrés dans la conversation."""
-    msg_ids = _TRACKED_CHAT_MESSAGES.pop(chat_id, [])
-    for mid in msg_ids:
+async def clear_telegram_chat(bot, chat_id: int, current_message_id: Optional[int] = None) -> None:
+    """Efface les messages précédents enregistrés et récents dans la conversation."""
+    tracked = _TRACKED_CHAT_MESSAGES.pop(chat_id, [])
+    ids_to_delete = set(tracked)
+
+    if current_message_id:
+        for mid in range(max(1, current_message_id - 200), current_message_id + 1):
+            ids_to_delete.add(mid)
+
+    if not ids_to_delete:
+        return
+
+    sorted_ids = sorted(list(ids_to_delete), reverse=True)
+
+    for i in range(0, len(sorted_ids), 100):
+        batch = sorted_ids[i:i + 100]
         try:
-            await bot.delete_message(chat_id=chat_id, message_id=mid)
+            await bot.delete_messages(chat_id=chat_id, message_ids=batch)
         except Exception:
-            pass
+            for mid in batch:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=mid)
+                except Exception:
+                    pass
 
 
 async def replay_telegram_history(bot, chat_id: int, history: list[dict]) -> None:
@@ -536,13 +552,10 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     elif data.startswith("resume:"):
         cid = data.split(":", 1)[1]
         chat_id = query.message.chat_id
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
+        mid = query.message.message_id
 
-        # 1. Efface les messages précédents
-        await clear_telegram_chat(context.bot, chat_id)
+        # 1. Efface tous les messages précédents (y compris le menu resume)
+        await clear_telegram_chat(context.bot, chat_id, current_message_id=mid)
 
         # 2. Nouvelle conversation
         if cid == "new":
@@ -633,7 +646,7 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     args = context.args
     if args:
         cid = args[0].strip()
-        await clear_telegram_chat(context.bot, chat_id)
+        await clear_telegram_chat(context.bot, chat_id, current_message_id=update.message.message_id)
 
         if cid.lower() in ("new", "nouvelle", "reset"):
             await reset_session_remote()
@@ -940,9 +953,10 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     chat_id = update.effective_chat.id
-    track_chat_message(chat_id, update.message.message_id)
+    current_mid = update.message.message_id
+    track_chat_message(chat_id, current_mid)
     await reset_session_remote()
-    await clear_telegram_chat(context.bot, chat_id)
+    await clear_telegram_chat(context.bot, chat_id, current_message_id=current_mid)
     # Affiche rien si c'est une nouvelle !
 
 
