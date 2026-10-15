@@ -121,9 +121,12 @@ def list_recent_conversations(limit: int = 8) -> list[dict]:
     if not brain_dir.exists():
         return []
 
+    # Ignore la session de développement en cours
+    excluded_ids = {"0e02609b-e140-4ca5-a760-247d880dfa5c"}
+
     conversations = []
     for item in brain_dir.iterdir():
-        if not item.is_dir():
+        if not item.is_dir() or item.name in excluded_ids:
             continue
         transcript_file = item / ".system_generated" / "logs" / "transcript.jsonl"
         if not transcript_file.exists():
@@ -133,18 +136,25 @@ def list_recent_conversations(limit: int = 8) -> list[dict]:
             mtime = transcript_file.stat().st_mtime
             date_str = datetime.datetime.fromtimestamp(mtime).strftime("%d/%m %H:%M")
             title = "Discussion sans titre"
+            first_user_text = ""
             with open(transcript_file, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
                         obj = json.loads(line)
                         if obj.get("type") == "USER_INPUT":
                             raw = obj.get("content", "")
+                            if "<CONTEXT_SUMMARY>" in raw:
+                                continue
                             m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", raw, re.DOTALL)
                             req = m.group(1).strip() if m else raw.strip()
                             title = req.replace("\n", " ")[:50].strip()
+                            first_user_text = title
                             break
                     except Exception:
                         pass
+
+            if not first_user_text or "CONTEXT_SUMMARY" in first_user_text:
+                continue
 
             conversations.append({
                 "id": item.name,
@@ -194,16 +204,18 @@ async def run_agy(
 
     if reset_session_flag:
         SESSION_CONFIG["has_active_session"] = False
+        SESSION_CONFIG["conversation_id"] = None
 
     # Construction des arguments agy
     cmd = [agy_path]
 
-    # Reprise de conversation ciblée (--conversation) ou continue (-c)
-    target_conv = SESSION_CONFIG.get("conversation_id")
-    if target_conv and not reset_session_flag:
-        cmd.extend(["--conversation", target_conv])
-    elif continue_session and SESSION_CONFIG["has_active_session"] and not reset_session_flag:
-        cmd.append("-c")
+    # Reprise de conversation ciblée (--conversation) ou continue (-c) UNIQUEMENT si continue_session est True
+    if continue_session and not reset_session_flag:
+        target_conv = SESSION_CONFIG.get("conversation_id")
+        if target_conv:
+            cmd.extend(["--conversation", target_conv])
+        elif SESSION_CONFIG.get("has_active_session"):
+            cmd.append("-c")
 
 
     # Modèle

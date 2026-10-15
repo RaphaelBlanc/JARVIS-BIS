@@ -145,15 +145,24 @@ def _get_bot() -> AssistantBot:
 
 
 BRIEFING_PROMPT = (
-    "Effectue mon briefing matinal complet et synthétique :\n"
-    "1. ✉️ Consulte mes e-mails récents reçus depuis hier via Gmail. "
+    "Effectue mon briefing matinal complet, motivant et structuré :\n"
+    "1. 📅 EMPLOI DU TEMPS DU JOUR (Heure / Cours / Salles) :\n"
+    "Consulte mon Google Agenda pour aujourd'hui (en vérifiant bien tous mes calendriers, y compris mon calendrier de cours EPITA/PREPA). "
+    "Présente mon planning de la journée sous forme de liste claire avec les horaires, l'intitulé du cours et la salle exacte :\n"
+    "• Heure début - Heure fin : [Matière / Intitulé] (📍 Salle [numéro])\n"
+    "S'il n'y a aucun cours aujourd'hui, mentionne-le clairement.\n\n"
+    "2. 📈 ACTUALITÉS ÉCONOMIQUES DE LA VEILLE :\n"
+    "Recherche les actualités économiques et financières marquantes de la veille (marchés boursiers, macroéconomie, tech & business) et résume les 2 ou 3 points essentiels.\n\n"
+    "3. ✉️ E-MAILS IMPORTANTS :\n"
+    "Consulte mes e-mails récents reçus depuis hier via Gmail. "
     "IMPORTANT : Filtre et ignore TOTALEMENT toutes les publicités, spams, newsletters commerciales et promotions. "
     "Ne retiens que les messages importants (personnels, professionnels, école/EPITA, cours/examens, démarches). "
-    "Pour chaque e-mail important retenu, résume en 1 ou 2 phrases l'essentiel et l'action requise.\n"
-    "2. 📅 Consulte mon Google Agenda pour la journée d'aujourd'hui et demain matin, et liste mes rendez-vous avec leurs horaires.\n"
-    "3. 🌤️ Consulte la météo du jour pour ma ville (température, ciel, pluie éventuelle).\n"
-    "4. 📋 Consulte mes tâches Google Tasks en cours.\n"
-    "Présente le résultat avec un ton motivant, clair et structuré avec des émojis."
+    "Pour chaque e-mail important retenu, résume en 1 ou 2 phrases l'essentiel et l'action requise.\n\n"
+    "4. 🌤️ MÉTÉO DU JOUR :\n"
+    "Consulte la météo du jour pour ma ville (température, ciel, ressenti, pluie éventuelle).\n\n"
+    "5. 📋 TÂCHES EN COURS :\n"
+    "Consulte mes tâches Google Tasks en cours non terminées si disponibles.\n\n"
+    "Présente le résultat avec un ton motivant, structuré et dynamique avec des émojis."
 )
 
 
@@ -268,8 +277,11 @@ async def agenda_slash(interaction: discord.Interaction, periode: app_commands.C
         "leur titre, lieu éventuel et détails pertinents. "
         "S'il n'y a aucun événement, confirme-le clairement."
     )
-    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-    out = res.get("output", "").strip() or "⚠️ Impossible de récupérer l'agenda."
+    res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+    if not res.get("success"):
+        out = f"❌ Erreur agenda : {res.get('error', 'Le serveur maison n\'a pas répondu.')}"
+    else:
+        out = res.get("output", "").strip() or "📅 Aucun événement trouvé pour cette période."
     await send_discord_long_response(interaction, out)
 
 
@@ -297,7 +309,7 @@ async def tasks_slash(
 
     if act == "lister":
         prompt = (
-            "Consulte Google Tasks via le MCP google-tasks. "
+            "Consulte Google Tasks. "
             "Liste toutes les tâches en cours non terminées avec leur statut et date d'échéance éventuelle. "
             "S'il n'y en a aucune, indique-le clairement."
         )
@@ -314,28 +326,34 @@ async def tasks_slash(
     else:
         prompt = f"Gère Google Tasks pour : {act} {titre or ''}"
 
-    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-    out = res.get("output", "").strip() or "✅ Demande exécutée."
+    res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+    if not res.get("success"):
+        out = f"❌ Erreur tâches : {res.get('error', 'Le serveur maison n\'a pas répondu.')}"
+    else:
+        out = res.get("output", "").strip() or "✅ Demande exécutée."
     await send_discord_long_response(interaction, out)
 
 
 @app_commands.command(name="meteo", description="Consulter la météo mondiale en temps réel")
-@app_commands.describe(ville="Ville ou commune (ex: Paris, Lyon, Tokyo, New York)")
+@app_commands.describe(ville="Ville ou commune (ex: Paris, Lyon, Toulouse, Tokyo)")
 async def meteo_slash(interaction: discord.Interaction, ville: str = "Paris") -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
     await interaction.response.defer()
     prompt = (
-        f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}' via le MCP weather. "
+        f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}'. "
         "Donne la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté."
     )
-    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-    out = res.get("output", "").strip() or "⚠️ Impossible de récupérer la météo."
+    res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+    if not res.get("success"):
+        out = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu.')}"
+    else:
+        out = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
     await send_discord_long_response(interaction, out)
 
 
-@app_commands.command(name="search", description="Effectuer une recherche web via DuckDuckGo")
+@app_commands.command(name="search", description="Effectuer une recherche web")
 @app_commands.describe(requete="Votre recherche sur le web")
 async def search_slash(interaction: discord.Interaction, requete: str) -> None:
     if not _is_allowed(interaction.user.id):
@@ -343,11 +361,14 @@ async def search_slash(interaction: discord.Interaction, requete: str) -> None:
         return
     await interaction.response.defer()
     prompt = (
-        f"Effectue une recherche web avec le MCP duckduckgo_web_search pour la requête suivante : '{requete}'. "
-        "Synthétise les informations les plus récentes et pertinentes en citant les sources avec leurs liens."
+        f"Recherche sur le web des informations récentes et fiables sur la requête suivante : '{requete}'. "
+        "Synthétise les éléments clés de façon claire et cite les sources si pertinent."
     )
-    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-    out = res.get("output", "").strip() or "⚠️ Aucun résultat trouvé."
+    res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+    if not res.get("success"):
+        out = f"❌ Erreur recherche : {res.get('error', 'Le serveur maison n\'a pas répondu.')}"
+    else:
+        out = res.get("output", "").strip() or "⚠️ Aucun résultat trouvé."
     await send_discord_long_response(interaction, out)
 
 
@@ -359,11 +380,13 @@ async def summarize_slash(interaction: discord.Interaction, url: str) -> None:
         return
     await interaction.response.defer()
     prompt = (
-        f"Récupère le contenu de l'URL '{url}' via le MCP fetch (fetch_readable ou fetch_markdown). "
-        "Résume les points clés de manière synthétique et structurée avec des puces."
+        f"Récupère le contenu de l'URL '{url}' et résume les points clés de manière synthétique et structurée avec des puces."
     )
-    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-    out = res.get("output", "").strip() or "⚠️ Impossible de résumer la page."
+    res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+    if not res.get("success"):
+        out = f"❌ Erreur résumé : {res.get('error', 'Le serveur maison n\'a pas répondu.')}"
+    else:
+        out = res.get("output", "").strip() or "⚠️ Impossible de résumer la page."
     await send_discord_long_response(interaction, out)
 
 
@@ -723,8 +746,11 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             "leur titre, lieu éventuel et détails pertinents. "
             "S'il n'y a aucun événement, confirme-le clairement."
         )
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        out = res.get("output", "").strip() or "⚠️ Impossible de récupérer l'agenda."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            out = f"❌ Erreur agenda : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            out = res.get("output", "").strip() or "📅 Aucun événement trouvé pour cette période."
         if len(out) > 2000:
             out = out[:1990] + "..."
         await waiting.edit(content=out)
@@ -736,7 +762,7 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         act = action.lower()
         if act in ("list", "lister", "ls"):
             prompt = (
-                "Consulte Google Tasks via le MCP google-tasks. "
+                "Consulte Google Tasks. "
                 "Liste toutes les tâches en cours non terminées avec leur statut et date d'échéance éventuelle. "
                 "S'il n'y en a aucune, indique-le clairement."
             )
@@ -754,8 +780,11 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             prompt = f"Gère Google Tasks pour : {action} {details}"
 
         waiting = await ctx.send("⏳ Traitement Google Tasks...")
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        out = res.get("output", "").strip() or "✅ Tâche effectuée."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            out = f"❌ Erreur tâches : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            out = res.get("output", "").strip() or "✅ Tâche effectuée."
         if len(out) > 2000:
             out = out[:1990] + "..."
         await waiting.edit(content=out)
@@ -766,16 +795,19 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             return
         waiting = await ctx.send(f"⏳ Consultation météo pour {ville}...")
         prompt = (
-            f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}' via le MCP weather. "
+            f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}'. "
             "Donne la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté."
         )
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        out = res.get("output", "").strip() or "⚠️ Impossible de récupérer la météo."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            out = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            out = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
         if len(out) > 2000:
             out = out[:1990] + "..."
         await waiting.edit(content=out)
 
-    @bot.command(name="search", aliases=["recherche"], help="Recherche web DuckDuckGo. Ex: !search intelligence artificielle")
+    @bot.command(name="search", aliases=["recherche"], help="Recherche web. Ex: !search intelligence artificielle")
     async def search_cmd(ctx: commands.Context, *, requete: str = "") -> None:
         if not _is_allowed(ctx.author.id):
             return
@@ -784,11 +816,14 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             return
         waiting = await ctx.send(f"🔍 Recherche pour '{requete}'...")
         prompt = (
-            f"Effectue une recherche web avec le MCP duckduckgo_web_search pour la requête suivante : '{requete}'. "
-            "Synthétise les informations les plus récentes et pertinentes en citant les sources avec leurs liens."
+            f"Recherche sur le web des informations récentes et fiables sur la requête suivante : '{requete}'. "
+            "Synthétise les éléments clés de façon claire et cite les sources si pertinent."
         )
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        out = res.get("output", "").strip() or "⚠️ Aucun résultat."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            out = f"❌ Erreur recherche : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            out = res.get("output", "").strip() or "⚠️ Aucun résultat."
         if len(out) > 2000:
             out = out[:1990] + "..."
         await waiting.edit(content=out)
@@ -802,11 +837,13 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             return
         waiting = await ctx.send(f"⏳ Résumé de {url}...")
         prompt = (
-            f"Récupère le contenu de l'URL '{url}' via le MCP fetch (fetch_readable ou fetch_markdown). "
-            "Résume les points clés de manière synthétique et structurée avec des puces."
+            f"Récupère le contenu de l'URL '{url}' et résume les points clés de manière synthétique et structurée avec des puces."
         )
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        out = res.get("output", "").strip() or "⚠️ Impossible de résumer la page."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            out = f"❌ Erreur résumé : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            out = res.get("output", "").strip() or "⚠️ Impossible de résumer la page."
         if len(out) > 2000:
             out = out[:1990] + "..."
         await waiting.edit(content=out)

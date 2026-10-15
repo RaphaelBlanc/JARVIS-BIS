@@ -610,8 +610,11 @@ async def cmd_agenda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "leur titre, lieu éventuel et détails pertinents. "
         "S'il n'y a aucun événement, confirme-le clairement."
     )
-    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-    output = res.get("output", "").strip() or "⚠️ Impossible de récupérer l'agenda."
+    res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+    if not res.get("success"):
+        output = f"❌ Erreur agenda : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+    else:
+        output = res.get("output", "").strip() or "📅 Aucun événement trouvé pour cette période."
     await send_or_edit_telegram_response(waiting_msg, output, update.message)
 
 
@@ -647,12 +650,15 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if subcmd in ("list", "lister", "ls"):
         waiting_msg = await update.message.reply_text("⏳ Récupération de vos tâches...")
         prompt = (
-            "Consulte Google Tasks via le MCP google-tasks. "
+            "Consulte Google Tasks. "
             "Liste toutes les tâches en cours non terminées avec leur statut et date d'échéance éventuelle. "
             "S'il n'y en a aucune, indique-le clairement."
         )
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        output = res.get("output", "").strip() or "⚠️ Impossible de récupérer les tâches."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            output = f"❌ Erreur tâches : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            output = res.get("output", "").strip() or "📋 Aucune tâche en cours."
         await send_or_edit_telegram_response(waiting_msg, output, update.message)
     elif subcmd in ("add", "ajouter", "new", "creer"):
         if not task_text:
@@ -660,8 +666,11 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         waiting_msg = await update.message.reply_text(f"⏳ Ajout de la tâche '{task_text}'...")
         prompt = f"Ajoute une nouvelle tâche dans Google Tasks avec le titre : '{task_text}'."
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        output = res.get("output", "").strip() or "✅ Tâche ajoutée."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            output = f"❌ Erreur ajout : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            output = res.get("output", "").strip() or "✅ Tâche ajoutée."
         await send_or_edit_telegram_response(waiting_msg, output, update.message)
     elif subcmd in ("done", "terminer", "complete", "finir"):
         if not task_text:
@@ -669,15 +678,21 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         waiting_msg = await update.message.reply_text(f"⏳ Finalisation de la tâche '{task_text}'...")
         prompt = f"Marque la tâche '{task_text}' comme terminée dans Google Tasks."
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        output = res.get("output", "").strip() or "✅ Tâche complétée."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            output = f"❌ Erreur : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            output = res.get("output", "").strip() or "✅ Tâche complétée."
         await send_or_edit_telegram_response(waiting_msg, output, update.message)
     else:
         full_query = " ".join(args)
         waiting_msg = await update.message.reply_text("⏳ Traitement de votre demande Google Tasks...")
         prompt = f"Gère Google Tasks selon cette demande : {full_query}."
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        output = res.get("output", "").strip() or "✅ Demande traitée."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            output = f"❌ Erreur : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            output = res.get("output", "").strip() or "✅ Demande traitée."
         await send_or_edit_telegram_response(waiting_msg, output, update.message)
 
 
@@ -693,11 +708,11 @@ async def cmd_meteo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         keyboard = [
             [
                 InlineKeyboardButton("📍 Paris", callback_data="meteo:Paris"),
-                InlineKeyboardButton("📍 Lyon", callback_data="meteo:Lyon"),
+                InlineKeyboardButton("📍 Toulouse", callback_data="meteo:Toulouse"),
             ],
             [
+                InlineKeyboardButton("📍 Lyon", callback_data="meteo:Lyon"),
                 InlineKeyboardButton("📍 Marseille", callback_data="meteo:Marseille"),
-                InlineKeyboardButton("📍 Bordeaux", callback_data="meteo:Bordeaux"),
             ],
         ]
         await update.message.reply_text(
@@ -711,11 +726,14 @@ async def cmd_meteo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     city = " ".join(args).strip()
     waiting_msg = await update.message.reply_text(f"⏳ Consultation de la météo pour {city}...")
     prompt = (
-        f"Consulte la météo actuelle et les prévisions pour la ville de '{city}' via le MCP weather. "
+        f"Consulte la météo actuelle et les prévisions pour la ville de '{city}'. "
         "Donne la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté."
     )
-    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-    output = res.get("output", "").strip() or "⚠️ Impossible de récupérer la météo."
+    res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+    if not res.get("success"):
+        output = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+    else:
+        output = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
     await send_or_edit_telegram_response(waiting_msg, output, update.message)
 
 
@@ -734,11 +752,14 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     query = " ".join(args).strip()
     waiting_msg = await update.message.reply_text(f"🔍 Recherche web pour '{query}'...")
     prompt = (
-        f"Effectue une recherche web avec le MCP duckduckgo_web_search pour la requête suivante : '{query}'. "
-        "Synthétise les informations les plus récentes et pertinentes en citant les sources avec leurs liens."
+        f"Recherche sur le web des informations récentes et fiables sur la requête suivante : '{query}'. "
+        "Synthétise les éléments clés de façon claire et cite les sources si pertinent."
     )
-    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-    output = res.get("output", "").strip() or "⚠️ Aucun résultat trouvé."
+    res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+    if not res.get("success"):
+        output = f"❌ Erreur recherche : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+    else:
+        output = res.get("output", "").strip() or "⚠️ Aucun résultat trouvé."
     await send_or_edit_telegram_response(waiting_msg, output, update.message)
 
 
@@ -757,11 +778,13 @@ async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     target_url = args[0].strip()
     waiting_msg = await update.message.reply_text(f"⏳ Lecture et résumé de {target_url}...")
     prompt = (
-        f"Récupère le contenu de l'URL '{target_url}' via le MCP fetch (fetch_readable ou fetch_markdown). "
-        "Résume les points clés de manière synthétique et structurée avec des puces."
+        f"Récupère le contenu de l'URL '{target_url}' et résume les points clés de manière synthétique et structurée avec des puces."
     )
-    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-    output = res.get("output", "").strip() or "⚠️ Impossible de résumer la page."
+    res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+    if not res.get("success"):
+        output = f"❌ Erreur résumé : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+    else:
+        output = res.get("output", "").strip() or "⚠️ Impossible de résumer la page."
     await send_or_edit_telegram_response(waiting_msg, output, update.message)
 
 
@@ -872,15 +895,24 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 SAVED_CHATS_FILE = Path(__file__).resolve().parent.parent / "saved_chats.json"
 
 BRIEFING_PROMPT = (
-    "Effectue mon briefing matinal complet et synthétique :\n"
-    "1. ✉️ Consulte mes e-mails récents reçus depuis hier via Gmail. "
+    "Effectue mon briefing matinal complet, motivant et structuré :\n"
+    "1. 📅 EMPLOI DU TEMPS DU JOUR (Heure / Cours / Salles) :\n"
+    "Consulte mon Google Agenda pour aujourd'hui (en vérifiant bien tous mes calendriers, y compris mon calendrier de cours EPITA/PREPA). "
+    "Présente mon planning de la journée sous forme de liste claire avec les horaires, l'intitulé du cours et la salle exacte :\n"
+    "• Heure début - Heure fin : [Matière / Intitulé] (📍 Salle [numéro])\n"
+    "S'il n'y a aucun cours aujourd'hui, mentionne-le clairement.\n\n"
+    "2. 📈 ACTUALITÉS ÉCONOMIQUES DE LA VEILLE :\n"
+    "Recherche les actualités économiques et financières marquantes de la veille (marchés boursiers, macroéconomie, tech & business) et résume les 2 ou 3 points essentiels.\n\n"
+    "3. ✉️ E-MAILS IMPORTANTS :\n"
+    "Consulte mes e-mails récents reçus depuis hier via Gmail. "
     "IMPORTANT : Filtre et ignore TOTALEMENT toutes les publicités, spams, newsletters commerciales et promotions. "
     "Ne retiens que les messages importants (personnels, professionnels, école/EPITA, cours/examens, démarches). "
-    "Pour chaque e-mail important retenu, résume en 1 ou 2 phrases l'essentiel et l'action requise.\n"
-    "2. 📅 Consulte mon Google Agenda pour la journée d'aujourd'hui et demain matin, et liste mes rendez-vous avec leurs horaires.\n"
-    "3. 🌤️ Consulte la météo du jour pour ma ville (température, ciel, pluie éventuelle).\n"
-    "4. 📋 Consulte mes tâches Google Tasks en cours.\n"
-    "Présente le résultat avec un ton motivant, clair et structuré avec des émojis."
+    "Pour chaque e-mail important retenu, résume en 1 ou 2 phrases l'essentiel et l'action requise.\n\n"
+    "4. 🌤️ MÉTÉO DU JOUR :\n"
+    "Consulte la météo du jour pour ma ville (température, ciel, ressenti, pluie éventuelle).\n\n"
+    "5. 📋 TÂCHES EN COURS :\n"
+    "Consulte mes tâches Google Tasks en cours non terminées si disponibles.\n\n"
+    "Présente le résultat avec un ton motivant, structuré et dynamique avec des émojis."
 )
 
 
