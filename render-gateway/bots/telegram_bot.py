@@ -560,6 +560,8 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # 2. Nouvelle conversation
         if cid == "new":
             await reset_session_remote()
+            msg = await context.bot.send_message(chat_id=chat_id, text="✨ **Nouvelle conversation prête.**", parse_mode="Markdown")
+            track_chat_message(chat_id, msg.message_id)
             return
 
         # 3. Ancienne conversation
@@ -650,6 +652,8 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         if cid.lower() in ("new", "nouvelle", "reset"):
             await reset_session_remote()
+            msg = await context.bot.send_message(chat_id=chat_id, text="✨ **Nouvelle conversation prête.**", parse_mode="Markdown")
+            track_chat_message(chat_id, msg.message_id)
             return
 
         res = await resume_conversation_remote(cid)
@@ -957,7 +961,9 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     track_chat_message(chat_id, current_mid)
     await reset_session_remote()
     await clear_telegram_chat(context.bot, chat_id, current_message_id=current_mid)
-    # Affiche rien si c'est une nouvelle !
+    # Message discret pour garder la discussion active et visible dans Telegram
+    msg = await context.bot.send_message(chat_id=chat_id, text="✨ **Nouvelle conversation prête.**", parse_mode="Markdown")
+    track_chat_message(chat_id, msg.message_id)
 
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
