@@ -342,8 +342,9 @@ async def meteo_slash(interaction: discord.Interaction, ville: str = "Paris") ->
         return
     await interaction.response.defer()
     prompt = (
-        f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}'. "
-        "Donne la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté."
+        f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}'.\n"
+        "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
+        "Ne lance aucune commande bash ni script python."
     )
     res = await forward_to_runner(prompt, continue_session=False, timeout=120)
     if not res.get("success"):
@@ -361,8 +362,9 @@ async def search_slash(interaction: discord.Interaction, requete: str) -> None:
         return
     await interaction.response.defer()
     prompt = (
-        f"Recherche sur le web des informations récentes et fiables sur la requête suivante : '{requete}'. "
-        "Synthétise les éléments clés de façon claire et cite les sources si pertinent."
+        f"Effectue une recherche sur le web pour la requête suivante : '{requete}'.\n"
+        "RÈGLE STRICTE : Dès la première recherche effectuée, rédige immédiatement une synthèse claire, concise et structurée avec les chiffres clés et les sources en un seul tour. "
+        "Ne lance AUCUNE commande bash ni script python, ne lis aucun fichier local. Sois direct et rapide."
     )
     res = await forward_to_runner(prompt, continue_session=False, timeout=120)
     if not res.get("success"):
@@ -380,7 +382,9 @@ async def summarize_slash(interaction: discord.Interaction, url: str) -> None:
         return
     await interaction.response.defer()
     prompt = (
-        f"Récupère le contenu de l'URL '{url}' et résume les points clés de manière synthétique et structurée avec des puces."
+        f"Consulte le contenu de la page web suivante : '{url}'.\n"
+        "RÈGLE STRICTE : Résume les points clés de manière synthétique et structurée avec des puces en un seul tour. "
+        "Ne lance aucune commande bash ni script python."
     )
     res = await forward_to_runner(prompt, continue_session=False, timeout=120)
     if not res.get("success"):
@@ -795,8 +799,9 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             return
         waiting = await ctx.send(f"⏳ Consultation météo pour {ville}...")
         prompt = (
-            f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}'. "
-            "Donne la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté."
+            f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}'.\n"
+            "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
+            "Ne lance aucune commande bash ni script python."
         )
         res = await forward_to_runner(prompt, continue_session=False, timeout=120)
         if not res.get("success"):
@@ -816,8 +821,9 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             return
         waiting = await ctx.send(f"🔍 Recherche pour '{requete}'...")
         prompt = (
-            f"Recherche sur le web des informations récentes et fiables sur la requête suivante : '{requete}'. "
-            "Synthétise les éléments clés de façon claire et cite les sources si pertinent."
+            f"Effectue une recherche sur le web pour la requête suivante : '{requete}'.\n"
+            "RÈGLE STRICTE : Dès la première recherche effectuée, rédige immédiatement une synthèse claire, concise et structurée avec les chiffres clés et les sources en un seul tour. "
+            "Ne lance AUCUNE commande bash ni script python, ne lis aucun fichier local. Sois direct et rapide."
         )
         res = await forward_to_runner(prompt, continue_session=False, timeout=120)
         if not res.get("success"):
@@ -837,7 +843,9 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             return
         waiting = await ctx.send(f"⏳ Résumé de {url}...")
         prompt = (
-            f"Récupère le contenu de l'URL '{url}' et résume les points clés de manière synthétique et structurée avec des puces."
+            f"Consulte le contenu de la page web suivante : '{url}'.\n"
+            "RÈGLE STRICTE : Résume les points clés de manière synthétique et structurée avec des puces en un seul tour. "
+            "Ne lance aucune commande bash ni script python."
         )
         res = await forward_to_runner(prompt, continue_session=False, timeout=120)
         if not res.get("success"):

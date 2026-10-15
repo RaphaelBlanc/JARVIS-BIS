@@ -487,24 +487,32 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         period = data.split(":", 1)[1]
         waiting_msg = await query.message.reply_text(f"⏳ Consultation de votre agenda ({period})...")
         prompt = (
-            f"Consulte mon Google Agenda pour la période suivante : {period}. "
+            f"Consulte mon Google Agenda pour la période suivante : '{period}'. "
             "Liste les rendez-vous et événements avec leurs horaires de début et de fin, "
             "leur titre, lieu éventuel et détails pertinents. "
+            "RÈGLE STRICTE : Utilise directement l'outil de calendrier Google, sans exécuter de scripts bash ni python. "
             "S'il n'y a aucun événement, confirme-le clairement."
         )
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        output = res.get("output", "").strip() or "⚠️ Impossible de récupérer l'agenda."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            output = f"❌ Erreur agenda : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            output = res.get("output", "").strip() or "📅 Aucun événement trouvé pour cette période."
         await send_or_edit_telegram_response(waiting_msg, output, query.message)
 
     elif data == "tasks:list":
         waiting_msg = await query.message.reply_text("⏳ Récupération de vos tâches...")
         prompt = (
-            "Consulte Google Tasks via le MCP google-tasks. "
+            "Consulte Google Tasks. "
             "Liste toutes les tâches en cours non terminées avec leur statut et date d'échéance éventuelle. "
+            "RÈGLE STRICTE : Utilise directement l'outil Google Tasks, sans exécuter de scripts bash ni python. "
             "S'il n'y en a aucune, indique-le clairement."
         )
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        output = res.get("output", "").strip() or "⚠️ Impossible de récupérer les tâches."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            output = f"❌ Erreur tâches : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            output = res.get("output", "").strip() or "✅ Aucune tâche en cours."
         await send_or_edit_telegram_response(waiting_msg, output, query.message)
 
     elif data == "tasks:help_add":
@@ -529,11 +537,15 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         city = data.split(":", 1)[1]
         waiting_msg = await query.message.reply_text(f"⏳ Consultation météo pour {city}...")
         prompt = (
-            f"Consulte la météo actuelle et les prévisions pour la ville de '{city}' via le MCP weather. "
-            "Donne la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté."
+            f"Consulte la météo actuelle et les prévisions pour la ville de '{city}'.\n"
+            "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
+            "Ne lance aucune commande bash ni script python."
         )
-        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
-        output = res.get("output", "").strip() or "⚠️ Impossible de récupérer la météo."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            output = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            output = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
         await send_or_edit_telegram_response(waiting_msg, output, query.message)
 
 
@@ -605,9 +617,10 @@ async def cmd_agenda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     period = " ".join(args).strip()
     waiting_msg = await update.message.reply_text(f"⏳ Consultation de votre agenda ({period})...")
     prompt = (
-        f"Consulte mon Google Agenda pour la période suivante : {period}. "
+        f"Consulte mon Google Agenda pour la période suivante : '{period}'. "
         "Liste les rendez-vous et événements avec leurs horaires de début et de fin, "
-        "leur titre, lieu éventuel et détails pertinents. "
+        "leur titre, lieu éventuel (ou salle de cours) et détails pertinents. "
+        "RÈGLE STRICTE : Utilise directement l'outil de calendrier Google, sans exécuter de scripts bash ni python. "
         "S'il n'y a aucun événement, confirme-le clairement."
     )
     res = await forward_to_runner(prompt, continue_session=False, timeout=120)
@@ -726,8 +739,9 @@ async def cmd_meteo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     city = " ".join(args).strip()
     waiting_msg = await update.message.reply_text(f"⏳ Consultation de la météo pour {city}...")
     prompt = (
-        f"Consulte la météo actuelle et les prévisions pour la ville de '{city}'. "
-        "Donne la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté."
+        f"Consulte la météo actuelle et les prévisions pour la ville de '{city}'.\n"
+        "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
+        "Ne lance aucune commande bash ni script python."
     )
     res = await forward_to_runner(prompt, continue_session=False, timeout=120)
     if not res.get("success"):
@@ -752,8 +766,9 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     query = " ".join(args).strip()
     waiting_msg = await update.message.reply_text(f"🔍 Recherche web pour '{query}'...")
     prompt = (
-        f"Recherche sur le web des informations récentes et fiables sur la requête suivante : '{query}'. "
-        "Synthétise les éléments clés de façon claire et cite les sources si pertinent."
+        f"Effectue une recherche sur le web pour la requête suivante : '{query}'.\n"
+        "RÈGLE STRICTE : Dès la première recherche effectuée, rédige immédiatement une synthèse claire, concise et structurée avec les chiffres clés et les sources en un seul tour. "
+        "Ne lance AUCUNE commande bash ni script python, ne lis aucun fichier local. Sois direct et rapide."
     )
     res = await forward_to_runner(prompt, continue_session=False, timeout=120)
     if not res.get("success"):
@@ -778,7 +793,9 @@ async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     target_url = args[0].strip()
     waiting_msg = await update.message.reply_text(f"⏳ Lecture et résumé de {target_url}...")
     prompt = (
-        f"Récupère le contenu de l'URL '{target_url}' et résume les points clés de manière synthétique et structurée avec des puces."
+        f"Consulte le contenu de la page web suivante : '{target_url}'.\n"
+        "RÈGLE STRICTE : Résume les points clés de manière synthétique et structurée avec des puces en un seul tour. "
+        "Ne lance aucune commande bash ni script python."
     )
     res = await forward_to_runner(prompt, continue_session=False, timeout=120)
     if not res.get("success"):
@@ -1142,12 +1159,17 @@ def start_telegram_polling() -> None:
             await app.stop()
             await app.shutdown()
 
-        try:
-            loop.run_until_complete(_async_polling())
-        except Exception as exc:
-            logger.error("Erreur dans le polling Telegram: %s", exc, exc_info=True)
-        finally:
-            loop.close()
+        while not _stop_event.is_set():
+            try:
+                loop.run_until_complete(_async_polling())
+                break
+            except Exception as exc:
+                if _stop_event.is_set():
+                    break
+                logger.error("Erreur dans le polling Telegram: %s. Nouvelle tentative dans 5s...", exc)
+                import time
+                time.sleep(5)
+        loop.close()
 
     _polling_thread = threading.Thread(target=_run, name="telegram-polling", daemon=True)
     _polling_thread.start()

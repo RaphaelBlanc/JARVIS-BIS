@@ -18,7 +18,7 @@ MAX_RESPONSE_LENGTH: int = 4000
 
 async def forward_to_runner(
     prompt: str,
-    timeout: int = 130,
+    timeout: int = 120,
     model: str | None = None,
     effort: str | None = None,
     mode: str | None = None,
@@ -31,13 +31,16 @@ async def forward_to_runner(
         logger.error("HOME_SERVER_URL n'est pas configuré.")
         return {"success": False, "output": "", "error": "HOME_SERVER_URL non configuré"}
 
-    logger.info("Transmission au home-runner: prompt=%.60s… (continue=%s)", prompt, continue_session)
+    logger.info("Transmission au home-runner: prompt=%.60s… (continue=%s, timeout=%ds)", prompt, continue_session, timeout)
+
+    # Marge de 15s pour que httpx ne coupe pas avant que le runner ait renvoyé son diagnostic
+    client_timeout = float(timeout + 15)
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=client_timeout) as client:
             payload = {
                 "prompt": prompt,
-                "timeout": 120,
+                "timeout": timeout,
                 "continue_session": continue_session,
                 "reset_session": reset_session,
             }
