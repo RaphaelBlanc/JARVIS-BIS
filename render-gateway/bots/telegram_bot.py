@@ -7,12 +7,15 @@ et répond à l'utilisateur avec le résultat.
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Optional
+
 
 from fastapi import APIRouter, Request, Response
 from telegram import (
@@ -63,6 +66,136 @@ def _is_allowed(user_id: int) -> bool:
     if not ALLOWED_USER_IDS:
         return True  # pas de restriction configurée
     return user_id in ALLOWED_USER_IDS
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    """Convertit du Markdown GitHub Flavored en HTML Telegram riche et élégant."""
+    if not text:
+        return ""
+
+    # 1. Extraction et protection des blocs de code
+    code_blocks = []
+    def save_code_block(match):
+        code_blocks.append(match.group(2))
+        return f"@@CODE_BLOCK_{len(code_blocks)-1}@@"
+    text = re.sub(r"```([a-zA-Z0-9_-]*)\n(.*?)```", save_code_block, text, flags=re.DOTALL)
+
+    # 2. Extraction du code inline
+    inline_codes = []
+    def save_inline_code(match):
+        inline_codes.append(match.group(1))
+        return f"@@INLINE_CODE_{len(inline_codes)-1}@@"
+    text = re.sub(r"`([^`\n]+)`", save_inline_code, text)
+
+    # 3. Échappement HTML du texte hors code
+    text = html.escape(text, quote=False)
+
+    # 4. Citations / Blockquotes (> texte) avec support natif Telegram
+    def replace_blockquotes(match):
+        lines = [re.sub(r"^&gt;\s?", "", l) for l in match.group(0).split("\n")]
+        content = "\n".join(lines).strip()
+        # Supprime les badges GitHub style [!NOTE] etc.
+        content = re.sub(r"\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*", "", content)
+        return f"<blockquote>{content}</blockquote>"
+    text = re.sub(r"(?:^&gt;[^\n]*\n?)+", replace_blockquotes, text, flags=re.MULTILINE)
+
+    # 5. Titres avec mise en valeur
+    text = re.sub(r"^###\s+(.+)$", r"<b><u>\1</u></b>", text, flags=re.MULTILINE)
+    text = re.sub(r"^##\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+    text = re.sub(r"^#\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+
+    # 6. Séparateurs horizontaux
+    text = re.sub(r"^\s*[-*_]{3,}\s*$", "────────────────────────────", text, flags=re.MULTILINE)
+
+    # 7. Gras et Italique
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+    text = re.sub(r"(?<![a-zA-Z0-9])\*([^* \n][^*\n]*?)\*(?![a-zA-Z0-9])", r"<i>\1</i>", text)
+    text = re.sub(r"(?<![a-zA-Z0-9])_([^_ \n][^_\n]*?)_(?![a-zA-Z0-9])", r"<i>\1</i>", text)
+
+    # 8. Barré
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+
+    # 9. Liens [texte](url)
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # 10. Listes à puces avec jolis points
+    text = re.sub(r"^\s*[\*\-]\s+", "• ", text, flags=re.MULTILINE)
+
+    # 11. Restauration des blocs de code échappés
+    for i, code in enumerate(code_blocks):
+        escaped = html.escape(code.strip())
+        text = text.replace(f"@@CODE_BLOCK_{i}@@", f"<pre><code>{escaped}</code></pre>")
+
+    for i, code in enumerate(inline_codes):
+        escaped = html.escape(code)
+        text = text.replace(f"@@INLINE_CODE_{i}@@", f"<code>{escaped}</code>")
+
+    return text.strip()
+
+
+def split_telegram_message(text: str, max_length: int = 4000) -> list[str]:
+    """Découpe un message long en morceaux de moins de 4000 caractères sans couper au milieu d'un paragraphe."""
+    if len(text) <= max_length:
+        return [text]
+
+    chunks = []
+    current_chunk = ""
+
+    # Découpe par paragraphe
+    paragraphs = text.split("\n\n")
+    for p in paragraphs:
+        if len(current_chunk) + len(p) + 2 <= max_length:
+            current_chunk = f"{current_chunk}\n\n{p}" if current_chunk else p
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            if len(p) > max_length:
+                lines = p.split("\n")
+                for l in lines:
+                    if len(current_chunk) + len(l) + 1 <= max_length:
+                        current_chunk = f"{current_chunk}\n{l}" if current_chunk else l
+                    else:
+                        if current_chunk:
+                            chunks.append(current_chunk)
+                        current_chunk = l
+            else:
+                current_chunk = p
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+async def send_or_edit_telegram_response(
+    waiting_msg,
+    raw_text: str,
+    reply_to_message=None,
+) -> None:
+    """Met en forme en HTML Telegram et édite/envoie la réponse avec gestion propre des messages longs et erreurs."""
+    html_text = markdown_to_telegram_html(raw_text)
+    chunks = split_telegram_message(html_text)
+
+    # 1. Tente d'éditer le message d'attente avec le premier morceau
+    first_chunk = chunks[0] if chunks else "✅ Tâche terminée."
+    try:
+        await waiting_msg.edit_text(first_chunk, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as exc:
+        logger.warning("Échec affichage HTML Telegram (%s), repli sur texte brut.", exc)
+        raw_chunks = split_telegram_message(raw_text)
+        await waiting_msg.edit_text(raw_chunks[0] if raw_chunks else raw_text)
+        chunks = raw_chunks
+
+    # 2. S'il y a d'autres morceaux (message > 4000 chars), on les envoie à la suite
+    if len(chunks) > 1 and reply_to_message:
+        for chunk in chunks[1:]:
+            try:
+                await reply_to_message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+            except Exception:
+                await reply_to_message.reply_text(chunk)
+
 
 
 # ── Handlers de commandes ────────────────────────────────────────────────────
@@ -372,7 +505,7 @@ async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     waiting_msg = await update.message.reply_text("⏳ Récupération des quotas...")
     res = await forward_to_runner("/usage", continue_session=False)
-    await waiting_msg.edit_text(res.get("output", "Aucune information de quota retournée."))
+    await send_or_edit_telegram_response(waiting_msg, res.get("output", "Aucune information de quota retournée."), update.message)
 
 
 async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -384,7 +517,7 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     waiting_msg = await update.message.reply_text("⏳ Récupération des compétences...")
     res = await forward_to_runner("/skills", continue_session=False)
-    await waiting_msg.edit_text(res.get("output", "Aucune compétence trouvée."))
+    await send_or_edit_telegram_response(waiting_msg, res.get("output", "Aucune compétence trouvée."), update.message)
 
 
 SAVED_CHATS_FILE = Path(__file__).resolve().parent.parent / "saved_chats.json"
@@ -428,13 +561,20 @@ def get_saved_chat_ids() -> list[int]:
 
 
 async def send_broadcast_message(text: str) -> None:
-    """Envoie un message à tous les utilisateurs Telegram enregistrés."""
+    """Envoie un message formaté en HTML à tous les utilisateurs Telegram enregistrés."""
     app = get_application()
+    html_text = markdown_to_telegram_html(text)
+    chunks = split_telegram_message(html_text)
     for cid in get_saved_chat_ids():
-        try:
-            await app.bot.send_message(chat_id=cid, text=text)
-        except Exception as exc:
-            logger.warning("Erreur diffusion Telegram vers %s: %s", cid, exc)
+        for chunk in chunks:
+            try:
+                await app.bot.send_message(chat_id=cid, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
+            except Exception as exc:
+                logger.warning("Erreur diffusion Telegram HTML vers %s: %s", cid, exc)
+                try:
+                    await app.bot.send_message(chat_id=cid, text=text)
+                except Exception:
+                    pass
 
 
 async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -448,11 +588,11 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     waiting_msg = await update.message.reply_text("⏳ Préparation de votre briefing matinal (analyse e-mails, agenda, météo)...")
     res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=120)
     output = res.get("output", "").strip() or "⚠️ Impossible de générer le briefing matinal."
-    await waiting_msg.edit_text(output)
+    await send_or_edit_telegram_response(waiting_msg, output, update.message)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Traite les messages texte entrants avec mémoire de contexte conversationnel."""
+    """Traite les messages texte entrants avec mémoire de contexte conversationnel et mise en page riche."""
     user = update.effective_user
     if not _is_allowed(user.id):
         logger.warning("Message refusé de l'utilisateur Telegram %d.", user.id)
@@ -480,8 +620,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         response_text = f"❌ Erreur : {error}"
         logger.error("Erreur retournée par le runner: %s", error)
 
-    # Édite le message "en cours" avec la vraie réponse
-    await waiting_msg.edit_text(response_text)
+    # Édite le message "en cours" avec la réponse magnifiquement formatée en HTML
+    await send_or_edit_telegram_response(waiting_msg, response_text, update.message)
+
 
 
 from telegram.request import HTTPXRequest
