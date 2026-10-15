@@ -225,3 +225,28 @@ async def resume_conversation_remote(conversation_id: str) -> dict:
         logger.error("Erreur resume_conversation_remote: %s", e)
         return {"error": str(e)}
 
+
+async def delete_conversation_remote(conversation_id: str) -> dict:
+    """Demande au home-runner de supprimer une conversation passée."""
+    if not HOME_SERVER_URL:
+        return {"success": False, "error": "HOME_SERVER_URL non configuré"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.delete(
+                f"{HOME_SERVER_URL}/conversation/{conversation_id}",
+                headers={"X-Secret-Key": SECRET_KEY},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        detail = "Erreur de suppression"
+        try:
+            detail = e.response.json().get("detail", detail)
+        except Exception:
+            pass
+        return {"success": False, "error": detail}
+    except Exception as e:
+        logger.error("Erreur delete_conversation_remote: %s", e)
+        return {"success": False, "error": str(e)}
+
+

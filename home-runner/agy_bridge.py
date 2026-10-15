@@ -214,6 +214,53 @@ def list_recent_conversations(limit: int = 8) -> list[dict]:
     return conversations[:limit]
 
 
+def delete_conversation(conv_id: str) -> dict:
+    """Supprime une conversation passée du répertoire brain."""
+    clean_id = conv_id.strip()
+    if not clean_id or "/" in clean_id or "\\" in clean_id or ".." in clean_id:
+        return {"success": False, "error": "Identifiant de conversation invalide."}
+
+    excluded_ids = {"0e02609b-e140-4ca5-a760-247d880dfa5c"}
+    if clean_id in excluded_ids:
+        return {"success": False, "error": "Impossible de supprimer la session de travail active."}
+
+    brain_dir = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+    target_dir = brain_dir / clean_id
+    if not target_dir.exists() or not target_dir.is_dir():
+        return {"success": False, "error": "Conversation introuvable."}
+
+    try:
+        shutil.rmtree(target_dir)
+        if SESSION_CONFIG.get("conversation_id") == clean_id:
+            reset_session()
+        logger.info("Conversation %s supprimée avec succès.", clean_id)
+        return {"success": True, "deleted_id": clean_id}
+    except Exception as e:
+        logger.error("Erreur suppression conversation %s : %s", clean_id, e)
+        return {"success": False, "error": str(e)}
+
+
+def delete_all_conversations() -> dict:
+    """Supprime toutes les conversations passées (sauf la session courante)."""
+    brain_dir = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+    if not brain_dir.exists():
+        return {"success": True, "deleted_count": 0}
+
+    excluded_ids = {"0e02609b-e140-4ca5-a760-247d880dfa5c"}
+    count = 0
+    for item in brain_dir.iterdir():
+        if item.is_dir() and item.name not in excluded_ids:
+            try:
+                shutil.rmtree(item)
+                count += 1
+            except Exception as e:
+                logger.warning("Impossible de supprimer %s : %s", item.name, e)
+
+    reset_session()
+    logger.info("%d conversations passées ont été supprimées.", count)
+    return {"success": True, "deleted_count": count}
+
+
 
 async def run_agy(
     prompt: str,

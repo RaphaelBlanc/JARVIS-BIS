@@ -16,6 +16,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from gateway import (
+    delete_conversation_remote,
     fetch_conversations,
     fetch_health,
     fetch_models,
@@ -72,6 +73,7 @@ class AssistantBot(commands.Bot):
             briefing_slash,
             ask_slash,
             resume_slash,
+            delete_slash,
             agenda_slash,
             tasks_slash,
             meteo_slash,
@@ -331,6 +333,50 @@ async def resume_autocomplete(interaction: discord.Interaction, current: str) ->
         title = c.get("title", "Discussion")
         date = c.get("date", "")
         label = f"[{date}] {title}"
+        if len(label) > 100:
+            label = label[:97] + "..."
+        if not current or current_lower in label.lower() or current_lower in cid.lower():
+            choices.append(app_commands.Choice(name=label, value=cid))
+    return choices[:25]
+
+
+@app_commands.command(name="delete", description="Supprimer définitivement une conversation passée")
+@app_commands.describe(conversation="Choisissez la conversation à supprimer ou 'Tout supprimer'")
+async def delete_slash(interaction: discord.Interaction, conversation: str) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    if conversation == "all":
+        res = await delete_conversation_remote("all")
+        if res.get("success"):
+            count = res.get("deleted_count", 0)
+            await interaction.followup.send(f"🗑️ **{count} conversation(s) passée(s) supprimée(s) définitivement.**", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ Erreur : {res.get('error', 'Échec de suppression')}", ephemeral=True)
+        return
+
+    res = await delete_conversation_remote(conversation)
+    if res.get("success"):
+        await interaction.followup.send(f"🗑️ **Conversation `{conversation[:8]}...` supprimée avec succès !**", ephemeral=True)
+    else:
+        await interaction.followup.send(f"❌ Erreur lors de la suppression : {res.get('error', 'Conversation introuvable')}", ephemeral=True)
+
+
+@delete_slash.autocomplete("conversation")
+async def delete_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    convs = await fetch_conversations(limit=25)
+    choices = [
+        app_commands.Choice(name="💥 [TOUT SUPPRIMER] Effacer toutes les conversations passées", value="all")
+    ]
+    current_lower = current.lower()
+    for c in convs:
+        cid = c.get("id", "")
+        title = c.get("title", "Discussion")
+        date = c.get("date", "")
+        label = f"🗑️ [{date}] {title}"
         if len(label) > 100:
             label = label[:97] + "..."
         if not current or current_lower in label.lower() or current_lower in cid.lower():
@@ -837,6 +883,36 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
 
         history = res.get("history", [])
         await replay_conversation_history(ctx.channel, history)
+
+    @bot.command(name="delete", aliases=["del", "supprimer"], help="Supprimer une conversation passée. Ex: !delete <id> ou !delete all")
+    async def delete_cmd(ctx: commands.Context, conversation_id: str = "") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        cid = conversation_id.strip()
+        if not cid:
+            convs = await fetch_conversations(limit=8)
+            if not convs:
+                await ctx.send("ℹ️ Aucune conversation passée à supprimer.")
+                return
+            lines = [
+                "🗑️ **Conversations passées à supprimer :**",
+                "• `!delete all` — 💥 Supprimer toutes les conversations passées",
+            ]
+            for c in convs:
+                lines.append(f"• `!delete {c['id']}` — *{c['date']}* : {c['title']}")
+            lines.append("\n👉 Tapez `!delete <id>` pour supprimer définitivement une conversation.")
+            await ctx.send("\n".join(lines))
+            return
+
+        res = await delete_conversation_remote(cid)
+        if res.get("success"):
+            if cid.lower() == "all":
+                count = res.get("deleted_count", 0)
+                await ctx.send(f"🗑️ **{count} conversation(s) passée(s) supprimée(s) définitivement.**")
+            else:
+                await ctx.send(f"🗑️ **Conversation `{cid[:8]}...` supprimée définitivement avec succès !**")
+        else:
+            await ctx.send(f"❌ Erreur : {res.get('error', 'Suppression échouée')}")
 
     @bot.command(name="agenda", aliases=["cal"], help="Consulter votre Google Agenda. Ex: !agenda aujourd'hui")
     async def agenda_cmd(ctx: commands.Context, *, periode: str = "aujourd'hui") -> None:

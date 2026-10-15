@@ -34,6 +34,7 @@ from telegram.ext import (
 )
 
 from gateway import (
+    delete_conversation_remote,
     fetch_conversations,
     fetch_health,
     fetch_models,
@@ -569,6 +570,25 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         history = res.get("history", [])
         await replay_telegram_history(context.bot, chat_id, history)
 
+    elif data.startswith("delconv:"):
+        cid = data.split(":", 1)[1]
+        if cid == "cancel":
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            return
+
+        res = await delete_conversation_remote(cid)
+        if res.get("success"):
+            if cid == "all":
+                count = res.get("deleted_count", 0)
+                await query.edit_message_text(f"🗑️ **{count} conversation(s) supprimée(s) avec succès !**", parse_mode="Markdown")
+            else:
+                await query.edit_message_text(f"🗑️ **Conversation `{cid[:8]}...` supprimée avec succès !**", parse_mode="Markdown")
+        else:
+            await query.edit_message_text(f"❌ Erreur lors de la suppression : {res.get('error', 'Inconnue')}", parse_mode="Markdown")
+
     elif data.startswith("agenda:"):
         period = data.split(":", 1)[1]
         waiting_msg = await query.message.reply_text(f"⏳ Consultation de votre agenda ({period})...")
@@ -683,6 +703,59 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         parse_mode="HTML",
     )
     track_chat_message(chat_id, m.message_id)
+
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Supprime une conversation passée (menu interactif avec boutons ou ID direct)."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    chat_id = update.effective_chat.id
+    track_chat_message(chat_id, update.message.message_id)
+
+    args = context.args
+    if args:
+        cid = args[0].strip()
+        res = await delete_conversation_remote(cid)
+        if res.get("success"):
+            if cid.lower() == "all":
+                count = res.get("deleted_count", 0)
+                msg = await update.message.reply_text(f"🗑️ **{count} conversation(s) supprimée(s) avec succès !**", parse_mode="Markdown")
+            else:
+                msg = await update.message.reply_text(f"🗑️ **Conversation `{cid[:8]}...` supprimée avec succès !**", parse_mode="Markdown")
+        else:
+            msg = await update.message.reply_text(f"❌ Erreur : {res.get('error', 'Suppression échouée')}", parse_mode="Markdown")
+        track_chat_message(chat_id, msg.message_id)
+        return
+
+    convs = await fetch_conversations(limit=10)
+    if not convs:
+        msg = await update.message.reply_text("ℹ️ Aucune conversation passée à supprimer.")
+        track_chat_message(chat_id, msg.message_id)
+        return
+
+    keyboard = []
+    for c in convs:
+        cid = c.get("id", "")
+        title = c.get("title", "Discussion")
+        date = c.get("date", "")
+        btn_text = f"🗑️ [{date}] {title[:28]}"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"delconv:{cid}")])
+
+    keyboard.append([
+        InlineKeyboardButton("💥 Tout supprimer", callback_data="delconv:all"),
+        InlineKeyboardButton("❌ Annuler", callback_data="delconv:cancel"),
+    ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg = await update.message.reply_text(
+        "🗑️ <b>Sélectionnez la conversation à supprimer définitivement :</b>",
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+    )
+    track_chat_message(chat_id, msg.message_id)
 
 
 async def cmd_agenda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1132,6 +1205,7 @@ from telegram.request import HTTPXRequest
 BOT_COMMANDS = [
     BotCommand("briefing", "Briefing matinal (mails triés, agenda, météo)"),
     BotCommand("resume", "Reprendre une discussion précédente"),
+    BotCommand("delete", "Supprimer des discussions passées"),
     BotCommand("agenda", "Consulter Google Agenda (aujourd'hui, semaine)"),
     BotCommand("tasks", "Gérer Google Tasks (lister, ajouter, terminer)"),
     BotCommand("meteo", "Météo mondiale en temps réel"),
@@ -1176,6 +1250,9 @@ def get_application() -> Application:
     app.add_handler(CommandHandler("briefing", cmd_briefing))
     app.add_handler(CommandHandler("brief", cmd_briefing))
     app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("del", cmd_delete))
+    app.add_handler(CommandHandler("delconv", cmd_delete))
     app.add_handler(CommandHandler("agenda", cmd_agenda))
     app.add_handler(CommandHandler("cal", cmd_agenda))
     app.add_handler(CommandHandler("tasks", cmd_tasks))

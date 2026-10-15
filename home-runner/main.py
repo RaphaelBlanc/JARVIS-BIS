@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 
 from agy_bridge import (
     KNOWN_MODELS,
+    delete_all_conversations,
+    delete_conversation,
     find_agy,
     get_conversation_history,
     get_session_info,
@@ -127,6 +129,12 @@ class SessionUpdateRequest(BaseModel):
     effort: str | None = None
     mode: str | None = None
     permission_mode: str | None = None
+
+
+class DeleteConversationRequest(BaseModel):
+    """Suppression d'une conversation."""
+
+    conversation_id: str = Field(..., description="ID de la conversation à supprimer ou 'all'.")
 
 # ---------------------------------------------------------------------------
 # Helpers d'authentification
@@ -251,6 +259,32 @@ async def get_conv_history(request: Request, conversation_id: str, limit: int = 
     _check_secret(request)
     history = get_conversation_history(conversation_id, max_turns=limit)
     return {"conversation_id": conversation_id, "history": history}
+
+
+@app.delete("/conversation/{conversation_id}", summary="Supprime une conversation passée")
+async def delete_conv(request: Request, conversation_id: str):
+    """Supprime une conversation spécifique ou toutes les conversations ('all')."""
+    _check_secret(request)
+    if conversation_id.lower() == "all":
+        res = delete_all_conversations()
+        return res
+    res = delete_conversation(conversation_id)
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("error", "Erreur de suppression"))
+    return res
+
+
+@app.post("/conversation/delete", summary="Supprime une conversation passée (POST)")
+async def delete_conv_post(request: Request, body: DeleteConversationRequest):
+    """Supprime une conversation via POST."""
+    _check_secret(request)
+    if body.conversation_id.lower() == "all":
+        res = delete_all_conversations()
+        return res
+    res = delete_conversation(body.conversation_id)
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("error", "Erreur de suppression"))
+    return res
 
 
 
