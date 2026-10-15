@@ -8,10 +8,13 @@ Lance le gateway qui:
   - Configure le webhook Telegram au démarrage
 """
 
+import asyncio
+import datetime
 import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -75,6 +78,39 @@ def _check_env() -> None:
         logger.info("Toutes les variables d'environnement critiques sont configurées.")
 
 
+# ── Planificateur de briefing matinal ─────────────────────────────────────────
+
+async def morning_briefing_scheduler() -> None:
+    """Tâche de fond qui envoie automatiquement le briefing chaque matin à 08:00."""
+    logger.info("Planificateur de briefing matinal actif (08:00 chaque matin).")
+    last_sent_date = None
+    while True:
+        try:
+            now = datetime.datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            # Déclenchement à 08h00 si pas encore envoyé aujourd'hui
+            if now.hour == 8 and now.minute < 5 and last_sent_date != today_str:
+                logger.info("Déclenchement automatique du briefing matinal pour le %s...", today_str)
+                from bots.telegram_bot import BRIEFING_PROMPT, send_broadcast_message
+                from bots.discord_bot import broadcast_discord_message
+                from gateway import forward_to_runner
+
+                res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=120)
+                if res.get("success"):
+                    briefing_text = res.get("output", "").strip()
+                    if briefing_text:
+                        # Diffusion Telegram
+                        await send_broadcast_message(briefing_text)
+                        # Diffusion Discord
+                        await broadcast_discord_message(briefing_text)
+                        last_sent_date = today_str
+                        logger.info("Briefing matinal automatique diffusé avec succès !")
+        except Exception as exc:
+            logger.error("Erreur dans le planificateur de briefing matinal: %s", exc)
+
+        await asyncio.sleep(60)
+
+
 # ── Lifespan FastAPI ──────────────────────────────────────────────────────────
 
 
@@ -86,6 +122,7 @@ async def lifespan(app: FastAPI):
         - Vérifie les variables d'environnement
         - Lance le bot Discord en arrière-plan
         - Configure le webhook Telegram (si URL fournie) ou démarre le polling (en local)
+        - Lance le planificateur de briefing matinal
 
     Arrêt:
         - Ferme proprement les bots Discord et Telegram
@@ -110,12 +147,16 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("TELEGRAM_TOKEN manquant — bot Telegram inactif.")
 
+    # Démarre la tâche de fond du briefing matinal
+    scheduler_task = asyncio.create_task(morning_briefing_scheduler())
+
     logger.info("render-gateway prêt à recevoir des requêtes.")
 
     yield  # L'application tourne
 
     # Arrêt
     logger.info("=== Arrêt du render-gateway ===")
+    scheduler_task.cancel()
     try:
         stop_telegram_polling()
     except Exception as exc:
@@ -124,6 +165,7 @@ async def lifespan(app: FastAPI):
         await stop_discord_bot()
     except Exception as exc:
         logger.error("Erreur lors de l'arrêt du bot Discord: %s", exc)
+
 
 
 # ── Application FastAPI ───────────────────────────────────────────────────────

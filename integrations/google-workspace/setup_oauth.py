@@ -26,6 +26,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/tasks",
 ]
 
 REDIRECT_PORT = 8085

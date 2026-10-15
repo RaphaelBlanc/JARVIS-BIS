@@ -7,9 +7,11 @@ et répond à l'utilisateur avec le résultat.
 """
 
 import asyncio
+import json
 import logging
 import os
 import threading
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Request, Response
@@ -74,12 +76,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
 
+    _save_chat_id(update.effective_chat.id)
     await update.message.reply_text(
         f"👋 Bonjour {user.first_name} !\n\n"
         "Je suis votre assistant personnel. Envoyez-moi simplement un message "
         "et je vous répondrai en transmettant votre demande à votre PC maison.\n\n"
-        "Tapez /help pour plus d'informations."
+        "Tapez /help pour plus d'informations ou /briefing pour votre résumé du jour."
     )
+
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -383,6 +387,70 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await waiting_msg.edit_text(res.get("output", "Aucune compétence trouvée."))
 
 
+SAVED_CHATS_FILE = Path(__file__).resolve().parent.parent / "saved_chats.json"
+
+BRIEFING_PROMPT = (
+    "Effectue mon briefing matinal complet et synthétique :\n"
+    "1. ✉️ Consulte mes e-mails récents reçus depuis hier via Gmail. "
+    "IMPORTANT : Filtre et ignore TOTALEMENT toutes les publicités, spams, newsletters commerciales et promotions. "
+    "Ne retiens que les messages importants (personnels, professionnels, école/EPITA, cours/examens, démarches). "
+    "Pour chaque e-mail important retenu, résume en 1 ou 2 phrases l'essentiel et l'action requise.\n"
+    "2. 📅 Consulte mon Google Agenda pour la journée d'aujourd'hui et demain matin, et liste mes rendez-vous avec leurs horaires.\n"
+    "3. 🌤️ Consulte la météo du jour pour ma ville (température, ciel, pluie éventuelle).\n"
+    "4. 📋 Consulte mes tâches Google Tasks en cours.\n"
+    "Présente le résultat avec un ton motivant, clair et structuré avec des émojis."
+)
+
+
+def _save_chat_id(chat_id: int) -> None:
+    """Enregistre l'ID du chat Telegram pour permettre les notifications automatiques."""
+    try:
+        chats = set()
+        if SAVED_CHATS_FILE.exists():
+            with open(SAVED_CHATS_FILE, "r", encoding="utf-8") as f:
+                chats = set(json.load(f))
+        chats.add(chat_id)
+        with open(SAVED_CHATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(chats), f)
+    except Exception as exc:
+        logger.warning("Erreur sauvegarde chat_id %s: %s", chat_id, exc)
+
+
+def get_saved_chat_ids() -> list[int]:
+    """Retourne la liste des chats Telegram enregistrés."""
+    if SAVED_CHATS_FILE.exists():
+        try:
+            with open(SAVED_CHATS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+async def send_broadcast_message(text: str) -> None:
+    """Envoie un message à tous les utilisateurs Telegram enregistrés."""
+    app = get_application()
+    for cid in get_saved_chat_ids():
+        try:
+            await app.bot.send_message(chat_id=cid, text=text)
+        except Exception as exc:
+            logger.warning("Erreur diffusion Telegram vers %s: %s", cid, exc)
+
+
+async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Génère le briefing matinal complet (tri des e-mails, agenda, météo)."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    _save_chat_id(update.effective_chat.id)
+    waiting_msg = await update.message.reply_text("⏳ Préparation de votre briefing matinal (analyse e-mails, agenda, météo)...")
+    res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=120)
+    output = res.get("output", "").strip() or "⚠️ Impossible de générer le briefing matinal."
+    await waiting_msg.edit_text(output)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Traite les messages texte entrants avec mémoire de contexte conversationnel."""
     user = update.effective_user
@@ -390,6 +458,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.warning("Message refusé de l'utilisateur Telegram %d.", user.id)
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
+
+    _save_chat_id(update.effective_chat.id)
 
     prompt = update.message.text.strip()
     if not prompt:
@@ -419,6 +489,7 @@ from telegram.request import HTTPXRequest
 # ── Application Telegram ──────────────────────────────────────────────────────
 
 BOT_COMMANDS = [
+    BotCommand("briefing", "Briefing matinal (mails triés, agenda, météo)"),
     BotCommand("models", "Choisir le modèle d'IA (boutons cliquables)"),
     BotCommand("effort", "Régler l'effort de réflexion (boutons)"),
     BotCommand("mode", "Changer le mode d'action (auto, plan)"),
@@ -429,6 +500,7 @@ BOT_COMMANDS = [
     BotCommand("skills", "Voir les compétences actives"),
     BotCommand("help", "Afficher l'aide complète"),
 ]
+
 
 
 def get_application() -> Application:
@@ -452,6 +524,8 @@ def get_application() -> Application:
     # Enregistrement de tous les handlers de commandes
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("briefing", cmd_briefing))
+    app.add_handler(CommandHandler("brief", cmd_briefing))
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("model", cmd_models))
     app.add_handler(CommandHandler("setmodel", cmd_setmodel))

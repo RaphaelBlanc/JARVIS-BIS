@@ -132,6 +132,43 @@ def _get_bot() -> AssistantBot:
 # ── Commandes slash avec autocomplétion & choix ───────────────────────────────
 
 
+BRIEFING_PROMPT = (
+    "Effectue mon briefing matinal complet et synthétique :\n"
+    "1. ✉️ Consulte mes e-mails récents reçus depuis hier via Gmail. "
+    "IMPORTANT : Filtre et ignore TOTALEMENT toutes les publicités, spams, newsletters commerciales et promotions. "
+    "Ne retiens que les messages importants (personnels, professionnels, école/EPITA, cours/examens, démarches). "
+    "Pour chaque e-mail important retenu, résume en 1 ou 2 phrases l'essentiel et l'action requise.\n"
+    "2. 📅 Consulte mon Google Agenda pour la journée d'aujourd'hui et demain matin, et liste mes rendez-vous avec leurs horaires.\n"
+    "3. 🌤️ Consulte la météo du jour pour ma ville (température, ciel, pluie éventuelle).\n"
+    "4. 📋 Consulte mes tâches Google Tasks en cours.\n"
+    "Présente le résultat avec un ton motivant, clair et structuré avec des émojis."
+)
+
+
+@app_commands.command(name="briefing", description="Génère votre briefing matinal (e-mails triés, agenda, météo)")
+async def briefing_slash(interaction: discord.Interaction) -> None:
+    """Handler de la commande slash /briefing."""
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+
+    logger.info("Commande /briefing de %d", interaction.user.id)
+    await interaction.response.send_message("⏳ Préparation de votre briefing matinal (tri des e-mails, agenda, météo)...")
+    result = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=120)
+
+    if result.get("success"):
+        response_text = result.get("output", "").strip() or "✅ Briefing terminé."
+    else:
+        error = result.get("error", "Erreur inconnue")
+        response_text = f"❌ Erreur : {error}"
+
+    # Si la réponse dépasse 2000 caractères, on la tronque proprement pour Discord
+    if len(response_text) > 2000:
+        response_text = response_text[:1990] + "..."
+
+    await interaction.edit_original_response(content=response_text)
+
+
 @app_commands.command(name="ask", description="Pose une question à l'assistant personnel")
 @app_commands.describe(question="Votre question ou tâche pour l'assistant")
 async def ask_slash(interaction: discord.Interaction, question: str) -> None:
@@ -139,6 +176,7 @@ async def ask_slash(interaction: discord.Interaction, question: str) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
+
 
     logger.info("Commande /ask de %d: '%s'", interaction.user.id, question[:80])
     await interaction.response.send_message("⏳ Traitement en cours...")
@@ -417,6 +455,17 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         res = await forward_to_runner("/usage", continue_session=False)
         await waiting.edit(content=res.get("output", "Aucune information reçue."))
 
+    @bot.command(name="briefing", aliases=["brief"], help="Génère votre briefing matinal (mails triés, agenda, météo)")
+    async def briefing_cmd(ctx: commands.Context) -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        waiting = await ctx.send("⏳ Préparation de votre briefing matinal (tri des e-mails, agenda, météo)...")
+        res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=120)
+        output = res.get("output", "").strip() or "⚠️ Impossible de générer le briefing."
+        if len(output) > 2000:
+            output = output[:1990] + "..."
+        await waiting.edit(content=output)
+
     @bot.command(name="skills", help="Affiche les compétences actives")
     async def skills_cmd(ctx: commands.Context) -> None:
         if not _is_allowed(ctx.author.id):
@@ -426,7 +475,26 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         await waiting.edit(content=res.get("output", "Aucune compétence trouvée."))
 
 
+async def broadcast_discord_message(text: str) -> None:
+    """Diffuse un message (ex: briefing automatique) sur le salon principal de chaque serveur."""
+    bot = _get_bot()
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            if channel.name in ("général", "general", "bot", "assistant") and channel.permissions_for(guild.me).send_messages:
+                try:
+                    if len(text) > 1950:
+                        parts = [text[i:i + 1900] for i in range(0, len(text), 1900)]
+                        for p in parts:
+                            await channel.send(p)
+                    else:
+                        await channel.send(text)
+                except Exception as exc:
+                    logger.warning("Erreur diffusion Discord sur %s: %s", channel.name, exc)
+                break
+
+
 # ── Lancement en arrière-plan ─────────────────────────────────────────────────
+
 
 
 def start_discord_bot() -> None:
