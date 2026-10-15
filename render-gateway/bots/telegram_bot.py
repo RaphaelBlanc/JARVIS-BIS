@@ -34,12 +34,16 @@ from telegram.ext import (
 )
 
 from gateway import (
+    fetch_conversations,
+    fetch_health,
     fetch_models,
     fetch_session,
     forward_to_runner,
     reset_session_remote,
+    resume_conversation_remote,
     update_session_remote,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -220,29 +224,37 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Affiche la liste complète des commandes Antigravity."""
+    """Affiche la liste complète des commandes de l'Assistant Personnel."""
     user = update.effective_user
     if not _is_allowed(user.id):
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
 
     help_text = (
-        "🤖 *Commandes disponibles — Assistant Personnel*\n\n"
+        "🤖 *Commandes de l'Assistant Personnel*\n\n"
+        "⚡ *Productivité & Outils*\n"
+        "• `/briefing` — Résumé matinal (mails importants, agenda, météo, tâches)\n"
+        "• `/resume` — Reprendre une discussion précédente (boutons interactifs)\n"
+        "• `/agenda` — Consulter votre Google Agenda (aujourd'hui, semaine)\n"
+        "• `/tasks` — Gérer vos Google Tasks (lister, ajouter, terminer)\n"
+        "• `/meteo [ville]` — Météo en direct (Open-Meteo mondiale)\n"
+        "• `/search <requête>` — Recherche web DuckDuckGo\n"
+        "• `/summarize <url>` — Résumer une page web ou un article\n"
+        "• `/status` — État complet du système et des services\n\n"
         "💬 *Discussion & Mémoire*\n"
-        "• Écrivez simplement votre message pour échanger avec Antigravity.\n"
+        "• Écrivez simplement votre message pour échanger naturellement.\n"
         "• Vos messages s'enchaînent avec mémoire du contexte !\n"
-        "• Si l'IA pose une question, répondez directement dans le chat.\n"
-        "• `/new` — Démarre une nouvelle conversation (oublie l'historique)\n"
-        "• `/session` — Affiche l'état et les réglages de la session en cours\n\n"
-        "🧠 *Modèles d'IA*\n"
-        "• `/models` — Liste tous les modèles disponibles\n"
-        "• `/setmodel <nom>` — Change le modèle actif (ex: `/setmodel claude-sonnet-4-6`)\n"
-        "• `/effort <low|medium|high|xhigh|max>` — Règle l'effort de réflexion\n"
-        "• `/mode <auto|plan|accept-edits>` — Change le mode d'exécution\n\n"
-        "🛡️ *Permissions & Outils*\n"
-        "• `/permissions <always-proceed|request-review>` — Politique d'exécution des outils\n"
-        "• `/usage` — Affiche la consommation de quota\n"
-        "• `/skills` — Liste les compétences et outils installés\n"
+        "• `/new` — Démarre une nouvelle conversation vierge\n"
+        "• `/compact` — Compacte la mémoire de la conversation en cours\n"
+        "• `/session` — Affiche la configuration de la session active\n\n"
+        "🧠 *Modèles d'IA & Réglages*\n"
+        "• `/models` — Choisir le modèle d'IA (boutons cliquables)\n"
+        "• `/setmodel <nom>` — Changer de modèle directement\n"
+        "• `/effort` — Régler l'effort de réflexion (low/medium/high/max)\n"
+        "• `/mode` — Mode d'exécution (auto, plan, accept-edits)\n"
+        "• `/permissions` — Politique de sécurité des outils\n"
+        "• `/usage` — Quotas et jetons consommés\n"
+        "• `/skills` — Liste des outils et intégrations\n"
         "• `/help` — Affiche cette aide"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
@@ -462,6 +474,343 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update_session_remote(permission_mode=p)
         await query.edit_message_text(f"✅ Politique de permissions : `{p}`", parse_mode="Markdown")
 
+    elif data.startswith("resume:"):
+        cid = data.split(":", 1)[1]
+        await resume_conversation_remote(cid)
+        await query.edit_message_text(
+            f"🔄 <b>Conversation réactivée !</b> (ID: <code>{cid[:8]}...</code>)\n\n"
+            "Vous pouvez reprendre votre échange en envoyant directement votre message.",
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("agenda:"):
+        period = data.split(":", 1)[1]
+        waiting_msg = await query.message.reply_text(f"⏳ Consultation de votre agenda ({period})...")
+        prompt = (
+            f"Consulte mon Google Agenda pour la période suivante : {period}. "
+            "Liste les rendez-vous et événements avec leurs horaires de début et de fin, "
+            "leur titre, lieu éventuel et détails pertinents. "
+            "S'il n'y a aucun événement, confirme-le clairement."
+        )
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        output = res.get("output", "").strip() or "⚠️ Impossible de récupérer l'agenda."
+        await send_or_edit_telegram_response(waiting_msg, output, query.message)
+
+    elif data == "tasks:list":
+        waiting_msg = await query.message.reply_text("⏳ Récupération de vos tâches...")
+        prompt = (
+            "Consulte Google Tasks via le MCP google-tasks. "
+            "Liste toutes les tâches en cours non terminées avec leur statut et date d'échéance éventuelle. "
+            "S'il n'y en a aucune, indique-le clairement."
+        )
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        output = res.get("output", "").strip() or "⚠️ Impossible de récupérer les tâches."
+        await send_or_edit_telegram_response(waiting_msg, output, query.message)
+
+    elif data == "tasks:help_add":
+        await query.message.reply_text(
+            "➕ <b>Ajouter une tâche Google Tasks :</b>\n\n"
+            "Envoyez simplement la commande suivante :\n"
+            "<code>/tasks add Acheter du café</code>\n"
+            "<i>(remplacez par l'intitulé de votre tâche)</i>",
+            parse_mode="HTML",
+        )
+
+    elif data == "tasks:help_done":
+        await query.message.reply_text(
+            "✅ <b>Terminer une tâche Google Tasks :</b>\n\n"
+            "Envoyez simplement la commande suivante :\n"
+            "<code>/tasks done Acheter du café</code>\n"
+            "<i>(remplacez par le nom de la tâche à terminer)</i>",
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("meteo:"):
+        city = data.split(":", 1)[1]
+        waiting_msg = await query.message.reply_text(f"⏳ Consultation météo pour {city}...")
+        prompt = (
+            f"Consulte la météo actuelle et les prévisions pour la ville de '{city}' via le MCP weather. "
+            "Donne la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté."
+        )
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        output = res.get("output", "").strip() or "⚠️ Impossible de récupérer la météo."
+        await send_or_edit_telegram_response(waiting_msg, output, query.message)
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reprend une conversation passée (boutons interactifs ou ID direct)."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args
+    if args:
+        cid = args[0].strip()
+        await resume_conversation_remote(cid)
+        await update.message.reply_text(
+            f"🔄 <b>Conversation réactivée !</b> (ID: <code>{cid[:8]}...</code>)\n\n"
+            "Vous pouvez reprendre votre échange en envoyant directement votre message.",
+            parse_mode="HTML",
+        )
+        return
+
+    convs = await fetch_conversations(limit=6)
+    if not convs:
+        await update.message.reply_text("ℹ️ Aucune conversation passée trouvée.")
+        return
+
+    keyboard = []
+    for c in convs:
+        cid = c.get("id", "")
+        title = c.get("title", "Discussion")
+        date = c.get("date", "")
+        btn_label = f"💬 {date} — {title}"[:55]
+        keyboard.append([InlineKeyboardButton(btn_label, callback_data=f"resume:{cid}")])
+
+    await update.message.reply_text(
+        "📂 <b>Reprendre une discussion précédente :</b>\n"
+        "<i>Cliquez sur une session ci-dessous pour reprendre là où vous vous étiez arrêté :</i>",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+
+
+async def cmd_agenda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Consulte Google Agenda avec boutons interactifs ou argument."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args
+    if not args:
+        keyboard = [
+            [
+                InlineKeyboardButton("📅 Aujourd'hui", callback_data="agenda:aujourd'hui"),
+                InlineKeyboardButton("🌅 Demain", callback_data="agenda:demain"),
+            ],
+            [
+                InlineKeyboardButton("🗓️ Cette semaine", callback_data="agenda:cette semaine"),
+                InlineKeyboardButton("📆 Ce mois-ci", callback_data="agenda:ce mois-ci"),
+            ],
+        ]
+        await update.message.reply_text(
+            "📅 <b>Consulter votre Google Agenda :</b>\n<i>Choisissez la période souhaitée :</i>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+        return
+
+    period = " ".join(args).strip()
+    waiting_msg = await update.message.reply_text(f"⏳ Consultation de votre agenda ({period})...")
+    prompt = (
+        f"Consulte mon Google Agenda pour la période suivante : {period}. "
+        "Liste les rendez-vous et événements avec leurs horaires de début et de fin, "
+        "leur titre, lieu éventuel et détails pertinents. "
+        "S'il n'y a aucun événement, confirme-le clairement."
+    )
+    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+    output = res.get("output", "").strip() or "⚠️ Impossible de récupérer l'agenda."
+    await send_or_edit_telegram_response(waiting_msg, output, update.message)
+
+
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gère Google Tasks (lister, ajouter, terminer) avec boutons ou arguments."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args
+    if not args:
+        keyboard = [
+            [InlineKeyboardButton("📋 Lister mes tâches en cours", callback_data="tasks:list")],
+            [
+                InlineKeyboardButton("➕ Aide Ajout", callback_data="tasks:help_add"),
+                InlineKeyboardButton("✅ Aide Terminer", callback_data="tasks:help_done"),
+            ],
+        ]
+        await update.message.reply_text(
+            "📋 <b>Gestion de Google Tasks :</b>\n\n"
+            "• Cliquez sur le bouton ci-dessous pour voir vos tâches\n"
+            "• Ou tapez <code>/tasks add &lt;titre&gt;</code> pour en ajouter une\n"
+            "• Ou tapez <code>/tasks done &lt;titre&gt;</code> pour la terminer",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+        return
+
+    subcmd = args[0].lower()
+    task_text = " ".join(args[1:]).strip()
+
+    if subcmd in ("list", "lister", "ls"):
+        waiting_msg = await update.message.reply_text("⏳ Récupération de vos tâches...")
+        prompt = (
+            "Consulte Google Tasks via le MCP google-tasks. "
+            "Liste toutes les tâches en cours non terminées avec leur statut et date d'échéance éventuelle. "
+            "S'il n'y en a aucune, indique-le clairement."
+        )
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        output = res.get("output", "").strip() or "⚠️ Impossible de récupérer les tâches."
+        await send_or_edit_telegram_response(waiting_msg, output, update.message)
+    elif subcmd in ("add", "ajouter", "new", "creer"):
+        if not task_text:
+            await update.message.reply_text("⚠️ Précisez le titre de la tâche. Ex: <code>/tasks add Acheter du pain</code>", parse_mode="HTML")
+            return
+        waiting_msg = await update.message.reply_text(f"⏳ Ajout de la tâche '{task_text}'...")
+        prompt = f"Ajoute une nouvelle tâche dans Google Tasks avec le titre : '{task_text}'."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        output = res.get("output", "").strip() or "✅ Tâche ajoutée."
+        await send_or_edit_telegram_response(waiting_msg, output, update.message)
+    elif subcmd in ("done", "terminer", "complete", "finir"):
+        if not task_text:
+            await update.message.reply_text("⚠️ Précisez le titre de la tâche à terminer. Ex: <code>/tasks done Acheter du pain</code>", parse_mode="HTML")
+            return
+        waiting_msg = await update.message.reply_text(f"⏳ Finalisation de la tâche '{task_text}'...")
+        prompt = f"Marque la tâche '{task_text}' comme terminée dans Google Tasks."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        output = res.get("output", "").strip() or "✅ Tâche complétée."
+        await send_or_edit_telegram_response(waiting_msg, output, update.message)
+    else:
+        full_query = " ".join(args)
+        waiting_msg = await update.message.reply_text("⏳ Traitement de votre demande Google Tasks...")
+        prompt = f"Gère Google Tasks selon cette demande : {full_query}."
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        output = res.get("output", "").strip() or "✅ Demande traitée."
+        await send_or_edit_telegram_response(waiting_msg, output, update.message)
+
+
+async def cmd_meteo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Consulte la météo en temps réel (Open-Meteo mondiale sans clé)."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args
+    if not args:
+        keyboard = [
+            [
+                InlineKeyboardButton("📍 Paris", callback_data="meteo:Paris"),
+                InlineKeyboardButton("📍 Lyon", callback_data="meteo:Lyon"),
+            ],
+            [
+                InlineKeyboardButton("📍 Marseille", callback_data="meteo:Marseille"),
+                InlineKeyboardButton("📍 Bordeaux", callback_data="meteo:Bordeaux"),
+            ],
+        ]
+        await update.message.reply_text(
+            "🌤️ <b>Météo mondiale en temps réel :</b>\n"
+            "<i>Choisissez une ville ou tapez <code>/meteo &lt;nom_de_ville&gt;</code> :</i>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+        return
+
+    city = " ".join(args).strip()
+    waiting_msg = await update.message.reply_text(f"⏳ Consultation de la météo pour {city}...")
+    prompt = (
+        f"Consulte la météo actuelle et les prévisions pour la ville de '{city}' via le MCP weather. "
+        "Donne la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté."
+    )
+    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+    output = res.get("output", "").strip() or "⚠️ Impossible de récupérer la météo."
+    await send_or_edit_telegram_response(waiting_msg, output, update.message)
+
+
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Effectue une recherche web via DuckDuckGo."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("🔍 Veuillez préciser votre recherche. Ex: <code>/search actualités IA</code>", parse_mode="HTML")
+        return
+
+    query = " ".join(args).strip()
+    waiting_msg = await update.message.reply_text(f"🔍 Recherche web pour '{query}'...")
+    prompt = (
+        f"Effectue une recherche web avec le MCP duckduckgo_web_search pour la requête suivante : '{query}'. "
+        "Synthétise les informations les plus récentes et pertinentes en citant les sources avec leurs liens."
+    )
+    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+    output = res.get("output", "").strip() or "⚠️ Aucun résultat trouvé."
+    await send_or_edit_telegram_response(waiting_msg, output, update.message)
+
+
+async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Récupère une page web et la résume."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("📄 Veuillez préciser l'URL de la page à résumer. Ex: <code>/summarize https://example.com/article</code>", parse_mode="HTML")
+        return
+
+    target_url = args[0].strip()
+    waiting_msg = await update.message.reply_text(f"⏳ Lecture et résumé de {target_url}...")
+    prompt = (
+        f"Récupère le contenu de l'URL '{target_url}' via le MCP fetch (fetch_readable ou fetch_markdown). "
+        "Résume les points clés de manière synthétique et structurée avec des puces."
+    )
+    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+    output = res.get("output", "").strip() or "⚠️ Impossible de résumer la page."
+    await send_or_edit_telegram_response(waiting_msg, output, update.message)
+
+
+async def cmd_compact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Compacte la mémoire de contexte de la conversation en cours."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    waiting_msg = await update.message.reply_text("🧹 Compactage de la mémoire de conversation...")
+    res = await forward_to_runner("/compact", continue_session=True, timeout=60)
+    output = res.get("output", "").strip() or "✅ Mémoire compactée avec succès."
+    await send_or_edit_telegram_response(waiting_msg, output, update.message)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Affiche le statut global du système et de l'assistant."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    waiting_msg = await update.message.reply_text("⏳ Vérification des composants...")
+    health = await fetch_health()
+    session = await fetch_session()
+
+    runner_ok = health.get("status") == "ok"
+    agy_ok = health.get("agy_available", False)
+
+    status_lines = [
+        "📊 <b>État du Système Assistant Personnel</b>\n",
+        f"• <b>Serveur Maison (home-runner) :</b> {'🟢 En ligne' if runner_ok else '🔴 Inaccessible'}",
+        f"• <b>Moteur Antigravity (agy) :</b> {'🟢 Opérationnel' if agy_ok else '🔴 Dégradé'}",
+        f"• <b>Modèle Actif :</b> <code>{session.get('model', 'défaut')}</code>",
+        f"• <b>Effort de réflexion :</b> <code>{session.get('effort') or 'par défaut'}</code>",
+        f"• <b>Mode d'exécution :</b> <code>{session.get('mode') or 'auto'}</code>",
+        f"• <b>Conversation active :</b> {'🟢 Oui' if session.get('has_active_session') else '⚪ Vierge'}",
+        "\n🔧 <b>Outils & Intégrations actifs :</b>",
+        "• ✉️ Gmail & Google Calendar",
+        "• 📋 Google Tasks",
+        "• 🌤️ Météo mondiale (Open-Meteo)",
+        "• 🔍 Recherche Web DuckDuckGo",
+        "• 📄 Lecteur Web (Fetch)",
+        "\n💡 <i>Utilisez <code>/models</code> pour choisir un autre modèle d'IA.</i>",
+    ]
+    await send_or_edit_telegram_response(waiting_msg, "\n".join(status_lines), update.message)
+
+
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Démarre une nouvelle conversation vierge."""
@@ -631,12 +980,20 @@ from telegram.request import HTTPXRequest
 
 BOT_COMMANDS = [
     BotCommand("briefing", "Briefing matinal (mails triés, agenda, météo)"),
+    BotCommand("resume", "Reprendre une discussion précédente"),
+    BotCommand("agenda", "Consulter Google Agenda (aujourd'hui, semaine)"),
+    BotCommand("tasks", "Gérer Google Tasks (lister, ajouter, terminer)"),
+    BotCommand("meteo", "Météo mondiale en temps réel"),
+    BotCommand("search", "Recherche web DuckDuckGo"),
+    BotCommand("summarize", "Résumer une page web ou un lien"),
+    BotCommand("status", "Statut du système et des composants"),
+    BotCommand("compact", "Compacter la mémoire de discussion"),
     BotCommand("models", "Choisir le modèle d'IA (boutons cliquables)"),
-    BotCommand("effort", "Régler l'effort de réflexion (boutons)"),
-    BotCommand("mode", "Changer le mode d'action (auto, plan)"),
-    BotCommand("permissions", "Régler les permissions (auto/manuel)"),
     BotCommand("new", "Démarrer une nouvelle discussion"),
     BotCommand("session", "Voir les réglages actifs"),
+    BotCommand("effort", "Régler l'effort de réflexion"),
+    BotCommand("mode", "Changer le mode d'action (auto, plan)"),
+    BotCommand("permissions", "Régler les permissions (auto/manuel)"),
     BotCommand("usage", "Consulter quotas et jetons"),
     BotCommand("skills", "Voir les compétences actives"),
     BotCommand("help", "Afficher l'aide complète"),
@@ -667,6 +1024,19 @@ def get_application() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("briefing", cmd_briefing))
     app.add_handler(CommandHandler("brief", cmd_briefing))
+    app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("agenda", cmd_agenda))
+    app.add_handler(CommandHandler("cal", cmd_agenda))
+    app.add_handler(CommandHandler("tasks", cmd_tasks))
+    app.add_handler(CommandHandler("task", cmd_tasks))
+    app.add_handler(CommandHandler("todo", cmd_tasks))
+    app.add_handler(CommandHandler("meteo", cmd_meteo))
+    app.add_handler(CommandHandler("weather", cmd_meteo))
+    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("recherche", cmd_search))
+    app.add_handler(CommandHandler("summarize", cmd_summarize))
+    app.add_handler(CommandHandler("compact", cmd_compact))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("model", cmd_models))
     app.add_handler(CommandHandler("setmodel", cmd_setmodel))

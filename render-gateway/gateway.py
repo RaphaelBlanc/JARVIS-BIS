@@ -89,6 +89,20 @@ async def forward_to_runner(
         return {"success": False, "output": "", "error": str(e)}
 
 
+async def fetch_health() -> dict:
+    """Récupère l'état de santé détaillé du home-runner."""
+    if not HOME_SERVER_URL:
+        return {"status": "error", "error": "HOME_SERVER_URL non configuré"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{HOME_SERVER_URL}/health")
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error("Erreur fetch_health: %s", e)
+        return {"status": "error", "error": str(e)}
+
+
 async def fetch_models() -> dict:
     """Récupère la liste des modèles disponibles auprès du home-runner."""
     if not HOME_SERVER_URL:
@@ -171,3 +185,40 @@ async def reset_session_remote() -> dict:
     except Exception as e:
         logger.error("Erreur reset_session_remote: %s", e)
         return {"error": str(e)}
+
+
+async def fetch_conversations(limit: int = 8) -> list[dict]:
+    """Récupère la liste des conversations passées auprès du home-runner."""
+    if not HOME_SERVER_URL:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{HOME_SERVER_URL}/conversations?limit={limit}",
+                headers={"X-Secret-Key": SECRET_KEY},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("conversations", [])
+    except Exception as e:
+        logger.error("Erreur fetch_conversations: %s", e)
+        return []
+
+
+async def resume_conversation_remote(conversation_id: str) -> dict:
+    """Demande au home-runner de reprendre une conversation spécifique."""
+    if not HOME_SERVER_URL:
+        return {"error": "HOME_SERVER_URL non configuré"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{HOME_SERVER_URL}/conversation/resume",
+                json={"conversation_id": conversation_id},
+                headers={"X-Secret-Key": SECRET_KEY},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error("Erreur resume_conversation_remote: %s", e)
+        return {"error": str(e)}
+

@@ -16,10 +16,13 @@ from discord import app_commands
 from discord.ext import commands
 
 from gateway import (
+    fetch_conversations,
+    fetch_health,
     fetch_models,
     fetch_session,
     forward_to_runner,
     reset_session_remote,
+    resume_conversation_remote,
     update_session_remote,
 )
 
@@ -66,7 +69,16 @@ class AssistantBot(commands.Bot):
     async def setup_hook(self) -> None:
         """Enregistre l'ensemble des commandes slash avec autocomplétion."""
         for cmd in [
+            briefing_slash,
             ask_slash,
+            resume_slash,
+            agenda_slash,
+            tasks_slash,
+            meteo_slash,
+            search_slash,
+            summarize_slash,
+            status_slash,
+            compact_slash,
             setmodel_slash,
             effort_slash,
             mode_slash,
@@ -189,6 +201,212 @@ async def ask_slash(interaction: discord.Interaction, question: str) -> None:
         response_text = f"❌ Erreur : {error}"
 
     await interaction.edit_original_response(content=response_text)
+
+
+async def send_discord_long_response(interaction: discord.Interaction, text: str) -> None:
+    """Envoie une réponse découpée si elle dépasse 2000 caractères."""
+    if not text:
+        text = "✅ Tâche terminée (pas de sortie)."
+    if len(text) <= 2000:
+        await interaction.followup.send(text)
+        return
+    parts = [text[i:i + 1950] for i in range(0, len(text), 1950)]
+    for p in parts:
+        await interaction.followup.send(p)
+
+
+@app_commands.command(name="resume", description="Reprendre une conversation passée (autocomplétion)")
+@app_commands.describe(conversation="Choisissez la conversation à réactiver")
+async def resume_slash(interaction: discord.Interaction, conversation: str) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    res = await resume_conversation_remote(conversation)
+    if "error" in res:
+        await interaction.followup.send(f"❌ Erreur : {res['error']}")
+    else:
+        await interaction.followup.send(
+            f"🔄 **Conversation réactivée !** (ID: `{conversation[:8]}...`)\n"
+            "Vous pouvez reprendre votre échange avec `/ask` ou en discutant avec l'assistant."
+        )
+
+
+@resume_slash.autocomplete("conversation")
+async def resume_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    convs = await fetch_conversations(limit=20)
+    choices = []
+    current_lower = current.lower()
+    for c in convs:
+        cid = c.get("id", "")
+        title = c.get("title", "Discussion")
+        date = c.get("date", "")
+        label = f"[{date}] {title}"
+        if len(label) > 100:
+            label = label[:97] + "..."
+        if not current or current_lower in label.lower() or current_lower in cid.lower():
+            choices.append(app_commands.Choice(name=label, value=cid))
+    return choices[:25]
+
+
+@app_commands.command(name="agenda", description="Consulter votre Google Agenda")
+@app_commands.describe(periode="Période souhaitée")
+@app_commands.choices(periode=[
+    app_commands.Choice(name="📅 Aujourd'hui", value="aujourd'hui"),
+    app_commands.Choice(name="🌅 Demain", value="demain"),
+    app_commands.Choice(name="🗓️ Cette semaine", value="cette semaine"),
+    app_commands.Choice(name="📆 Ce mois-ci", value="ce mois-ci"),
+])
+async def agenda_slash(interaction: discord.Interaction, periode: app_commands.Choice[str]) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    prompt = (
+        f"Consulte mon Google Agenda pour la période suivante : {periode.value}. "
+        "Liste les rendez-vous et événements avec leurs horaires de début et de fin, "
+        "leur titre, lieu éventuel et détails pertinents. "
+        "S'il n'y a aucun événement, confirme-le clairement."
+    )
+    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+    out = res.get("output", "").strip() or "⚠️ Impossible de récupérer l'agenda."
+    await send_discord_long_response(interaction, out)
+
+
+@app_commands.command(name="tasks", description="Gérer vos tâches Google Tasks")
+@app_commands.describe(
+    action="Action à effectuer (lister, ajouter, terminer)",
+    titre="Titre de la tâche (requis pour ajouter ou terminer)",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="📋 Lister mes tâches en cours", value="lister"),
+    app_commands.Choice(name="➕ Ajouter une nouvelle tâche", value="ajouter"),
+    app_commands.Choice(name="✅ Marquer comme terminée", value="terminer"),
+])
+async def tasks_slash(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    titre: Optional[str] = None,
+) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    act = action.value
+
+    if act == "lister":
+        prompt = (
+            "Consulte Google Tasks via le MCP google-tasks. "
+            "Liste toutes les tâches en cours non terminées avec leur statut et date d'échéance éventuelle. "
+            "S'il n'y en a aucune, indique-le clairement."
+        )
+    elif act == "ajouter":
+        if not titre:
+            await interaction.followup.send("⚠️ Veuillez renseigner le champ `titre` pour ajouter une tâche.")
+            return
+        prompt = f"Ajoute une nouvelle tâche dans Google Tasks avec le titre : '{titre}'."
+    elif act == "terminer":
+        if not titre:
+            await interaction.followup.send("⚠️ Veuillez renseigner le champ `titre` pour la tâche à terminer.")
+            return
+        prompt = f"Marque la tâche '{titre}' comme terminée dans Google Tasks."
+    else:
+        prompt = f"Gère Google Tasks pour : {act} {titre or ''}"
+
+    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+    out = res.get("output", "").strip() or "✅ Demande exécutée."
+    await send_discord_long_response(interaction, out)
+
+
+@app_commands.command(name="meteo", description="Consulter la météo mondiale en temps réel")
+@app_commands.describe(ville="Ville ou commune (ex: Paris, Lyon, Tokyo, New York)")
+async def meteo_slash(interaction: discord.Interaction, ville: str = "Paris") -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    prompt = (
+        f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}' via le MCP weather. "
+        "Donne la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté."
+    )
+    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+    out = res.get("output", "").strip() or "⚠️ Impossible de récupérer la météo."
+    await send_discord_long_response(interaction, out)
+
+
+@app_commands.command(name="search", description="Effectuer une recherche web via DuckDuckGo")
+@app_commands.describe(requete="Votre recherche sur le web")
+async def search_slash(interaction: discord.Interaction, requete: str) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    prompt = (
+        f"Effectue une recherche web avec le MCP duckduckgo_web_search pour la requête suivante : '{requete}'. "
+        "Synthétise les informations les plus récentes et pertinentes en citant les sources avec leurs liens."
+    )
+    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+    out = res.get("output", "").strip() or "⚠️ Aucun résultat trouvé."
+    await send_discord_long_response(interaction, out)
+
+
+@app_commands.command(name="summarize", description="Résumer une page web ou un article")
+@app_commands.describe(url="Adresse URL complète à lire et résumer")
+async def summarize_slash(interaction: discord.Interaction, url: str) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    prompt = (
+        f"Récupère le contenu de l'URL '{url}' via le MCP fetch (fetch_readable ou fetch_markdown). "
+        "Résume les points clés de manière synthétique et structurée avec des puces."
+    )
+    res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+    out = res.get("output", "").strip() or "⚠️ Impossible de résumer la page."
+    await send_discord_long_response(interaction, out)
+
+
+@app_commands.command(name="status", description="Afficher l'état du système et de l'assistant")
+async def status_slash(interaction: discord.Interaction) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    health = await fetch_health()
+    session = await fetch_session()
+
+    runner_ok = health.get("status") == "ok"
+    agy_ok = health.get("agy_available", False)
+
+    status_lines = [
+        "**📊 État du Système Assistant Personnel**\n",
+        f"• **Serveur Maison (home-runner) :** {'🟢 En ligne' if runner_ok else '🔴 Inaccessible'}",
+        f"• **Moteur Antigravity (agy) :** {'🟢 Opérationnel' if agy_ok else '🔴 Dégradé'}",
+        f"• **Modèle Actif :** `{session.get('model', 'défaut')}`",
+        f"• **Effort de réflexion :** `{session.get('effort') or 'par défaut'}`",
+        f"• **Mode d'exécution :** `{session.get('mode') or 'auto'}`",
+        f"• **Conversation active :** {'🟢 Oui' if session.get('has_active_session') else '⚪ Vierge'}",
+        "\n🔧 **Outils & Intégrations actifs :**",
+        "• ✉️ Gmail & Google Calendar",
+        "• 📋 Google Tasks",
+        "• 🌤️ Météo mondiale (Open-Meteo)",
+        "• 🔍 Recherche Web DuckDuckGo",
+        "• 📄 Lecteur Web (Fetch)",
+        "\n💡 *Pour changer de modèle, utilisez `/setmodel`.*",
+    ]
+    await interaction.followup.send("\n".join(status_lines))
+
+
+@app_commands.command(name="compact", description="Compacter la mémoire de la conversation")
+async def compact_slash(interaction: discord.Interaction) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    res = await forward_to_runner("/compact", continue_session=True, timeout=60)
+    out = res.get("output", "").strip() or "✅ Mémoire compactée."
+    await send_discord_long_response(interaction, out)
 
 
 @app_commands.command(name="setmodel", description="Change le modèle d'IA actif (menu déroulant)")
@@ -473,6 +691,162 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         waiting = await ctx.send("⏳ Récupération des compétences...")
         res = await forward_to_runner("/skills", continue_session=False)
         await waiting.edit(content=res.get("output", "Aucune compétence trouvée."))
+
+    @bot.command(name="resume", help="Reprendre une conversation passée. Ex: !resume <id>")
+    async def resume_cmd(ctx: commands.Context, conversation_id: str = "") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        if not conversation_id:
+            convs = await fetch_conversations(limit=5)
+            if not convs:
+                await ctx.send("ℹ️ Aucune conversation passée trouvée.")
+                return
+            lines = ["**📂 Conversations récentes :**\n"]
+            for c in convs:
+                lines.append(f"• `!resume {c['id']}` — *{c['date']}* : {c['title']}")
+            await ctx.send("\n".join(lines))
+            return
+        res = await resume_conversation_remote(conversation_id.strip())
+        if "error" in res:
+            await ctx.send(f"❌ Erreur : {res['error']}")
+        else:
+            await ctx.send(f"🔄 **Conversation réactivée !** (`{conversation_id[:8]}...`)")
+
+    @bot.command(name="agenda", aliases=["cal"], help="Consulter votre Google Agenda. Ex: !agenda aujourd'hui")
+    async def agenda_cmd(ctx: commands.Context, *, periode: str = "aujourd'hui") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        waiting = await ctx.send(f"⏳ Consultation de votre agenda ({periode})...")
+        prompt = (
+            f"Consulte mon Google Agenda pour la période suivante : {periode}. "
+            "Liste les rendez-vous et événements avec leurs horaires de début et de fin, "
+            "leur titre, lieu éventuel et détails pertinents. "
+            "S'il n'y a aucun événement, confirme-le clairement."
+        )
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        out = res.get("output", "").strip() or "⚠️ Impossible de récupérer l'agenda."
+        if len(out) > 2000:
+            out = out[:1990] + "..."
+        await waiting.edit(content=out)
+
+    @bot.command(name="tasks", aliases=["task", "todo"], help="Gérer Google Tasks. Ex: !tasks list OU !tasks add Acheter du pain")
+    async def tasks_cmd(ctx: commands.Context, action: str = "list", *, details: str = "") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        act = action.lower()
+        if act in ("list", "lister", "ls"):
+            prompt = (
+                "Consulte Google Tasks via le MCP google-tasks. "
+                "Liste toutes les tâches en cours non terminées avec leur statut et date d'échéance éventuelle. "
+                "S'il n'y en a aucune, indique-le clairement."
+            )
+        elif act in ("add", "ajouter", "new"):
+            if not details:
+                await ctx.send("⚠️ Spécifiez un titre : `!tasks add <titre>`")
+                return
+            prompt = f"Ajoute une nouvelle tâche dans Google Tasks avec le titre : '{details}'."
+        elif act in ("done", "terminer", "complete"):
+            if not details:
+                await ctx.send("⚠️ Spécifiez la tâche à terminer : `!tasks done <titre>`")
+                return
+            prompt = f"Marque la tâche '{details}' comme terminée dans Google Tasks."
+        else:
+            prompt = f"Gère Google Tasks pour : {action} {details}"
+
+        waiting = await ctx.send("⏳ Traitement Google Tasks...")
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        out = res.get("output", "").strip() or "✅ Tâche effectuée."
+        if len(out) > 2000:
+            out = out[:1990] + "..."
+        await waiting.edit(content=out)
+
+    @bot.command(name="meteo", aliases=["weather"], help="Consulter la météo mondiale. Ex: !meteo Tokyo")
+    async def meteo_cmd(ctx: commands.Context, *, ville: str = "Paris") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        waiting = await ctx.send(f"⏳ Consultation météo pour {ville}...")
+        prompt = (
+            f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}' via le MCP weather. "
+            "Donne la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté."
+        )
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        out = res.get("output", "").strip() or "⚠️ Impossible de récupérer la météo."
+        if len(out) > 2000:
+            out = out[:1990] + "..."
+        await waiting.edit(content=out)
+
+    @bot.command(name="search", aliases=["recherche"], help="Recherche web DuckDuckGo. Ex: !search intelligence artificielle")
+    async def search_cmd(ctx: commands.Context, *, requete: str = "") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        if not requete:
+            await ctx.send("⚠️ Spécifiez une recherche : `!search <mots-clés>`")
+            return
+        waiting = await ctx.send(f"🔍 Recherche pour '{requete}'...")
+        prompt = (
+            f"Effectue une recherche web avec le MCP duckduckgo_web_search pour la requête suivante : '{requete}'. "
+            "Synthétise les informations les plus récentes et pertinentes en citant les sources avec leurs liens."
+        )
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        out = res.get("output", "").strip() or "⚠️ Aucun résultat."
+        if len(out) > 2000:
+            out = out[:1990] + "..."
+        await waiting.edit(content=out)
+
+    @bot.command(name="summarize", help="Résumer une page web. Ex: !summarize https://...")
+    async def summarize_cmd(ctx: commands.Context, url: str = "") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        if not url:
+            await ctx.send("⚠️ Spécifiez une URL : `!summarize <url>`")
+            return
+        waiting = await ctx.send(f"⏳ Résumé de {url}...")
+        prompt = (
+            f"Récupère le contenu de l'URL '{url}' via le MCP fetch (fetch_readable ou fetch_markdown). "
+            "Résume les points clés de manière synthétique et structurée avec des puces."
+        )
+        res = await forward_to_runner(prompt, continue_session=False, timeout=60)
+        out = res.get("output", "").strip() or "⚠️ Impossible de résumer la page."
+        if len(out) > 2000:
+            out = out[:1990] + "..."
+        await waiting.edit(content=out)
+
+    @bot.command(name="status", help="Statut global du système et des services")
+    async def status_cmd(ctx: commands.Context) -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        waiting = await ctx.send("⏳ Vérification des composants...")
+        health = await fetch_health()
+        session = await fetch_session()
+
+        runner_ok = health.get("status") == "ok"
+        agy_ok = health.get("agy_available", False)
+
+        status_lines = [
+            "**📊 État du Système Assistant Personnel**\n",
+            f"• **Serveur Maison (home-runner) :** {'🟢 En ligne' if runner_ok else '🔴 Inaccessible'}",
+            f"• **Moteur Antigravity (agy) :** {'🟢 Opérationnel' if agy_ok else '🔴 Dégradé'}",
+            f"• **Modèle Actif :** `{session.get('model', 'défaut')}`",
+            f"• **Effort de réflexion :** `{session.get('effort') or 'par défaut'}`",
+            f"• **Mode d'exécution :** `{session.get('mode') or 'auto'}`",
+            f"• **Conversation active :** {'🟢 Oui' if session.get('has_active_session') else '⚪ Vierge'}",
+            "\n🔧 **Outils & Intégrations actifs :**",
+            "• ✉️ Gmail & Google Calendar",
+            "• 📋 Google Tasks",
+            "• 🌤️ Météo mondiale (Open-Meteo)",
+            "• 🔍 Recherche Web DuckDuckGo",
+            "• 📄 Lecteur Web (Fetch)",
+        ]
+        await waiting.edit(content="\n".join(status_lines))
+
+    @bot.command(name="compact", help="Compacter la mémoire de contexte")
+    async def compact_cmd(ctx: commands.Context) -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        waiting = await ctx.send("🧹 Compactage de la mémoire...")
+        res = await forward_to_runner("/compact", continue_session=True, timeout=60)
+        out = res.get("output", "").strip() or "✅ Mémoire compactée."
+        await waiting.edit(content=out)
 
 
 async def broadcast_discord_message(text: str) -> None:

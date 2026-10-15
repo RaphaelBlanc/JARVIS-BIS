@@ -6,11 +6,15 @@ capture stdout/stderr et retourne un dict structuré.
 """
 
 import asyncio
+import datetime
+import json
 import logging
 import os
 import re
 import shutil
+from pathlib import Path
 from typing import Optional
+
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,7 @@ SESSION_CONFIG = {
     "effort": None,
     "mode": None,
     "has_active_session": False,
+    "conversation_id": None,
     "permission_mode": "always-proceed",  # always-proceed | request-review
 }
 
@@ -99,7 +104,60 @@ def update_session(
 def reset_session() -> dict:
     """Réinitialise la session conversationnelle (démarre une nouvelle conversation vierge)."""
     SESSION_CONFIG["has_active_session"] = False
+    SESSION_CONFIG["conversation_id"] = None
     return dict(SESSION_CONFIG)
+
+
+def resume_conversation(conv_id: str) -> dict:
+    """Active une conversation passée par son identifiant pour les futurs échanges."""
+    SESSION_CONFIG["conversation_id"] = conv_id.strip()
+    SESSION_CONFIG["has_active_session"] = True
+    return dict(SESSION_CONFIG)
+
+
+def list_recent_conversations(limit: int = 8) -> list[dict]:
+    """Scanne le répertoire brain d'Antigravity et retourne les conversations récentes avec leur résumé."""
+    brain_dir = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+    if not brain_dir.exists():
+        return []
+
+    conversations = []
+    for item in brain_dir.iterdir():
+        if not item.is_dir():
+            continue
+        transcript_file = item / ".system_generated" / "logs" / "transcript.jsonl"
+        if not transcript_file.exists():
+            continue
+
+        try:
+            mtime = transcript_file.stat().st_mtime
+            date_str = datetime.datetime.fromtimestamp(mtime).strftime("%d/%m %H:%M")
+            title = "Discussion sans titre"
+            with open(transcript_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                        if obj.get("type") == "USER_INPUT":
+                            raw = obj.get("content", "")
+                            m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", raw, re.DOTALL)
+                            req = m.group(1).strip() if m else raw.strip()
+                            title = req.replace("\n", " ")[:50].strip()
+                            break
+                    except Exception:
+                        pass
+
+            conversations.append({
+                "id": item.name,
+                "title": title,
+                "date": date_str,
+                "timestamp": mtime,
+            })
+        except Exception:
+            continue
+
+    conversations.sort(key=lambda c: c["timestamp"], reverse=True)
+    return conversations[:limit]
+
 
 
 async def run_agy(
@@ -140,9 +198,13 @@ async def run_agy(
     # Construction des arguments agy
     cmd = [agy_path]
 
-    # Continuité de conversation (-c)
-    if continue_session and SESSION_CONFIG["has_active_session"] and not reset_session_flag:
+    # Reprise de conversation ciblée (--conversation) ou continue (-c)
+    target_conv = SESSION_CONFIG.get("conversation_id")
+    if target_conv and not reset_session_flag:
+        cmd.extend(["--conversation", target_conv])
+    elif continue_session and SESSION_CONFIG["has_active_session"] and not reset_session_flag:
         cmd.append("-c")
+
 
     # Modèle
     active_model = model or SESSION_CONFIG.get("model")

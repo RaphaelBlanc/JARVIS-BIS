@@ -20,10 +20,13 @@ from agy_bridge import (
     KNOWN_MODELS,
     find_agy,
     get_session_info,
+    list_recent_conversations,
     reset_session as bridge_reset_session,
+    resume_conversation,
     run_agy,
     update_session,
 )
+
 
 # ---------------------------------------------------------------------------
 # Chargement de la configuration
@@ -217,6 +220,28 @@ async def session_reset(request: Request):
     res = bridge_reset_session()
     logger.info("Session conversationnelle réinitialisée.")
     return {"status": "reset", "session": res}
+
+
+@app.get("/conversations", summary="Liste les conversations récentes")
+async def get_conversations(request: Request, limit: int = 8):
+    """Retourne la liste des sessions passées récentes."""
+    _check_secret(request)
+    convs = list_recent_conversations(limit=limit)
+    return {"conversations": convs}
+
+
+class ResumeConvRequest(BaseModel):
+    conversation_id: str
+
+
+@app.post("/conversation/resume", summary="Reprendre une conversation spécifique")
+async def resume_conv(request: Request, body: ResumeConvRequest):
+    """Active une conversation passée par son identifiant."""
+    _check_secret(request)
+    res = resume_conversation(body.conversation_id)
+    logger.info("Reprise de la conversation %s.", body.conversation_id)
+    return {"status": "resumed", "session": res}
+
 
 
 @app.post("/run", response_model=RunResponse, summary="Exécute un prompt via agy")
