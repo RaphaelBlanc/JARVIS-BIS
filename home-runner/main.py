@@ -16,7 +16,14 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from agy_bridge import find_agy, run_agy
+from agy_bridge import (
+    KNOWN_MODELS,
+    find_agy,
+    get_session_info,
+    reset_session as bridge_reset_session,
+    run_agy,
+    update_session,
+)
 
 # ---------------------------------------------------------------------------
 # Chargement de la configuration
@@ -92,6 +99,12 @@ class RunRequest(BaseModel):
         le=600,
         description="Timeout en secondes (1–600, défaut depuis AGY_TIMEOUT).",
     )
+    model: str | None = Field(default=None, description="Modèle spécifique.")
+    effort: str | None = Field(default=None, description="Effort de raisonnement.")
+    mode: str | None = Field(default=None, description="Mode d'exécution.")
+    continue_session: bool = Field(default=True, description="Poursuivre la conversation existante.")
+    reset_session: bool = Field(default=False, description="Démarrer une nouvelle conversation vierge.")
+    permission_mode: str | None = Field(default=None, description="Politique de permission.")
 
 
 class RunResponse(BaseModel):
@@ -100,6 +113,16 @@ class RunResponse(BaseModel):
     success: bool
     output: str
     error: str | None = None
+    session: dict | None = None
+
+
+class SessionUpdateRequest(BaseModel):
+    """Mise à jour des paramètres de session."""
+
+    model: str | None = None
+    effort: str | None = None
+    mode: str | None = None
+    permission_mode: str | None = None
 
 # ---------------------------------------------------------------------------
 # Helpers d'authentification
@@ -150,6 +173,7 @@ async def health():
         "agy_available": agy_available,
         "agy_path": agy_path,
         "agy_timeout_default": AGY_TIMEOUT,
+        "session": get_session_info(),
     }
 
     if not agy_available:
@@ -159,25 +183,66 @@ async def health():
     return payload
 
 
+@app.get("/models", summary="Liste des modèles disponibles")
+async def list_models(request: Request):
+    """Retourne la liste des modèles Antigravity supportés et le modèle actif."""
+    _check_secret(request)
+    return {"models": KNOWN_MODELS, "current": get_session_info().get("model")}
+
+
+@app.get("/session", summary="Configuration de session active")
+async def session_info(request: Request):
+    """Retourne l'état courant de la session."""
+    _check_secret(request)
+    return get_session_info()
+
+
+@app.post("/session", summary="Mettre à jour la configuration de session")
+async def session_update(request: Request, body: SessionUpdateRequest):
+    """Change le modèle, l'effort ou le mode d'exécution."""
+    _check_secret(request)
+    updated = update_session(
+        model=body.model,
+        effort=body.effort,
+        mode=body.mode,
+        permission_mode=body.permission_mode,
+    )
+    return {"status": "updated", "session": updated}
+
+
+@app.post("/session/reset", summary="Réinitialise la conversation")
+async def session_reset(request: Request):
+    """Oublie l'historique et démarre une session vierge."""
+    _check_secret(request)
+    res = bridge_reset_session()
+    logger.info("Session conversationnelle réinitialisée.")
+    return {"status": "reset", "session": res}
+
+
 @app.post("/run", response_model=RunResponse, summary="Exécute un prompt via agy")
 async def run(request: Request, body: RunRequest):
     """
-    Lance Antigravity CLI avec le prompt fourni.
-
-    Authentification : header **X-Secret-Key** obligatoire.
-
-    - **prompt** : texte de la requête à envoyer à agy.
-    - **timeout** : délai maximal en secondes avant interruption forcée.
+    Lance Antigravity CLI avec le prompt fourni et les options de session.
     """
     _check_secret(request)
 
     logger.info(
-        "POST /run — prompt: %.80s… (timeout=%ds)",
+        "POST /run — prompt: %.80s… (timeout=%ds, continue=%s)",
         body.prompt,
         body.timeout,
+        body.continue_session,
     )
 
-    result = await run_agy(prompt=body.prompt, timeout=body.timeout)
+    result = await run_agy(
+        prompt=body.prompt,
+        timeout=body.timeout,
+        model=body.model,
+        effort=body.effort,
+        mode=body.mode,
+        continue_session=body.continue_session,
+        reset_session_flag=body.reset_session,
+        permission_mode=body.permission_mode,
+    )
 
     if not result["success"]:
         logger.warning("run_agy a échoué : %s", result.get("error"))
@@ -186,6 +251,7 @@ async def run(request: Request, body: RunRequest):
         success=result["success"],
         output=result["output"],
         error=result.get("error"),
+        session=result.get("session"),
     )
 
 # ---------------------------------------------------------------------------

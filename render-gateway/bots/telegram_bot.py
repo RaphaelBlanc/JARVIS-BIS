@@ -22,7 +22,13 @@ from telegram.ext import (
     filters,
 )
 
-from gateway import forward_to_runner
+from gateway import (
+    fetch_models,
+    fetch_session,
+    forward_to_runner,
+    reset_session_remote,
+    update_session_remote,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,24 +77,208 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Répond à la commande /help avec les instructions d'utilisation."""
+    """Affiche la liste complète des commandes Antigravity."""
     user = update.effective_user
     if not _is_allowed(user.id):
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
 
+    help_text = (
+        "🤖 *Commandes disponibles — Assistant Personnel*\n\n"
+        "💬 *Discussion & Mémoire*\n"
+        "• Écrivez simplement votre message pour échanger avec Antigravity.\n"
+        "• Vos messages s'enchaînent avec mémoire du contexte !\n"
+        "• Si l'IA pose une question, répondez directement dans le chat.\n"
+        "• `/new` — Démarre une nouvelle conversation (oublie l'historique)\n"
+        "• `/session` — Affiche l'état et les réglages de la session en cours\n\n"
+        "🧠 *Modèles d'IA*\n"
+        "• `/models` — Liste tous les modèles disponibles\n"
+        "• `/setmodel <nom>` — Change le modèle actif (ex: `/setmodel claude-sonnet-4-6`)\n"
+        "• `/effort <low|medium|high|xhigh|max>` — Règle l'effort de réflexion\n"
+        "• `/mode <auto|plan|accept-edits>` — Change le mode d'exécution\n\n"
+        "🛡️ *Permissions & Outils*\n"
+        "• `/permissions <always-proceed|request-review>` — Politique d'exécution des outils\n"
+        "• `/usage` — Affiche la consommation de quota\n"
+        "• `/skills` — Liste les compétences et outils installés\n"
+        "• `/help` — Affiche cette aide"
+    )
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+
+async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Affiche la liste des modèles disponibles avec le modèle actif."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    data = await fetch_models()
+    models_list = data.get("models", [])
+    current = data.get("current", "")
+
+    lines = ["🧠 *Modèles Antigravity disponibles :*\n"]
+    for m in models_list:
+        mid = m.get("id")
+        name = m.get("name")
+        desc = m.get("desc", "")
+        prefix = "⭐ " if mid == current else "• "
+        lines.append(f"{prefix}`{mid}`\n   _{name}_ — {desc}\n")
+
+    lines.append("\n👉 Pour changer : `/setmodel <nom>`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Change le modèle d'IA actif pour la session."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "⚠️ Précisez le nom du modèle. Exemple :\n`/setmodel claude-sonnet-4-6`\n`/setmodel gemini-3.8-flash-high`\n\nTapez `/models` pour voir la liste.",
+            parse_mode="Markdown",
+        )
+        return
+
+    chosen_model = args[0].strip()
+    res = await update_session_remote(model=chosen_model)
+    if "error" in res:
+        await update.message.reply_text(f"❌ Erreur : {res['error']}")
+    else:
+        await update.message.reply_text(
+            f"✅ Modèle changé avec succès !\nActif : `{chosen_model}`",
+            parse_mode="Markdown",
+        )
+
+
+async def cmd_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Règle le niveau de raisonnement."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args
+    valid = ["low", "medium", "high", "xhigh", "max"]
+    if not args or args[0].lower() not in valid:
+        await update.message.reply_text(
+            f"⚠️ Spécifiez un niveau valide : `{', '.join(valid)}`\nExemple : `/effort high`",
+            parse_mode="Markdown",
+        )
+        return
+
+    effort_val = args[0].lower()
+    await update_session_remote(effort=effort_val)
+    await update.message.reply_text(f"✅ Niveau d'effort réglé sur : `{effort_val}`", parse_mode="Markdown")
+
+
+async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Règle le mode d'exécution d'Antigravity."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args
+    valid = ["accept-edits", "auto", "plan"]
+    if not args or args[0].lower() not in valid:
+        await update.message.reply_text(
+            f"⚠️ Spécifiez un mode valide : `{', '.join(valid)}`\nExemple : `/mode plan`",
+            parse_mode="Markdown",
+        )
+        return
+
+    mode_val = args[0].lower()
+    await update_session_remote(mode=mode_val)
+    await update.message.reply_text(f"✅ Mode d'exécution réglé sur : `{mode_val}`", parse_mode="Markdown")
+
+
+async def cmd_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Règle la politique de permissions pour les commandes sensibles."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args
+    valid = ["always-proceed", "request-review"]
+    if not args or args[0].lower() not in valid:
+        await update.message.reply_text(
+            "⚠️ Spécifiez une politique :\n"
+            "• `always-proceed` — Exécute les commandes automatiquement\n"
+            "• `request-review` — Demande confirmation avant actions sensibles\n\n"
+            "Exemple : `/permissions always-proceed`",
+            parse_mode="Markdown",
+        )
+        return
+
+    perm_val = args[0].lower()
+    await update_session_remote(permission_mode=perm_val)
+    await update.message.reply_text(f"✅ Politique de permissions : `{perm_val}`", parse_mode="Markdown")
+
+
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Démarre une nouvelle conversation vierge."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    await reset_session_remote()
     await update.message.reply_text(
-        "ℹ️ *Aide — Assistant Personnel*\n\n"
-        "• Envoyez n'importe quel message texte pour interroger votre assistant.\n"
-        "• /start — Message de bienvenue\n"
-        "• /help — Affiche ce message\n\n"
-        "_Le traitement peut prendre jusqu'à 2 minutes selon la complexité de la tâche._",
+        "🧹 *Nouvelle conversation démarrée !*\nL'historique précédent a été réinitialisé.",
         parse_mode="Markdown",
     )
 
 
+async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Affiche les paramètres de la session active."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    s = await fetch_session()
+    text = (
+        "⚙️ *Configuration de la session active :*\n\n"
+        f"• *Modèle :* `{s.get('model', 'défaut')}`\n"
+        f"• *Effort de réflexion :* `{s.get('effort') or 'par défaut'}`\n"
+        f"• *Mode d'exécution :* `{s.get('mode') or 'auto'}`\n"
+        f"• *Permissions :* `{s.get('permission_mode', 'always-proceed')}`\n"
+        f"• *Conversation en cours :* `{'Oui' if s.get('has_active_session') else 'Non (vierge)'}`"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Interroge et affiche la consommation de quota d'Antigravity."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    waiting_msg = await update.message.reply_text("⏳ Récupération des quotas...")
+    res = await forward_to_runner("/usage", continue_session=False)
+    await waiting_msg.edit_text(res.get("output", "Aucune information de quota retournée."))
+
+
+async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Liste les compétences et intégrations actives."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    waiting_msg = await update.message.reply_text("⏳ Récupération des compétences...")
+    res = await forward_to_runner("/skills", continue_session=False)
+    await waiting_msg.edit_text(res.get("output", "Aucune compétence trouvée."))
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Traite les messages texte entrants et transmet au home-runner."""
+    """Traite les messages texte entrants avec mémoire de contexte conversationnel."""
     user = update.effective_user
     if not _is_allowed(user.id):
         logger.warning("Message refusé de l'utilisateur Telegram %d.", user.id)
@@ -104,7 +294,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Envoie un message temporaire "en cours de traitement"
     waiting_msg = await update.message.reply_text("⏳ Traitement en cours...")
 
-    result = await forward_to_runner(prompt)
+    # Exécution avec continuité de session activée (multi-turn)
+    result = await forward_to_runner(prompt, continue_session=True)
 
     if result.get("success"):
         response_text = result.get("output", "").strip() or "✅ Tâche terminée (pas de sortie)."
@@ -123,12 +314,7 @@ from telegram.request import HTTPXRequest
 
 
 def get_application() -> Application:
-    """Construit et retourne l'Application Telegram (singleton).
-
-    Returns:
-        L'instance `Application` de python-telegram-bot configurée avec
-        les handlers de commandes et de messages.
-    """
+    """Construit et retourne l'Application Telegram (singleton)."""
     global _application
     if _application is not None:
         return _application
@@ -144,12 +330,28 @@ def get_application() -> Application:
         pool_timeout=30.0,
     )
     app = Application.builder().token(TELEGRAM_TOKEN).request(req).build()
+
+    # Enregistrement de tous les handlers de commandes
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("models", cmd_models))
+    app.add_handler(CommandHandler("model", cmd_session))
+    app.add_handler(CommandHandler("setmodel", cmd_setmodel))
+    app.add_handler(CommandHandler("effort", cmd_effort))
+    app.add_handler(CommandHandler("mode", cmd_mode))
+    app.add_handler(CommandHandler("permissions", cmd_permissions))
+    app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("clear", cmd_new))
+    app.add_handler(CommandHandler("session", cmd_session))
+    app.add_handler(CommandHandler("usage", cmd_usage))
+    app.add_handler(CommandHandler("quota", cmd_usage))
+    app.add_handler(CommandHandler("skills", cmd_skills))
+
+    # Handler messages texte normaux
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     _application = app
-    logger.info("Application Telegram configurée avec pool de connexions (size=10).")
+    logger.info("Application Telegram configurée avec l'ensemble des commandes Antigravity.")
     return _application
 
 

@@ -16,30 +16,43 @@ SECRET_KEY: str = os.getenv("SECRET_KEY", "")
 MAX_RESPONSE_LENGTH: int = 4000
 
 
-async def forward_to_runner(prompt: str, timeout: int = 130) -> dict:
-    """Transmet un prompt au home-runner et retourne sa réponse.
-
-    Args:
-        prompt: Le texte à envoyer au runner.
-        timeout: Délai maximum en secondes avant abandon (défaut: 130).
-
-    Returns:
-        Un dictionnaire avec les clés:
-            - ``success`` (bool): True si la requête a réussi.
-            - ``output`` (str): La réponse du runner (tronquée si > 4000 chars).
-            - ``error`` (str | None): Message d'erreur en cas d'échec.
-    """
+async def forward_to_runner(
+    prompt: str,
+    timeout: int = 130,
+    model: str | None = None,
+    effort: str | None = None,
+    mode: str | None = None,
+    continue_session: bool = True,
+    reset_session: bool = False,
+    permission_mode: str | None = None,
+) -> dict:
+    """Transmet un prompt au home-runner et retourne sa réponse."""
     if not HOME_SERVER_URL:
         logger.error("HOME_SERVER_URL n'est pas configuré.")
         return {"success": False, "output": "", "error": "HOME_SERVER_URL non configuré"}
 
-    logger.info("Transmission du prompt au home-runner (%d chars).", len(prompt))
+    logger.info("Transmission au home-runner: prompt=%.60s… (continue=%s)", prompt, continue_session)
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
+            payload = {
+                "prompt": prompt,
+                "timeout": 120,
+                "continue_session": continue_session,
+                "reset_session": reset_session,
+            }
+            if model:
+                payload["model"] = model
+            if effort:
+                payload["effort"] = effort
+            if mode:
+                payload["mode"] = mode
+            if permission_mode:
+                payload["permission_mode"] = permission_mode
+
             resp = await client.post(
                 f"{HOME_SERVER_URL}/run",
-                json={"prompt": prompt, "timeout": 120},
+                json=payload,
                 headers={"X-Secret-Key": SECRET_KEY},
             )
             resp.raise_for_status()
@@ -74,3 +87,87 @@ async def forward_to_runner(prompt: str, timeout: int = 130) -> dict:
     except Exception as e:
         logger.exception("Erreur inattendue dans forward_to_runner.")
         return {"success": False, "output": "", "error": str(e)}
+
+
+async def fetch_models() -> dict:
+    """Récupère la liste des modèles disponibles auprès du home-runner."""
+    if not HOME_SERVER_URL:
+        return {"success": False, "models": [], "error": "HOME_SERVER_URL non configuré"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{HOME_SERVER_URL}/models",
+                headers={"X-Secret-Key": SECRET_KEY},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error("Erreur fetch_models: %s", e)
+        return {"success": False, "models": [], "error": str(e)}
+
+
+async def fetch_session() -> dict:
+    """Récupère les informations de session du home-runner."""
+    if not HOME_SERVER_URL:
+        return {"error": "HOME_SERVER_URL non configuré"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{HOME_SERVER_URL}/session",
+                headers={"X-Secret-Key": SECRET_KEY},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error("Erreur fetch_session: %s", e)
+        return {"error": str(e)}
+
+
+async def update_session_remote(
+    model: str | None = None,
+    effort: str | None = None,
+    mode: str | None = None,
+    permission_mode: str | None = None,
+) -> dict:
+    """Met à jour les paramètres de session du home-runner."""
+    if not HOME_SERVER_URL:
+        return {"error": "HOME_SERVER_URL non configuré"}
+    try:
+        payload = {}
+        if model:
+            payload["model"] = model
+        if effort:
+            payload["effort"] = effort
+        if mode:
+            payload["mode"] = mode
+        if permission_mode:
+            payload["permission_mode"] = permission_mode
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{HOME_SERVER_URL}/session",
+                json=payload,
+                headers={"X-Secret-Key": SECRET_KEY},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error("Erreur update_session_remote: %s", e)
+        return {"error": str(e)}
+
+
+async def reset_session_remote() -> dict:
+    """Réinitialise la session active sur le home-runner."""
+    if not HOME_SERVER_URL:
+        return {"error": "HOME_SERVER_URL non configuré"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{HOME_SERVER_URL}/session/reset",
+                headers={"X-Secret-Key": SECRET_KEY},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error("Erreur reset_session_remote: %s", e)
+        return {"error": str(e)}
