@@ -1,0 +1,38 @@
+[Unit]
+Description=Assistant Personnel — Home Runner (FastAPI + agy bridge)
+Documentation=https://github.com/xenospacex/assistant-perso
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=xenospacex
+Group=xenospacex
+
+WorkingDirectory=/home/xenospacex/Bureau/assistant-perso/home-runner
+
+# Charge les variables d'environnement depuis .env
+EnvironmentFile=/home/xenospacex/Bureau/assistant-perso/home-runner/.env
+
+# Lance uvicorn depuis le venv Python du projet
+ExecStart=/home/xenospacex/Bureau/assistant-perso/home-runner/.venv/bin/uvicorn \
+    main:app \
+    --host 0.0.0.0 \
+    --port ${PORT} \
+    --log-level info
+
+# Redémarrage automatique en cas d'erreur (pas en cas d'arrêt propre)
+Restart=on-failure
+RestartSec=5s
+
+# Sécurité minimale
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logs disponibles via journalctl -u assistant-home-runner
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=assistant-home-runner
+
+[Install]
+WantedBy=multi-user.target
