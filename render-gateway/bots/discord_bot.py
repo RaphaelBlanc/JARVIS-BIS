@@ -224,27 +224,107 @@ async def send_discord_long_response(interaction: discord.Interaction, text: str
         await interaction.followup.send(p)
 
 
-@app_commands.command(name="resume", description="Reprendre une conversation passée (autocomplétion)")
-@app_commands.describe(conversation="Choisissez la conversation à réactiver")
+async def clear_channel_messages(channel: Optional[discord.abc.Messageable], limit: int = 100) -> None:
+    """Efface les messages précédents dans le salon."""
+    if not channel:
+        return
+    try:
+        if hasattr(channel, "purge"):
+            await channel.purge(limit=limit)
+            return
+    except discord.Forbidden:
+        logger.warning("Permissions insuffisantes pour purger le salon, tentative message par message.")
+    except Exception as exc:
+        logger.warning("Erreur lors du purge du salon : %s", exc)
+
+    # Repli : suppression des messages accessibles
+    try:
+        async for msg in channel.history(limit=limit):
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning("Erreur suppression message par message : %s", exc)
+
+
+async def replay_conversation_history(channel: discord.abc.Messageable, history: list[dict]) -> None:
+    """Affiche les anciens prompts et réponses pour la conversation réactivée."""
+    if not history:
+        return
+
+    for turn in history:
+        prompt_txt = turn.get("prompt", "").strip()
+        resp_txt = turn.get("response", "").strip()
+
+        if prompt_txt:
+            msg_p = f"👤 **Vous :**\n{prompt_txt}"
+            if len(msg_p) > 2000:
+                msg_p = msg_p[:1990] + "..."
+            try:
+                await channel.send(msg_p)
+            except Exception as e:
+                logger.warning("Erreur affichage prompt historique : %s", e)
+
+        if resp_txt:
+            header = "🤖 **Assistant :**\n"
+            full_text = header + resp_txt
+            if len(full_text) <= 2000:
+                try:
+                    await channel.send(full_text)
+                except Exception as e:
+                    logger.warning("Erreur affichage réponse historique : %s", e)
+            else:
+                parts = [resp_txt[i:i + 1950] for i in range(0, len(resp_txt), 1950)]
+                for idx, p in enumerate(parts):
+                    prefix = header if idx == 0 else ""
+                    try:
+                        await channel.send(f"{prefix}{p}")
+                    except Exception as e:
+                        logger.warning("Erreur affichage bloc réponse : %s", e)
+
+
+@app_commands.command(name="resume", description="Reprendre une conversation passée (vide et recharge le salon)")
+@app_commands.describe(conversation="Choisissez la conversation à réactiver ou 'Nouvelle discussion'")
 async def resume_slash(interaction: discord.Interaction, conversation: str) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
+
+    await interaction.response.defer(ephemeral=True)
+
+    # 1. Efface les messages précédents dans le salon
+    if interaction.channel:
+        await clear_channel_messages(interaction.channel)
+
+    # 2. Si l'utilisateur choisit 'new' (Nouvelle discussion) : réinitialise et n'affiche rien
+    if conversation == "new":
+        await reset_session_remote()
+        await interaction.followup.send("✨ **Nouvelle conversation prête.** Le salon a été vidé.", ephemeral=True)
+        return
+
+    # 3. Réactivation d'une ancienne conversation et rechargement de l'historique
     res = await resume_conversation_remote(conversation)
     if "error" in res:
-        await interaction.followup.send(f"❌ Erreur : {res['error']}")
-    else:
-        await interaction.followup.send(
-            f"🔄 **Conversation réactivée !** (ID: `{conversation[:8]}...`)\n"
-            "Vous pouvez reprendre votre échange avec `/ask` ou en discutant avec l'assistant."
-        )
+        await interaction.followup.send(f"❌ Erreur : {res['error']}", ephemeral=True)
+        return
+
+    history = res.get("history", [])
+    if interaction.channel and history:
+        await replay_conversation_history(interaction.channel, history)
+
+    await interaction.followup.send(
+        f"🔄 **Conversation réactivée !** ({len(history)} échanges rechargés)",
+        ephemeral=True,
+    )
 
 
 @resume_slash.autocomplete("conversation")
 async def resume_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     convs = await fetch_conversations(limit=20)
-    choices = []
+    choices = [
+        app_commands.Choice(name="➕ [Nouvelle discussion] Démarrer une conversation vierge", value="new")
+    ]
     current_lower = current.lower()
     for c in convs:
         cid = c.get("id", "")
@@ -507,14 +587,16 @@ async def permissions_slash(interaction: discord.Interaction, policy: app_comman
     await interaction.followup.send(f"✅ Politique de permissions : `{policy.value}`")
 
 
-@app_commands.command(name="new", description="Démarre une nouvelle conversation vierge")
+@app_commands.command(name="new", description="Démarre une nouvelle conversation vierge (vide le salon)")
 async def new_slash(interaction: discord.Interaction) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
     await reset_session_remote()
-    await interaction.followup.send("🧹 **Nouvelle conversation démarrée !** L'historique précédent a été effacé.")
+    if interaction.channel:
+        await clear_channel_messages(interaction.channel)
+    await interaction.followup.send("✨ **Nouvelle conversation prête.** Le salon a été vidé.", ephemeral=True)
 
 
 @app_commands.command(name="models", description="Liste les modèles Antigravity disponibles")
@@ -670,12 +752,12 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         await update_session_remote(permission_mode=perm_val.lower())
         await ctx.send(f"✅ Politique de permissions : `{perm_val.lower()}`")
 
-    @bot.command(name="new", help="Démarre une nouvelle conversation vierge")
+    @bot.command(name="new", aliases=["clear", "reset"], help="Démarre une nouvelle conversation vierge (vide le salon)")
     async def new_cmd(ctx: commands.Context) -> None:
         if not _is_allowed(ctx.author.id):
             return
         await reset_session_remote()
-        await ctx.send("🧹 **Nouvelle conversation démarrée !** L'historique précédent a été effacé.")
+        await clear_channel_messages(ctx.channel)
 
     @bot.command(name="session", help="Affiche l'état de la session active")
     async def session_cmd(ctx: commands.Context) -> None:
@@ -719,25 +801,42 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         res = await forward_to_runner("/skills", continue_session=False)
         await waiting.edit(content=res.get("output", "Aucune compétence trouvée."))
 
-    @bot.command(name="resume", help="Reprendre une conversation passée. Ex: !resume <id>")
+    @bot.command(name="resume", help="Reprendre une conversation passée (vide et recharge le salon). Ex: !resume <id>")
     async def resume_cmd(ctx: commands.Context, conversation_id: str = "") -> None:
         if not _is_allowed(ctx.author.id):
             return
-        if not conversation_id:
-            convs = await fetch_conversations(limit=5)
+        cid = conversation_id.strip()
+        if not cid:
+            convs = await fetch_conversations(limit=6)
             if not convs:
                 await ctx.send("ℹ️ Aucune conversation passée trouvée.")
                 return
-            lines = ["**📂 Conversations récentes :**\n"]
+            lines = [
+                "📂 **Conversations passées disponibles :**",
+                "• `!resume new` — ➕ Démarrer une nouvelle discussion vierge",
+            ]
             for c in convs:
                 lines.append(f"• `!resume {c['id']}` — *{c['date']}* : {c['title']}")
+            lines.append("\n👉 Tapez `!resume <id>` pour réactiver et recharger une conversation.")
             await ctx.send("\n".join(lines))
             return
-        res = await resume_conversation_remote(conversation_id.strip())
+
+        # 1. Efface les messages précédents
+        await clear_channel_messages(ctx.channel)
+
+        # 2. Nouvelle conversation
+        if cid.lower() in ("new", "nouvelle", "reset"):
+            await reset_session_remote()
+            return
+
+        # 3. Ancienne conversation
+        res = await resume_conversation_remote(cid)
         if "error" in res:
             await ctx.send(f"❌ Erreur : {res['error']}")
-        else:
-            await ctx.send(f"🔄 **Conversation réactivée !** (`{conversation_id[:8]}...`)")
+            return
+
+        history = res.get("history", [])
+        await replay_conversation_history(ctx.channel, history)
 
     @bot.command(name="agenda", aliases=["cal"], help="Consulter votre Google Agenda. Ex: !agenda aujourd'hui")
     async def agenda_cmd(ctx: commands.Context, *, periode: str = "aujourd'hui") -> None:

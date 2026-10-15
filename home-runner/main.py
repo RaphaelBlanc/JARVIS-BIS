@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from agy_bridge import (
     KNOWN_MODELS,
     find_agy,
+    get_conversation_history,
     get_session_info,
     list_recent_conversations,
     reset_session as bridge_reset_session,
@@ -236,11 +237,20 @@ class ResumeConvRequest(BaseModel):
 
 @app.post("/conversation/resume", summary="Reprendre une conversation spécifique")
 async def resume_conv(request: Request, body: ResumeConvRequest):
-    """Active une conversation passée par son identifiant."""
+    """Active une conversation passée par son identifiant et retourne son historique."""
     _check_secret(request)
     res = resume_conversation(body.conversation_id)
-    logger.info("Reprise de la conversation %s.", body.conversation_id)
-    return {"status": "resumed", "session": res}
+    history = res.get("history", [])
+    logger.info("Reprise de la conversation %s (%d tours trouvés).", body.conversation_id, len(history))
+    return {"status": "resumed", "session": res["session"], "history": history}
+
+
+@app.get("/conversation/{conversation_id}/history", summary="Historique des échanges d'une conversation")
+async def get_conv_history(request: Request, conversation_id: str, limit: int = 15):
+    """Retourne l'historique des prompts et réponses d'une conversation."""
+    _check_secret(request)
+    history = get_conversation_history(conversation_id, max_turns=limit)
+    return {"conversation_id": conversation_id, "history": history}
 
 
 

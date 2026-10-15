@@ -108,11 +108,56 @@ def reset_session() -> dict:
     return dict(SESSION_CONFIG)
 
 
+def get_conversation_history(conv_id: str, max_turns: int = 15) -> list[dict]:
+    """Extrait les échanges passés (prompt utilisateur et réponse finale de l'assistant) du transcript."""
+    brain_dir = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+    transcript_file = brain_dir / conv_id.strip() / ".system_generated" / "logs" / "transcript.jsonl"
+    if not transcript_file.exists():
+        return []
+
+    turns = []
+    current_prompt = None
+    last_response = None
+
+    with open(transcript_file, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+                typ = obj.get("type")
+                content = obj.get("content", "")
+
+                if typ == "USER_INPUT":
+                    if current_prompt and last_response:
+                        turns.append({"prompt": current_prompt, "response": last_response})
+                    current_prompt = None
+                    last_response = None
+
+                    if not content or "<CONTEXT_SUMMARY>" in content:
+                        continue
+                    m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", content, re.DOTALL)
+                    current_prompt = (m.group(1).strip() if m else content.strip())
+
+                elif typ == "PLANNER_RESPONSE" and content:
+                    last_response = content.strip()
+            except Exception:
+                pass
+
+    if current_prompt and last_response:
+        turns.append({"prompt": current_prompt, "response": last_response})
+
+    return turns[-max_turns:]
+
+
 def resume_conversation(conv_id: str) -> dict:
     """Active une conversation passée par son identifiant pour les futurs échanges."""
-    SESSION_CONFIG["conversation_id"] = conv_id.strip()
+    clean_id = conv_id.strip()
+    SESSION_CONFIG["conversation_id"] = clean_id
     SESSION_CONFIG["has_active_session"] = True
-    return dict(SESSION_CONFIG)
+    history = get_conversation_history(clean_id)
+    return {
+        "session": dict(SESSION_CONFIG),
+        "history": history,
+    }
 
 
 def list_recent_conversations(limit: int = 8) -> list[dict]:

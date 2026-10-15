@@ -173,12 +173,69 @@ def split_telegram_message(text: str, max_length: int = 4000) -> list[str]:
     return chunks
 
 
+_TRACKED_CHAT_MESSAGES: dict[int, list[int]] = {}
+
+
+def track_chat_message(chat_id: int, message_id: int) -> None:
+    """Enregistre l'ID d'un message afin de pouvoir le supprimer lors d'un changement de conversation."""
+    if chat_id not in _TRACKED_CHAT_MESSAGES:
+        _TRACKED_CHAT_MESSAGES[chat_id] = []
+    _TRACKED_CHAT_MESSAGES[chat_id].append(message_id)
+
+
+async def clear_telegram_chat(bot, chat_id: int) -> None:
+    """Efface les messages précédents enregistrés dans la conversation."""
+    msg_ids = _TRACKED_CHAT_MESSAGES.pop(chat_id, [])
+    for mid in msg_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+
+
+async def replay_telegram_history(bot, chat_id: int, history: list[dict]) -> None:
+    """Affiche les anciens prompts et réponses d'une conversation passée."""
+    if not history:
+        return
+
+    for turn in history:
+        prompt_txt = turn.get("prompt", "").strip()
+        resp_txt = turn.get("response", "").strip()
+
+        if prompt_txt:
+            prompt_html = markdown_to_telegram_html(prompt_txt)
+            text_p = f"👤 <b>Vous :</b>\n{prompt_html}"
+            chunks_p = split_telegram_message(text_p)
+            for cp in chunks_p:
+                try:
+                    m = await bot.send_message(chat_id=chat_id, text=cp, parse_mode="HTML", disable_web_page_preview=True)
+                    track_chat_message(chat_id, m.message_id)
+                except Exception:
+                    m = await bot.send_message(chat_id=chat_id, text=f"👤 Vous :\n{prompt_txt[:3500]}")
+                    track_chat_message(chat_id, m.message_id)
+
+        if resp_txt:
+            resp_html = markdown_to_telegram_html(resp_txt)
+            text_r = f"🤖 <b>Assistant :</b>\n{resp_html}"
+            chunks_r = split_telegram_message(text_r)
+            for cr in chunks_r:
+                try:
+                    m = await bot.send_message(chat_id=chat_id, text=cr, parse_mode="HTML", disable_web_page_preview=True)
+                    track_chat_message(chat_id, m.message_id)
+                except Exception:
+                    m = await bot.send_message(chat_id=chat_id, text=f"🤖 Assistant :\n{resp_txt[:3500]}")
+                    track_chat_message(chat_id, m.message_id)
+
+
 async def send_or_edit_telegram_response(
     waiting_msg,
     raw_text: str,
     reply_to_message=None,
 ) -> None:
     """Met en forme en HTML Telegram et édite/envoie la réponse avec gestion propre des messages longs et erreurs."""
+    if waiting_msg and hasattr(waiting_msg, "chat_id") and hasattr(waiting_msg, "message_id"):
+        track_chat_message(waiting_msg.chat_id, waiting_msg.message_id)
+
     html_text = markdown_to_telegram_html(raw_text)
     chunks = split_telegram_message(html_text)
 
@@ -196,9 +253,11 @@ async def send_or_edit_telegram_response(
     if len(chunks) > 1 and reply_to_message:
         for chunk in chunks[1:]:
             try:
-                await reply_to_message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+                m = await reply_to_message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+                track_chat_message(m.chat_id, m.message_id)
             except Exception:
-                await reply_to_message.reply_text(chunk)
+                m = await reply_to_message.reply_text(chunk)
+                track_chat_message(m.chat_id, m.message_id)
 
 
 
@@ -476,12 +535,24 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     elif data.startswith("resume:"):
         cid = data.split(":", 1)[1]
-        await resume_conversation_remote(cid)
-        await query.edit_message_text(
-            f"🔄 <b>Conversation réactivée !</b> (ID: <code>{cid[:8]}...</code>)\n\n"
-            "Vous pouvez reprendre votre échange en envoyant directement votre message.",
-            parse_mode="HTML",
-        )
+        chat_id = query.message.chat_id
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        # 1. Efface les messages précédents
+        await clear_telegram_chat(context.bot, chat_id)
+
+        # 2. Nouvelle conversation
+        if cid == "new":
+            await reset_session_remote()
+            return
+
+        # 3. Ancienne conversation
+        res = await resume_conversation_remote(cid)
+        history = res.get("history", [])
+        await replay_telegram_history(context.bot, chat_id, history)
 
     elif data.startswith("agenda:"):
         period = data.split(":", 1)[1]
@@ -556,15 +627,21 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
 
+    chat_id = update.effective_chat.id
+    track_chat_message(chat_id, update.message.message_id)
+
     args = context.args
     if args:
         cid = args[0].strip()
-        await resume_conversation_remote(cid)
-        await update.message.reply_text(
-            f"🔄 <b>Conversation réactivée !</b> (ID: <code>{cid[:8]}...</code>)\n\n"
-            "Vous pouvez reprendre votre échange en envoyant directement votre message.",
-            parse_mode="HTML",
-        )
+        await clear_telegram_chat(context.bot, chat_id)
+
+        if cid.lower() in ("new", "nouvelle", "reset"):
+            await reset_session_remote()
+            return
+
+        res = await resume_conversation_remote(cid)
+        history = res.get("history", [])
+        await replay_telegram_history(context.bot, chat_id, history)
         return
 
     convs = await fetch_conversations(limit=6)
@@ -572,7 +649,9 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("ℹ️ Aucune conversation passée trouvée.")
         return
 
-    keyboard = []
+    keyboard = [
+        [InlineKeyboardButton("➕ [Nouvelle discussion vierge]", callback_data="resume:new")]
+    ]
     for c in convs:
         cid = c.get("id", "")
         title = c.get("title", "Discussion")
@@ -580,12 +659,13 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         btn_label = f"💬 {date} — {title}"[:55]
         keyboard.append([InlineKeyboardButton(btn_label, callback_data=f"resume:{cid}")])
 
-    await update.message.reply_text(
+    m = await update.message.reply_text(
         "📂 <b>Reprendre une discussion précédente :</b>\n"
-        "<i>Cliquez sur une session ci-dessous pour reprendre là où vous vous étiez arrêté :</i>",
+        "<i>Cliquez sur une session ci-dessous pour recharger l'échange :</i>",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML",
     )
+    track_chat_message(chat_id, m.message_id)
 
 
 async def cmd_agenda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -853,17 +933,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Démarre une nouvelle conversation vierge."""
+    """Démarre une nouvelle conversation vierge (vide le chat)."""
     user = update.effective_user
     if not _is_allowed(user.id):
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
 
+    chat_id = update.effective_chat.id
+    track_chat_message(chat_id, update.message.message_id)
     await reset_session_remote()
-    await update.message.reply_text(
-        "🧹 *Nouvelle conversation démarrée !*\nL'historique précédent a été réinitialisé.",
-        parse_mode="Markdown",
-    )
+    await clear_telegram_chat(context.bot, chat_id)
+    # Affiche rien si c'est une nouvelle !
 
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -997,7 +1077,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
 
-    _save_chat_id(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    _save_chat_id(chat_id)
+    track_chat_message(chat_id, update.message.message_id)
 
     prompt = update.message.text.strip()
     if not prompt:
