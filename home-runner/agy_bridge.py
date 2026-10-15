@@ -40,6 +40,7 @@ def find_agy() -> Optional[str]:
 
     # 2. Emplacements de repli
     candidates = [
+        os.path.expanduser("~/.local/bin/agy"),
         os.path.expanduser("~/.gemini/antigravity-cli/agy"),
         "/usr/local/bin/agy",
         "/usr/bin/agy",
@@ -55,7 +56,7 @@ def find_agy() -> Optional[str]:
 
 async def run_agy(prompt: str, timeout: int = 120) -> dict:
     """
-    Lance `agy` en subprocess asynchrone et lui envoie le prompt via stdin.
+    Lance `agy` en subprocess non-interactif (-p / --print).
 
     Args:
         prompt:  Texte de la requête à envoyer à agy.
@@ -88,17 +89,20 @@ async def run_agy(prompt: str, timeout: int = 120) -> dict:
 
     proc: Optional[asyncio.subprocess.Process] = None
     try:
+        # Exécute agy en mode print non-interactif
         proc = await asyncio.create_subprocess_exec(
             agy_path,
-            stdin=asyncio.subprocess.PIPE,
+            "-p",
+            prompt,
+            "--output-format",
+            "text",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
 
-        # Envoie le prompt puis ferme stdin (EOF) pour signifier la fin de l'entrée
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(input=(prompt + "\n").encode("utf-8")),
+            proc.communicate(),
             timeout=timeout,
         )
 

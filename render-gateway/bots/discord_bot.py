@@ -96,18 +96,10 @@ def _get_bot() -> AssistantBot:
 
 # ── Commande slash /ask ───────────────────────────────────────────────────────
 
-# Note: définie avant d'être ajoutée dans setup_hook
-ask_slash = app_commands.Command(
-    name="ask",
-    description="Pose une question à l'assistant personnel",
-    callback=None,  # sera défini ci-dessous
-)
 
-
+@app_commands.command(name="ask", description="Pose une question à l'assistant personnel")
 @app_commands.describe(question="Votre question ou tâche pour l'assistant")
-async def _ask_slash_callback(
-    interaction: discord.Interaction, question: str
-) -> None:
+async def ask_slash(interaction: discord.Interaction, question: str) -> None:
     """Handler de la commande slash /ask."""
     if not _is_allowed(interaction.user.id):
         logger.warning("Accès refusé pour l'utilisateur Discord %d.", interaction.user.id)
@@ -127,11 +119,6 @@ async def _ask_slash_callback(
         logger.error("Erreur runner (slash /ask): %s", error)
 
     await interaction.edit_original_response(content=response_text)
-
-
-# Attache le callback à la commande slash
-ask_slash._callback = _ask_slash_callback
-ask_slash.callback = _ask_slash_callback
 
 
 # ── Commandes préfixées ───────────────────────────────────────────────────────

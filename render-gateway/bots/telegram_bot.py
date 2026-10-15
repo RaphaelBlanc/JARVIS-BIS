@@ -6,8 +6,10 @@ les transmet au home-runner via `gateway.forward_to_runner()`,
 et répond à l'utilisateur avec le résultat.
 """
 
+import asyncio
 import logging
 import os
+import threading
 from typing import Optional
 
 from fastapi import APIRouter, Request, Response
@@ -152,6 +154,56 @@ async def setup_webhook(app: Application, webhook_url: str) -> None:
     """
     await app.bot.set_webhook(url=webhook_url)
     logger.info("Webhook Telegram enregistré sur: %s", webhook_url)
+
+
+# ── Polling en arrière-plan (mode dev / test local) ───────────────────────────
+
+_stop_event = threading.Event()
+_polling_thread: Optional[threading.Thread] = None
+
+
+def start_telegram_polling() -> None:
+    """Lance le polling Telegram dans un thread séparé (pour tests locaux sans webhook)."""
+    global _polling_thread
+    if not TELEGRAM_TOKEN:
+        logger.warning("TELEGRAM_TOKEN non défini — bot Telegram non démarré.")
+        return
+
+    _stop_event.clear()
+
+    def _run() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        app = get_application()
+
+        async def _async_polling():
+            await app.initialize()
+            # Supprime le webhook existant pour permettre le polling
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            await app.start()
+            await app.updater.start_polling()
+            logger.info("Bot Telegram démarré en mode POLLING (local) !")
+            while not _stop_event.is_set():
+                await asyncio.sleep(1)
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+
+        try:
+            loop.run_until_complete(_async_polling())
+        except Exception as exc:
+            logger.error("Erreur dans le polling Telegram: %s", exc, exc_info=True)
+        finally:
+            loop.close()
+
+    _polling_thread = threading.Thread(target=_run, name="telegram-polling", daemon=True)
+    _polling_thread.start()
+    logger.info("Thread de polling Telegram lancé.")
+
+
+def stop_telegram_polling() -> None:
+    """Arrête le polling Telegram."""
+    _stop_event.set()
 
 
 # ── Router FastAPI ────────────────────────────────────────────────────────────

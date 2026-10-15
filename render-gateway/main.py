@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 from bots.telegram_bot import (  # noqa: E402
     get_application as get_telegram_app,
     setup_webhook,
+    start_telegram_polling,
+    stop_telegram_polling,
     telegram_router,
     TELEGRAM_WEBHOOK_URL,
 )
@@ -83,10 +85,10 @@ async def lifespan(app: FastAPI):
     Démarrage:
         - Vérifie les variables d'environnement
         - Lance le bot Discord en arrière-plan
-        - Configure le webhook Telegram
+        - Configure le webhook Telegram (si URL fournie) ou démarre le polling (en local)
 
     Arrêt:
-        - Ferme proprement le bot Discord
+        - Ferme proprement les bots Discord et Telegram
     """
     logger.info("=== Démarrage du render-gateway v%s ===", VERSION)
     _check_env()
@@ -94,7 +96,7 @@ async def lifespan(app: FastAPI):
     # Démarre le bot Discord dans un thread daemon
     start_discord_bot()
 
-    # Configure le webhook Telegram si les variables sont présentes
+    # Configure Telegram (Webhook si en prod sur Render, ou Polling si en local)
     if TELEGRAM_TOKEN and TELEGRAM_WEBHOOK_URL:
         try:
             tg_app = get_telegram_app()
@@ -102,10 +104,11 @@ async def lifespan(app: FastAPI):
             await setup_webhook(tg_app, webhook_url)
         except Exception as exc:
             logger.error("Impossible de configurer le webhook Telegram: %s", exc, exc_info=True)
+    elif TELEGRAM_TOKEN:
+        logger.info("TELEGRAM_WEBHOOK_URL non défini — Démarrage du bot Telegram en mode Polling local...")
+        start_telegram_polling()
     else:
-        logger.warning(
-            "Webhook Telegram non configuré (TELEGRAM_TOKEN ou TELEGRAM_WEBHOOK_URL manquant)."
-        )
+        logger.warning("TELEGRAM_TOKEN manquant — bot Telegram inactif.")
 
     logger.info("render-gateway prêt à recevoir des requêtes.")
 
@@ -113,6 +116,10 @@ async def lifespan(app: FastAPI):
 
     # Arrêt
     logger.info("=== Arrêt du render-gateway ===")
+    try:
+        stop_telegram_polling()
+    except Exception as exc:
+        logger.error("Erreur lors de l'arrêt du polling Telegram: %s", exc)
     try:
         await stop_discord_bot()
     except Exception as exc:
