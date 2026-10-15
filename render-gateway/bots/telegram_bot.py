@@ -117,6 +117,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await waiting_msg.edit_text(response_text)
 
 
+from telegram.request import HTTPXRequest
+
 # ── Application Telegram ──────────────────────────────────────────────────────
 
 
@@ -134,13 +136,20 @@ def get_application() -> Application:
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN n'est pas défini dans les variables d'environnement.")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    req = HTTPXRequest(
+        connection_pool_size=10,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        connect_timeout=30.0,
+        pool_timeout=30.0,
+    )
+    app = Application.builder().token(TELEGRAM_TOKEN).request(req).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     _application = app
-    logger.info("Application Telegram configurée.")
+    logger.info("Application Telegram configurée avec pool de connexions (size=10).")
     return _application
 
 

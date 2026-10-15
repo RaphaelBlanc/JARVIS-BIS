@@ -72,6 +72,23 @@ class AssistantBot(commands.Bot):
 
     async def on_ready(self) -> None:
         logger.info("Bot Discord connecté en tant que %s (ID: %d).", self.user, self.user.id)
+        if not self.guilds:
+            invite_url = (
+                f"https://discord.com/oauth2/authorize?client_id={self.user.id}"
+                "&permissions=277025507392&scope=bot%20applications.commands"
+            )
+            logger.warning(
+                "Le bot Discord n'a rejoint aucun serveur ! Invitez-le via ce lien : %s",
+                invite_url,
+            )
+        else:
+            for guild in self.guilds:
+                logger.info("Serveur Discord rejoint: %s (ID: %d)", guild.name, guild.id)
+                channels = [
+                    c.name for c in guild.text_channels
+                    if c.permissions_for(guild.me).send_messages
+                ]
+                logger.info("Salons accessibles dans '%s': %s", guild.name, ", ".join(f"#{c}" for c in channels))
 
     async def on_command_error(self, ctx: commands.Context, error: Exception) -> None:
         """Gestion globale des erreurs de commandes préfixées."""
