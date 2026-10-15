@@ -13,9 +13,15 @@ import threading
 from typing import Optional
 
 from fastapi import APIRouter, Request, Response
-from telegram import Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -105,8 +111,38 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
+def fuzzy_resolve_model(query: str, models: list[dict]) -> Optional[str]:
+    """Résout intelligemment un nom de modèle même avec une saisie approximative."""
+    q = query.lower().strip()
+    if not q:
+        return None
+    # 1. Correspondance exacte
+    for m in models:
+        if m.get("id", "").lower() == q:
+            return m["id"]
+    # 2. Sous-chaîne dans l'ID
+    for m in models:
+        if q in m.get("id", "").lower():
+            return m["id"]
+    # 3. Sous-chaîne dans le nom complet
+    for m in models:
+        if q in m.get("name", "").lower():
+            return m["id"]
+    # 4. Raccourcis courants
+    aliases = {
+        "claude": "claude-sonnet-4-6",
+        "sonnet": "claude-sonnet-4-6",
+        "opus": "claude-opus-4-6-thinking",
+        "flash": "gemini-3.8-flash-high",
+        "gemini": "gemini-3.8-flash-high",
+        "gpt": "gpt-oss-120b-medium",
+        "oss": "gpt-oss-120b-medium",
+    }
+    return aliases.get(q)
+
+
 async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Affiche la liste des modèles disponibles avec le modèle actif."""
+    """Affiche la liste des modèles avec des boutons cliquables interactifs."""
     user = update.effective_user
     if not _is_allowed(user.id):
         await update.message.reply_text("⛔ Accès non autorisé.")
@@ -116,46 +152,58 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     models_list = data.get("models", [])
     current = data.get("current", "")
 
-    lines = ["🧠 *Modèles Antigravity disponibles :*\n"]
+    keyboard = []
     for m in models_list:
         mid = m.get("id")
-        name = m.get("name")
-        desc = m.get("desc", "")
-        prefix = "⭐ " if mid == current else "• "
-        lines.append(f"{prefix}`{mid}`\n   _{name}_ — {desc}\n")
+        name = m.get("name", mid)
+        label = f"⭐ {name}" if mid == current else name
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"setmodel:{mid}")])
 
-    lines.append("\n👉 Pour changer : `/setmodel <nom>`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "🧠 *Choisissez un modèle d'IA :*\n_(cliquez sur un bouton pour l'activer immédiatement)_",
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Change le modèle d'IA actif pour la session."""
+    """Change le modèle d'IA actif (avec autocomplétion par boutons ou saisie souple)."""
     user = update.effective_user
     if not _is_allowed(user.id):
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
 
     args = context.args
+    data = await fetch_models()
+    models_list = data.get("models", [])
+
     if not args:
+        # Aucun argument : affiche directement les boutons cliquables !
+        return await cmd_models(update, context)
+
+    input_text = " ".join(args)
+    resolved = fuzzy_resolve_model(input_text, models_list)
+
+    if not resolved:
         await update.message.reply_text(
-            "⚠️ Précisez le nom du modèle. Exemple :\n`/setmodel claude-sonnet-4-6`\n`/setmodel gemini-3.8-flash-high`\n\nTapez `/models` pour voir la liste.",
+            f"⚠️ Modèle `{input_text}` non reconnu.\nCliquez sur `/models` pour choisir directement parmi les boutons.",
             parse_mode="Markdown",
         )
         return
 
-    chosen_model = args[0].strip()
-    res = await update_session_remote(model=chosen_model)
+    res = await update_session_remote(model=resolved)
     if "error" in res:
         await update.message.reply_text(f"❌ Erreur : {res['error']}")
     else:
         await update.message.reply_text(
-            f"✅ Modèle changé avec succès !\nActif : `{chosen_model}`",
+            f"✅ Modèle changé avec succès !\nActif : `{resolved}`",
             parse_mode="Markdown",
         )
 
 
 async def cmd_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Règle le niveau de raisonnement."""
+    """Règle le niveau de raisonnement avec boutons interactifs."""
     user = update.effective_user
     if not _is_allowed(user.id):
         await update.message.reply_text("⛔ Accès non autorisé.")
@@ -163,9 +211,22 @@ async def cmd_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     args = context.args
     valid = ["low", "medium", "high", "xhigh", "max"]
+
     if not args or args[0].lower() not in valid:
+        keyboard = [
+            [
+                InlineKeyboardButton("low", callback_data="effort:low"),
+                InlineKeyboardButton("medium", callback_data="effort:medium"),
+                InlineKeyboardButton("high", callback_data="effort:high"),
+            ],
+            [
+                InlineKeyboardButton("xhigh", callback_data="effort:xhigh"),
+                InlineKeyboardButton("max", callback_data="effort:max"),
+            ],
+        ]
         await update.message.reply_text(
-            f"⚠️ Spécifiez un niveau valide : `{', '.join(valid)}`\nExemple : `/effort high`",
+            "⚡ *Choisissez le niveau de réflexion (reasoning effort) :*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
         return
@@ -176,7 +237,7 @@ async def cmd_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Règle le mode d'exécution d'Antigravity."""
+    """Règle le mode d'exécution d'Antigravity avec boutons interactifs."""
     user = update.effective_user
     if not _is_allowed(user.id):
         await update.message.reply_text("⛔ Accès non autorisé.")
@@ -184,9 +245,20 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     args = context.args
     valid = ["accept-edits", "auto", "plan"]
+
     if not args or args[0].lower() not in valid:
+        keyboard = [
+            [
+                InlineKeyboardButton("Auto (standard)", callback_data="mode:auto"),
+                InlineKeyboardButton("Plan (réflexion)", callback_data="mode:plan"),
+            ],
+            [
+                InlineKeyboardButton("Accept-Edits", callback_data="mode:accept-edits"),
+            ],
+        ]
         await update.message.reply_text(
-            f"⚠️ Spécifiez un mode valide : `{', '.join(valid)}`\nExemple : `/mode plan`",
+            "🛠️ *Choisissez le mode d'exécution d'Antigravity :*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
         return
@@ -197,7 +269,7 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Règle la politique de permissions pour les commandes sensibles."""
+    """Règle la politique de permissions avec boutons interactifs."""
     user = update.effective_user
     if not _is_allowed(user.id):
         await update.message.reply_text("⛔ Accès non autorisé.")
@@ -205,12 +277,19 @@ async def cmd_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     args = context.args
     valid = ["always-proceed", "request-review"]
+
     if not args or args[0].lower() not in valid:
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Auto (Always Proceed)", callback_data="perm:always-proceed"),
+            ],
+            [
+                InlineKeyboardButton("🛡️ Demander confirmation (Request Review)", callback_data="perm:request-review"),
+            ],
+        ]
         await update.message.reply_text(
-            "⚠️ Spécifiez une politique :\n"
-            "• `always-proceed` — Exécute les commandes automatiquement\n"
-            "• `request-review` — Demande confirmation avant actions sensibles\n\n"
-            "Exemple : `/permissions always-proceed`",
+            "🛡️ *Politique de permissions des outils sensibles :*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
         return
@@ -218,6 +297,33 @@ async def cmd_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     perm_val = args[0].lower()
     await update_session_remote(permission_mode=perm_val)
     await update.message.reply_text(f"✅ Politique de permissions : `{perm_val}`", parse_mode="Markdown")
+
+
+async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gère les clics sur les boutons interactifs Telegram."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data.startswith("setmodel:"):
+        model_id = data.split(":", 1)[1]
+        await update_session_remote(model=model_id)
+        await query.edit_message_text(f"✅ Modèle activé : `{model_id}`", parse_mode="Markdown")
+
+    elif data.startswith("effort:"):
+        eff = data.split(":", 1)[1]
+        await update_session_remote(effort=eff)
+        await query.edit_message_text(f"✅ Niveau d'effort réglé sur : `{eff}`", parse_mode="Markdown")
+
+    elif data.startswith("mode:"):
+        m = data.split(":", 1)[1]
+        await update_session_remote(mode=m)
+        await query.edit_message_text(f"✅ Mode d'exécution réglé sur : `{m}`", parse_mode="Markdown")
+
+    elif data.startswith("perm:"):
+        p = data.split(":", 1)[1]
+        await update_session_remote(permission_mode=p)
+        await query.edit_message_text(f"✅ Politique de permissions : `{p}`", parse_mode="Markdown")
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -312,6 +418,18 @@ from telegram.request import HTTPXRequest
 
 # ── Application Telegram ──────────────────────────────────────────────────────
 
+BOT_COMMANDS = [
+    BotCommand("models", "Choisir le modèle d'IA (boutons cliquables)"),
+    BotCommand("effort", "Régler l'effort de réflexion (boutons)"),
+    BotCommand("mode", "Changer le mode d'action (auto, plan)"),
+    BotCommand("permissions", "Régler les permissions (auto/manuel)"),
+    BotCommand("new", "Démarrer une nouvelle discussion"),
+    BotCommand("session", "Voir les réglages actifs"),
+    BotCommand("usage", "Consulter quotas et jetons"),
+    BotCommand("skills", "Voir les compétences actives"),
+    BotCommand("help", "Afficher l'aide complète"),
+]
+
 
 def get_application() -> Application:
     """Construit et retourne l'Application Telegram (singleton)."""
@@ -335,7 +453,7 @@ def get_application() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("models", cmd_models))
-    app.add_handler(CommandHandler("model", cmd_session))
+    app.add_handler(CommandHandler("model", cmd_models))
     app.add_handler(CommandHandler("setmodel", cmd_setmodel))
     app.add_handler(CommandHandler("effort", cmd_effort))
     app.add_handler(CommandHandler("mode", cmd_mode))
@@ -347,23 +465,25 @@ def get_application() -> Application:
     app.add_handler(CommandHandler("quota", cmd_usage))
     app.add_handler(CommandHandler("skills", cmd_skills))
 
+    # Handler pour les boutons interactifs (clics)
+    app.add_handler(CallbackQueryHandler(on_callback_query))
+
     # Handler messages texte normaux
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     _application = app
-    logger.info("Application Telegram configurée avec l'ensemble des commandes Antigravity.")
+    logger.info("Application Telegram configurée avec l'ensemble des commandes et boutons interactifs.")
     return _application
 
 
 async def setup_webhook(app: Application, webhook_url: str) -> None:
-    """Enregistre le webhook Telegram auprès de l'API Telegram.
-
-    Args:
-        app: L'instance Application Telegram.
-        webhook_url: L'URL publique complète du webhook
-                     (ex: ``https://mon-assistant.onrender.com/telegram/webhook``).
-    """
+    """Enregistre le webhook Telegram auprès de l'API Telegram et configure les commandes."""
     await app.bot.set_webhook(url=webhook_url)
+    try:
+        await app.bot.set_my_commands(BOT_COMMANDS)
+        logger.info("Commandes Telegram enregistrées avec succès (autocomplétion active).")
+    except Exception as exc:
+        logger.warning("Impossible d'enregistrer les commandes Telegram: %s", exc)
     logger.info("Webhook Telegram enregistré sur: %s", webhook_url)
 
 
@@ -391,6 +511,11 @@ def start_telegram_polling() -> None:
             await app.initialize()
             # Supprime le webhook existant pour permettre le polling
             await app.bot.delete_webhook(drop_pending_updates=True)
+            try:
+                await app.bot.set_my_commands(BOT_COMMANDS)
+                logger.info("Commandes Telegram enregistrées avec succès (autocomplétion active).")
+            except Exception as exc:
+                logger.warning("Impossible d'enregistrer les commandes Telegram: %s", exc)
             await app.start()
             await app.updater.start_polling()
             logger.info("Bot Telegram démarré en mode POLLING (local) !")

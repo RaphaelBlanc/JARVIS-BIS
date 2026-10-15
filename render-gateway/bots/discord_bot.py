@@ -64,17 +64,22 @@ class AssistantBot(commands.Bot):
         )
 
     async def setup_hook(self) -> None:
-        """Enregistre les commandes slash (globalement ou par guild)."""
-        self.tree.add_command(ask_slash)
+        """Enregistre l'ensemble des commandes slash avec autocomplétion."""
+        for cmd in [
+            ask_slash,
+            setmodel_slash,
+            effort_slash,
+            mode_slash,
+            permissions_slash,
+            new_slash,
+            models_slash,
+            session_slash,
+            usage_slash,
+            skills_slash,
+        ]:
+            self.tree.add_command(cmd)
 
-        if self._guild_obj:
-            # Synchronisation immédiate sur le serveur de dev
-            self.tree.copy_global_to(guild=self._guild_obj)
-            await self.tree.sync(guild=self._guild_obj)
-            logger.info("Commandes slash synchronisées pour la guild %d.", DISCORD_GUILD_ID)
-        else:
-            await self.tree.sync()
-            logger.info("Commandes slash synchronisées globalement.")
+        logger.info("Commandes slash enregistrées dans le command tree.")
 
     async def on_ready(self) -> None:
         logger.info("Bot Discord connecté en tant que %s (ID: %d).", self.user, self.user.id)
@@ -89,12 +94,19 @@ class AssistantBot(commands.Bot):
             )
         else:
             for guild in self.guilds:
-                logger.info("Serveur Discord rejoint: %s (ID: %d)", guild.name, guild.id)
+                logger.info("Serveur Discord: %s (ID: %d)", guild.name, guild.id)
                 channels = [
                     c.name for c in guild.text_channels
                     if c.permissions_for(guild.me).send_messages
                 ]
                 logger.info("Salons accessibles dans '%s': %s", guild.name, ", ".join(f"#{c}" for c in channels))
+                # Synchronisation immédiate des commandes slash sur le serveur !
+                try:
+                    self.tree.copy_global_to(guild=guild)
+                    await self.tree.sync(guild=guild)
+                    logger.info("Commandes slash synchronisées instantanément pour le serveur '%s' !", guild.name)
+                except Exception as exc:
+                    logger.warning("Erreur lors de la synchronisation slash pour '%s': %s", guild.name, exc)
 
     async def on_command_error(self, ctx: commands.Context, error: Exception) -> None:
         """Gestion globale des erreurs de commandes préfixées."""
@@ -117,7 +129,7 @@ def _get_bot() -> AssistantBot:
     return _bot
 
 
-# ── Commande slash /ask ───────────────────────────────────────────────────────
+# ── Commandes slash avec autocomplétion & choix ───────────────────────────────
 
 
 @app_commands.command(name="ask", description="Pose une question à l'assistant personnel")
@@ -125,23 +137,161 @@ def _get_bot() -> AssistantBot:
 async def ask_slash(interaction: discord.Interaction, question: str) -> None:
     """Handler de la commande slash /ask."""
     if not _is_allowed(interaction.user.id):
-        logger.warning("Accès refusé pour l'utilisateur Discord %d.", interaction.user.id)
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
 
     logger.info("Commande /ask de %d: '%s'", interaction.user.id, question[:80])
-
     await interaction.response.send_message("⏳ Traitement en cours...")
-    result = await forward_to_runner(question)
+    result = await forward_to_runner(question, continue_session=True)
 
     if result.get("success"):
         response_text = result.get("output", "").strip() or "✅ Tâche terminée (pas de sortie)."
     else:
         error = result.get("error", "Erreur inconnue")
         response_text = f"❌ Erreur : {error}"
-        logger.error("Erreur runner (slash /ask): %s", error)
 
     await interaction.edit_original_response(content=response_text)
+
+
+@app_commands.command(name="setmodel", description="Change le modèle d'IA actif (menu déroulant)")
+@app_commands.describe(model="Choisissez le modèle à activer")
+@app_commands.choices(model=[
+    app_commands.Choice(name="⭐ Gemini 3.8 Flash (High) — Recommandé", value="gemini-3.8-flash-high"),
+    app_commands.Choice(name="Gemini 3.8 Flash (Medium) — Équilibré", value="gemini-3.8-flash-medium"),
+    app_commands.Choice(name="Gemini 3.8 Flash (Low) — Économe", value="gemini-3.8-flash-low"),
+    app_commands.Choice(name="Claude Sonnet 4.6 (Thinking) — Code & Raisonnement", value="claude-sonnet-4-6"),
+    app_commands.Choice(name="Claude Opus 4.6 (Thinking) — Capacité max", value="claude-opus-4-6-thinking"),
+    app_commands.Choice(name="GPT-OSS 120B (Medium) — Open source", value="gpt-oss-120b-medium"),
+])
+async def setmodel_slash(interaction: discord.Interaction, model: app_commands.Choice[str]) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    res = await update_session_remote(model=model.value)
+    if "error" in res:
+        await interaction.followup.send(f"❌ Erreur : {res['error']}")
+    else:
+        await interaction.followup.send(f"✅ Modèle changé sur : `{model.value}` ({model.name})")
+
+
+@app_commands.command(name="effort", description="Règle l'effort de réflexion (menu déroulant)")
+@app_commands.describe(level="Choisissez le niveau d'effort")
+@app_commands.choices(level=[
+    app_commands.Choice(name="low (réponse rapide)", value="low"),
+    app_commands.Choice(name="medium (standard)", value="medium"),
+    app_commands.Choice(name="high (réflexion approfondie)", value="high"),
+    app_commands.Choice(name="xhigh (très approfondie)", value="xhigh"),
+    app_commands.Choice(name="max (maximum)", value="max"),
+])
+async def effort_slash(interaction: discord.Interaction, level: app_commands.Choice[str]) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    await update_session_remote(effort=level.value)
+    await interaction.followup.send(f"✅ Niveau d'effort réglé sur : `{level.value}`")
+
+
+@app_commands.command(name="mode", description="Règle le mode d'exécution d'Antigravity")
+@app_commands.describe(mode="Choisissez le mode d'exécution")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="auto (Exécution standard)", value="auto"),
+    app_commands.Choice(name="plan (Planification préalable)", value="plan"),
+    app_commands.Choice(name="accept-edits (Acceptation automatique des modifs)", value="accept-edits"),
+])
+async def mode_slash(interaction: discord.Interaction, mode: app_commands.Choice[str]) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    await update_session_remote(mode=mode.value)
+    await interaction.followup.send(f"✅ Mode d'exécution réglé sur : `{mode.value}`")
+
+
+@app_commands.command(name="permissions", description="Politique de permissions des outils sensibles")
+@app_commands.describe(policy="Choisissez la politique de permissions")
+@app_commands.choices(policy=[
+    app_commands.Choice(name="always-proceed (Exécution automatique sans confirmation)", value="always-proceed"),
+    app_commands.Choice(name="request-review (Demande confirmation avant actions)", value="request-review"),
+])
+async def permissions_slash(interaction: discord.Interaction, policy: app_commands.Choice[str]) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    await update_session_remote(permission_mode=policy.value)
+    await interaction.followup.send(f"✅ Politique de permissions : `{policy.value}`")
+
+
+@app_commands.command(name="new", description="Démarre une nouvelle conversation vierge")
+async def new_slash(interaction: discord.Interaction) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    await reset_session_remote()
+    await interaction.followup.send("🧹 **Nouvelle conversation démarrée !** L'historique précédent a été effacé.")
+
+
+@app_commands.command(name="models", description="Liste les modèles Antigravity disponibles")
+async def models_slash(interaction: discord.Interaction) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    data = await fetch_models()
+    models_list = data.get("models", [])
+    current = data.get("current", "")
+
+    lines = ["**🧠 Modèles Antigravity disponibles :**\n"]
+    for m in models_list:
+        mid = m.get("id")
+        name = m.get("name")
+        desc = m.get("desc", "")
+        prefix = "⭐ " if mid == current else "• "
+        lines.append(f"{prefix}`{mid}` — *{name}* ({desc})")
+
+    lines.append("\n👉 Pour changer : `/setmodel` (menu déroulant)")
+    await interaction.followup.send("\n".join(lines))
+
+
+@app_commands.command(name="session", description="Affiche les réglages de la session active")
+async def session_slash(interaction: discord.Interaction) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    s = await fetch_session()
+    text = (
+        "⚙️ **Configuration de la session :**\n"
+        f"• **Modèle :** `{s.get('model', 'défaut')}`\n"
+        f"• **Effort :** `{s.get('effort') or 'par défaut'}`\n"
+        f"• **Mode :** `{s.get('mode') or 'auto'}`\n"
+        f"• **Permissions :** `{s.get('permission_mode', 'always-proceed')}`\n"
+        f"• **Conversation active :** `{'Oui' if s.get('has_active_session') else 'Non (vierge)'}`"
+    )
+    await interaction.followup.send(text)
+
+
+@app_commands.command(name="usage", description="Consulte vos quotas et jetons consommés")
+async def usage_slash(interaction: discord.Interaction) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    res = await forward_to_runner("/usage", continue_session=False)
+    await interaction.followup.send(res.get("output", "Aucune information reçue."))
+
+
+@app_commands.command(name="skills", description="Affiche les compétences actives")
+async def skills_slash(interaction: discord.Interaction) -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    res = await forward_to_runner("/skills", continue_session=False)
+    await interaction.followup.send(res.get("output", "Aucune compétence trouvée."))
 
 
 # ── Commandes préfixées ───────────────────────────────────────────────────────
