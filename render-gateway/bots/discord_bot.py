@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from typing import Optional
 
 import discord
@@ -214,19 +215,38 @@ async def ask_slash(interaction: discord.Interaction, question: str) -> None:
     await interaction.edit_original_response(content=response_text)
 
 
+async def _fast_ack(interaction: discord.Interaction, message: str = "⏳ Traitement en cours...", ephemeral: bool = False) -> None:
+    """Accuse réception immédiatement de l'interaction pour garantir aucune erreur 3s Discord."""
+    try:
+        await interaction.response.send_message(message, ephemeral=ephemeral)
+    except Exception:
+        try:
+            await interaction.response.defer(ephemeral=ephemeral)
+        except Exception:
+            pass
+
+
 async def send_discord_long_response(interaction: discord.Interaction, text: str) -> None:
     """Envoie une réponse découpée si elle dépasse 2000 caractères."""
     if not text:
         text = "✅ Tâche terminée (pas de sortie)."
-    if len(text) <= 2000:
-        await interaction.followup.send(text)
-        return
     parts = [text[i:i + 1950] for i in range(0, len(text), 1950)]
+    first = True
     for p in parts:
-        await interaction.followup.send(p)
+        if first:
+            first = False
+            try:
+                await interaction.edit_original_response(content=p)
+                continue
+            except Exception:
+                pass
+        try:
+            await interaction.followup.send(p)
+        except Exception as e:
+            logger.warning("Erreur followup discord: %s", e)
 
 
-async def clear_channel_messages(channel: Optional[discord.abc.Messageable], limit: int = 100) -> None:
+async def clear_channel_messages(channel: Optional[discord.abc.Messageable], limit: int = 50) -> None:
     """Efface les messages précédents dans le salon."""
     if not channel:
         return
@@ -235,17 +255,21 @@ async def clear_channel_messages(channel: Optional[discord.abc.Messageable], lim
             await channel.purge(limit=limit)
             return
     except discord.Forbidden:
-        logger.warning("Permissions insuffisantes pour purger le salon, tentative message par message.")
+        pass
     except Exception as exc:
         logger.warning("Erreur lors du purge du salon : %s", exc)
 
-    # Repli : suppression des messages accessibles
+    # Repli : suppression des messages récents du bot
     try:
-        async for msg in channel.history(limit=limit):
-            try:
-                await msg.delete()
-            except Exception:
-                pass
+        bot = _get_bot()
+        count = 0
+        async for msg in channel.history(limit=min(limit, 30)):
+            if msg.author == bot.user:
+                try:
+                    await msg.delete()
+                    count += 1
+                except Exception:
+                    pass
     except Exception as exc:
         logger.warning("Erreur suppression message par message : %s", exc)
 
@@ -293,7 +317,7 @@ async def resume_slash(interaction: discord.Interaction, conversation: str) -> N
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await _fast_ack(interaction, "⏳ Réactivation de la discussion...", ephemeral=True)
 
     # 1. Efface les messages précédents dans le salon
     if interaction.channel:
@@ -347,7 +371,7 @@ async def delete_slash(interaction: discord.Interaction, conversation: str) -> N
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await _fast_ack(interaction, "⏳ Suppression de la conversation...", ephemeral=True)
 
     if conversation == "all":
         res = await delete_conversation_remote("all")
@@ -396,7 +420,7 @@ async def agenda_slash(interaction: discord.Interaction, periode: app_commands.C
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
+    await _fast_ack(interaction, f"⏳ Consultation de votre Google Agenda ({periode.value})...")
     prompt = (
         f"Consulte mon Google Agenda pour la période suivante : {periode.value}. "
         "Liste les rendez-vous et événements avec leurs horaires de début et de fin, "
@@ -430,7 +454,7 @@ async def tasks_slash(
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
 
-    await interaction.response.defer()
+    await _fast_ack(interaction, "⏳ Gestion de vos tâches Google Tasks...")
     act = action.value
 
     if act == "lister":
@@ -466,7 +490,7 @@ async def meteo_slash(interaction: discord.Interaction, ville: str = "Paris") ->
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
+    await _fast_ack(interaction, f"⏳ Consultation de la météo pour {ville}...")
     prompt = (
         f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}'.\n"
         "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
@@ -486,7 +510,7 @@ async def search_slash(interaction: discord.Interaction, requete: str) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
+    await _fast_ack(interaction, f"⏳ Recherche sur le web : {requete[:50]}...")
     prompt = (
         f"Effectue une recherche sur le web pour la requête suivante : '{requete}'.\n"
         "RÈGLE STRICTE : Dès la première recherche effectuée, rédige immédiatement une synthèse claire, concise et structurée avec les chiffres clés et les sources en un seul tour. "
@@ -506,7 +530,7 @@ async def summarize_slash(interaction: discord.Interaction, url: str) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
+    await _fast_ack(interaction, "⏳ Analyse et résumé du lien en cours...")
     prompt = (
         f"Consulte le contenu de la page web suivante : '{url}'.\n"
         "RÈGLE STRICTE : Résume les points clés de manière synthétique et structurée avec des puces en un seul tour. "
@@ -525,7 +549,7 @@ async def status_slash(interaction: discord.Interaction) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
+    await _fast_ack(interaction, "⏳ Récupération de l'état du système...")
     health = await fetch_health()
     session = await fetch_session()
 
@@ -556,7 +580,7 @@ async def compact_slash(interaction: discord.Interaction) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
+    await _fast_ack(interaction, "⏳ Compactage de la mémoire en cours...")
     res = await forward_to_runner("/compact", continue_session=True, timeout=60)
     out = res.get("output", "").strip() or "✅ Mémoire compactée."
     await send_discord_long_response(interaction, out)
@@ -576,12 +600,11 @@ async def setmodel_slash(interaction: discord.Interaction, model: app_commands.C
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
     res = await update_session_remote(model=model.value)
     if "error" in res:
-        await interaction.followup.send(f"❌ Erreur : {res['error']}")
+        await interaction.response.send_message(f"❌ Erreur : {res['error']}")
     else:
-        await interaction.followup.send(f"✅ Modèle changé sur : `{model.value}` ({model.name})")
+        await interaction.response.send_message(f"✅ Modèle changé sur : `{model.value}` ({model.name})")
 
 
 @app_commands.command(name="effort", description="Règle l'effort de réflexion (menu déroulant)")
@@ -597,9 +620,8 @@ async def effort_slash(interaction: discord.Interaction, level: app_commands.Cho
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
     await update_session_remote(effort=level.value)
-    await interaction.followup.send(f"✅ Niveau d'effort réglé sur : `{level.value}`")
+    await interaction.response.send_message(f"✅ Niveau d'effort réglé sur : `{level.value}`")
 
 
 @app_commands.command(name="mode", description="Règle le mode d'exécution d'Antigravity")
@@ -613,9 +635,8 @@ async def mode_slash(interaction: discord.Interaction, mode: app_commands.Choice
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
     await update_session_remote(mode=mode.value)
-    await interaction.followup.send(f"✅ Mode d'exécution réglé sur : `{mode.value}`")
+    await interaction.response.send_message(f"✅ Mode d'exécution réglé sur : `{mode.value}`")
 
 
 @app_commands.command(name="permissions", description="Politique de permissions des outils sensibles")
@@ -628,9 +649,8 @@ async def permissions_slash(interaction: discord.Interaction, policy: app_comman
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
     await update_session_remote(permission_mode=policy.value)
-    await interaction.followup.send(f"✅ Politique de permissions : `{policy.value}`")
+    await interaction.response.send_message(f"✅ Politique de permissions : `{policy.value}`")
 
 
 @app_commands.command(name="new", description="Démarre une nouvelle conversation vierge (vide le salon)")
@@ -638,11 +658,10 @@ async def new_slash(interaction: discord.Interaction) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.send_message("✨ **Nouvelle conversation prête.** Le salon a été vidé.", ephemeral=True)
     await reset_session_remote()
     if interaction.channel:
         await clear_channel_messages(interaction.channel)
-    await interaction.followup.send("✨ **Nouvelle conversation prête.** Le salon a été vidé.", ephemeral=True)
 
 
 @app_commands.command(name="models", description="Liste les modèles Antigravity disponibles")
@@ -650,7 +669,6 @@ async def models_slash(interaction: discord.Interaction) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
     data = await fetch_models()
     models_list = data.get("models", [])
     current = data.get("current", "")
@@ -664,7 +682,7 @@ async def models_slash(interaction: discord.Interaction) -> None:
         lines.append(f"{prefix}`{mid}` — *{name}* ({desc})")
 
     lines.append("\n👉 Pour changer : `/setmodel` (menu déroulant)")
-    await interaction.followup.send("\n".join(lines))
+    await interaction.response.send_message("\n".join(lines))
 
 
 @app_commands.command(name="session", description="Affiche les réglages de la session active")
@@ -672,7 +690,6 @@ async def session_slash(interaction: discord.Interaction) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
     s = await fetch_session()
     text = (
         "⚙️ **Configuration de la session :**\n"
@@ -682,7 +699,7 @@ async def session_slash(interaction: discord.Interaction) -> None:
         f"• **Permissions :** `{s.get('permission_mode', 'always-proceed')}`\n"
         f"• **Conversation active :** `{'Oui' if s.get('has_active_session') else 'Non (vierge)'}`"
     )
-    await interaction.followup.send(text)
+    await interaction.response.send_message(text)
 
 
 @app_commands.command(name="usage", description="Consulte vos quotas et jetons consommés")
@@ -690,9 +707,9 @@ async def usage_slash(interaction: discord.Interaction) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
+    await _fast_ack(interaction, "⏳ Récupération de l'usage...")
     res = await forward_to_runner("/usage", continue_session=False)
-    await interaction.followup.send(res.get("output", "Aucune information reçue."))
+    await send_discord_long_response(interaction, res.get("output", "Aucune information reçue."))
 
 
 @app_commands.command(name="skills", description="Affiche les compétences actives")
@@ -700,9 +717,9 @@ async def skills_slash(interaction: discord.Interaction) -> None:
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
-    await interaction.response.defer()
+    await _fast_ack(interaction, "⏳ Récupération des compétences...")
     res = await forward_to_runner("/skills", continue_session=False)
-    await interaction.followup.send(res.get("output", "Aucune compétence trouvée."))
+    await send_discord_long_response(interaction, res.get("output", "Aucune compétence trouvée."))
 
 
 # ── Commandes préfixées ───────────────────────────────────────────────────────
@@ -1068,6 +1085,36 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         out = res.get("output", "").strip() or "✅ Mémoire compactée."
         await waiting.edit(content=out)
 
+    @bot.event
+    async def on_message(message: discord.Message) -> None:
+        """Gère les messages texte du salon (commandes préfixées ou chat direct)."""
+        if message.author == bot.user:
+            return
+        if message.content.startswith("!"):
+            await bot.process_commands(message)
+            return
+        if not _is_allowed(message.author.id):
+            return
+
+        async with message.channel.typing():
+            res = await forward_to_runner(message.content, continue_session=True)
+            if res.get("success"):
+                out = res.get("output", "").strip() or "✅ Tâche terminée."
+            else:
+                out = f"❌ Erreur : {res.get('error', 'Le serveur maison n\'a pas répondu.')}"
+
+            if len(out) <= 2000:
+                await message.reply(out)
+            else:
+                parts = [out[i:i + 1950] for i in range(0, len(out), 1950)]
+                first = True
+                for p in parts:
+                    if first:
+                        first = False
+                        await message.reply(p)
+                    else:
+                        await message.channel.send(p)
+
 
 async def broadcast_discord_message(text: str) -> None:
     """Diffuse un message (ex: briefing automatique) sur le salon principal de chaque serveur."""
@@ -1091,8 +1138,11 @@ async def broadcast_discord_message(text: str) -> None:
 
 
 
+_discord_stop_event = threading.Event()
+
+
 def start_discord_bot() -> None:
-    """Lance le bot Discord dans un thread daemon séparé.
+    """Lance le bot Discord dans un thread daemon séparé avec reconnexion automatique.
 
     Le bot s'exécute dans sa propre boucle asyncio, indépendamment de FastAPI.
     Cette fonction est non-bloquante: elle démarre le thread et retourne immédiatement.
@@ -1103,17 +1153,31 @@ def start_discord_bot() -> None:
         )
         return
 
+    _discord_stop_event.clear()
+
     def _run() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        bot = _get_bot()
-        try:
-            logger.info("Démarrage du bot Discord...")
-            loop.run_until_complete(bot.start(DISCORD_TOKEN))
-        except Exception as exc:
-            logger.error("Le bot Discord s'est arrêté avec une erreur: %s", exc, exc_info=True)
-        finally:
-            loop.close()
+        while not _discord_stop_event.is_set():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            bot = _get_bot()
+            try:
+                logger.info("Démarrage du bot Discord...")
+                loop.run_until_complete(bot.start(DISCORD_TOKEN))
+            except Exception as exc:
+                if _discord_stop_event.is_set():
+                    break
+                logger.error("Le bot Discord s'est arrêté avec une erreur: %s", exc)
+                time.sleep(5)
+            else:
+                if _discord_stop_event.is_set():
+                    break
+                logger.warning("Connexion Discord terminée, tentative de reconnexion dans 5s...")
+                time.sleep(5)
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
 
     thread = threading.Thread(target=_run, name="discord-bot", daemon=True)
     thread.start()
@@ -1122,6 +1186,7 @@ def start_discord_bot() -> None:
 
 async def stop_discord_bot() -> None:
     """Ferme proprement la connexion du bot Discord."""
+    _discord_stop_event.set()
     bot = _get_bot()
     if not bot.is_closed():
         await bot.close()

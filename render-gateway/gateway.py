@@ -8,6 +8,7 @@ exposé via Cloudflare Tunnel et retourne la réponse normalisée.
 import httpx
 import os
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -173,8 +174,20 @@ async def update_session_remote(
         return {"error": str(e)}
 
 
+_CONV_CACHE: list[dict] = []
+_CONV_CACHE_EXPIRY: float = 0.0
+
+
+def invalidate_conversations_cache() -> None:
+    """Invalide le cache local des conversations."""
+    global _CONV_CACHE, _CONV_CACHE_EXPIRY
+    _CONV_CACHE = []
+    _CONV_CACHE_EXPIRY = 0.0
+
+
 async def reset_session_remote() -> dict:
     """Réinitialise la session active sur le home-runner."""
+    invalidate_conversations_cache()
     if not HOME_SERVER_URL:
         return {"error": "HOME_SERVER_URL non configuré"}
     try:
@@ -190,26 +203,35 @@ async def reset_session_remote() -> dict:
         return {"error": str(e)}
 
 
-async def fetch_conversations(limit: int = 8) -> list[dict]:
-    """Récupère la liste des conversations passées auprès du home-runner."""
+async def fetch_conversations(limit: int = 8, use_cache: bool = True) -> list[dict]:
+    """Récupère la liste des conversations passées auprès du home-runner (avec cache 15s)."""
+    global _CONV_CACHE, _CONV_CACHE_EXPIRY
+    now = time.time()
+    if use_cache and _CONV_CACHE and now < _CONV_CACHE_EXPIRY:
+        return _CONV_CACHE[:limit]
+
     if not HOME_SERVER_URL:
         return []
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                f"{HOME_SERVER_URL}/conversations?limit={limit}",
+                f"{HOME_SERVER_URL}/conversations?limit={max(limit, 25)}",
                 headers={"X-Secret-Key": SECRET_KEY},
             )
             resp.raise_for_status()
             data = resp.json()
-            return data.get("conversations", [])
+            convs = data.get("conversations", [])
+            _CONV_CACHE = convs
+            _CONV_CACHE_EXPIRY = now + 15.0
+            return convs[:limit]
     except Exception as e:
         logger.error("Erreur fetch_conversations: %s", e)
-        return []
+        return _CONV_CACHE[:limit] if _CONV_CACHE else []
 
 
 async def resume_conversation_remote(conversation_id: str) -> dict:
     """Demande au home-runner de reprendre une conversation spécifique."""
+    invalidate_conversations_cache()
     if not HOME_SERVER_URL:
         return {"error": "HOME_SERVER_URL non configuré"}
     try:
@@ -228,6 +250,7 @@ async def resume_conversation_remote(conversation_id: str) -> dict:
 
 async def delete_conversation_remote(conversation_id: str) -> dict:
     """Demande au home-runner de supprimer une conversation passée."""
+    invalidate_conversations_cache()
     if not HOME_SERVER_URL:
         return {"success": False, "error": "HOME_SERVER_URL non configuré"}
     try:
