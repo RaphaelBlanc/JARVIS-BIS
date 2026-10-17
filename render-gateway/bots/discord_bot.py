@@ -6,6 +6,8 @@ qui transmet les questions au home-runner via `gateway.forward_to_runner()`.
 """
 
 import asyncio
+import base64
+import io
 import logging
 import os
 import threading
@@ -15,6 +17,13 @@ from typing import Optional
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+from formatters import (
+    extract_and_render_latex,
+    extract_downloadable_code,
+    latex_to_unicode,
+    smart_split_discord,
+)
 
 from gateway import (
     delete_conversation_remote,
@@ -181,90 +190,71 @@ async def send_discord_long_response(
     interaction: discord.Interaction,
     text: str,
     title: Optional[str] = None,
+    extra_files: Optional[list[discord.File]] = None,
 ) -> None:
-    """Envoie une réponse Discord optimisée :
-    - Si <= 2000 caractères : message texte standard (1 seul message).
-    - Si entre 2000 et 6000 caractères : intégrée dans des Embeds dans le MÊME message (1 seul message, pas de spam).
-    - Si > 6000 caractères : découpage propre par paragraphes.
+    """Envoie une réponse Discord optimisée avec support LaTeX et code copiable :
+    - Rendu des équations LaTeX en images PNG attachées.
+    - Export des gros blocs de code en fichiers attachés téléchargeables.
+    - Découpage sécurisé préservant les blocs de code et leur coloration syntaxique.
     """
     if not text:
         text = "✅ Tâche terminée (pas de sortie)."
 
-    # Cas 1 : message court <= 2000 caractères -> message texte simple
-    if len(text) <= 2000:
+    # 1. Rendu LaTeX et extraction des gros extraits de code
+    processed_text, rendered_images = await extract_and_render_latex(text, dark_mode=True)
+    code_snippets = extract_downloadable_code(text, min_chars=700)
+
+    # Préparation des pièces jointes Discord
+    discord_files: list[discord.File] = []
+    if extra_files:
+        discord_files.extend(extra_files)
+
+    for img in rendered_images:
+        discord_files.append(
+            discord.File(fp=io.BytesIO(img["bytes"]), filename=img["filename"])
+        )
+
+    for code in code_snippets:
+        discord_files.append(
+            discord.File(fp=io.BytesIO(code["bytes"]), filename=code["filename"])
+        )
+
+    # 2. Cas 1 : message court <= 2000 caractères
+    if len(processed_text) <= 2000:
         try:
-            await interaction.edit_original_response(content=text, embeds=[])
+            await interaction.edit_original_response(
+                content=processed_text,
+                embeds=[],
+                attachments=discord_files,
+            )
             return
         except Exception:
             try:
-                await interaction.followup.send(content=text)
+                await interaction.followup.send(content=processed_text, files=discord_files)
                 return
             except Exception as e:
-                logger.warning("Erreur envoi message court: %s", e)
+                logger.warning("Erreur envoi message court Discord: %s", e)
 
-    # Cas 2 : message long (2000-6000 caractères) -> Embeds dans le MÊME message unique
-    chunks = []
-    lines = text.split("\n")
-    current_chunk = []
-    current_len = 0
-    for line in lines:
-        if current_len + len(line) + 1 > 3900:
-            chunks.append("\n".join(current_chunk))
-            current_chunk = [line]
-            current_len = len(line) + 1
-        else:
-            current_chunk.append(line)
-            current_len += len(line) + 1
-    if current_chunk:
-        chunks.append("\n".join(current_chunk))
+    # 3. Cas 2 : message découpé intelligemment avec smart_split_discord (préserve les blocs ```lang)
+    parts = smart_split_discord(processed_text, max_chars=1950)
 
-    total_len = sum(len(c) for c in chunks)
-    if len(chunks) <= 4 and total_len <= 5800:
-        embeds = []
-        for idx, chunk in enumerate(chunks):
-            embed = discord.Embed(
-                description=chunk,
-                color=0x5865F2,
-            )
-            if idx == 0 and title:
-                embed.title = title
-            if len(chunks) > 1:
-                embed.set_footer(text=f"Partie {idx + 1}/{len(chunks)}")
-            embeds.append(embed)
-        try:
-            await interaction.edit_original_response(content=None, embeds=embeds)
-            return
-        except Exception as e:
-            logger.warning("Erreur edit_original_response avec embeds: %s", e)
-
-    # Cas 3 : Repli si > 6000 chars -> découpage propre par paragraphes
     first = True
-    parts = []
-    curr = []
-    curr_l = 0
-    for line in text.split("\n"):
-        if curr_l + len(line) + 1 > 1950:
-            parts.append("\n".join(curr))
-            curr = [line]
-            curr_l = len(line) + 1
-        else:
-            curr.append(line)
-            curr_l += len(line) + 1
-    if curr:
-        parts.append("\n".join(curr))
-
     for p in parts:
         if first:
             first = False
             try:
-                await interaction.edit_original_response(content=p, embeds=[])
+                await interaction.edit_original_response(
+                    content=p,
+                    embeds=[],
+                    attachments=discord_files,
+                )
                 continue
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Erreur edit_original_response Discord: %s", exc)
         try:
-            await interaction.followup.send(p)
+            await interaction.followup.send(content=p)
         except Exception as e:
-            logger.warning("Erreur followup discord: %s", e)
+            logger.warning("Erreur followup Discord: %s", e)
 
 
 @app_commands.command(name="briefing", description="Génère votre briefing matinal (e-mails triés, agenda, météo)")
@@ -287,17 +277,41 @@ async def briefing_slash(interaction: discord.Interaction) -> None:
     await send_discord_long_response(interaction, response_text, title="🌅 Votre Briefing Matinal")
 
 
-@app_commands.command(name="ask", description="Pose une question à l'assistant personnel")
-@app_commands.describe(question="Votre question ou tâche pour l'assistant")
-async def ask_slash(interaction: discord.Interaction, question: str) -> None:
+@app_commands.command(name="ask", description="Pose une question à l'assistant personnel (supporte texte et image)")
+@app_commands.describe(
+    question="Votre question ou tâche pour l'assistant",
+    image="Image optionnelle à analyser (schéma, capture, photo, exercice)",
+)
+async def ask_slash(
+    interaction: discord.Interaction,
+    question: str,
+    image: Optional[discord.Attachment] = None,
+) -> None:
     """Handler de la commande slash /ask."""
     if not _is_allowed(interaction.user.id):
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
 
-    logger.info("Commande /ask de %d: '%s'", interaction.user.id, question[:80])
-    await _fast_ack(interaction, "⏳ Traitement en cours...")
-    result = await forward_to_runner(question, continue_session=True, timeout=180)
+    logger.info("Commande /ask de %d: '%s' (image=%s)", interaction.user.id, question[:80], bool(image))
+    await _fast_ack(interaction, "⏳ Traitement en cours..." if not image else "👁️ Analyse de votre image en cours...")
+
+    img_b64 = None
+    img_name = None
+    if image:
+        try:
+            raw_bytes = await image.read()
+            img_b64 = base64.b64encode(raw_bytes).decode("utf-8")
+            img_name = image.filename
+        except Exception as exc:
+            logger.warning("Erreur lecture pièce jointe /ask: %s", exc)
+
+    result = await forward_to_runner(
+        question,
+        continue_session=True,
+        timeout=180,
+        image_base64=img_b64,
+        image_filename=img_name,
+    )
 
     if result.get("success"):
         response_text = result.get("output", "").strip() or "✅ Tâche terminée (pas de sortie)."
@@ -800,8 +814,26 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
 
         logger.info("Commande !ask de %d: '%s'", ctx.author.id, question[:80])
 
-        waiting_msg = await ctx.send("⏳ Traitement en cours...")
-        result = await forward_to_runner(question, continue_session=True)
+        img_b64 = None
+        img_name = None
+        if ctx.message.attachments:
+            for att in ctx.message.attachments:
+                if att.content_type and att.content_type.startswith("image/"):
+                    try:
+                        raw_bytes = await att.read()
+                        img_b64 = base64.b64encode(raw_bytes).decode("utf-8")
+                        img_name = att.filename
+                        break
+                    except Exception as exc:
+                        logger.warning("Erreur lecture image !ask: %s", exc)
+
+        waiting_msg = await ctx.send("⏳ Traitement en cours..." if not img_b64 else "👁️ Analyse de votre image en cours...")
+        result = await forward_to_runner(
+            question,
+            continue_session=True,
+            image_base64=img_b64,
+            image_filename=img_name,
+        )
 
         if result.get("success"):
             response_text = result.get("output", "").strip() or "✅ Tâche terminée (pas de sortie)."
@@ -810,7 +842,23 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             response_text = f"❌ Erreur : {error}"
             logger.error("Erreur runner (!ask): %s", error)
 
-        await waiting_msg.edit(content=response_text)
+        processed_text, rendered_images = await extract_and_render_latex(response_text, dark_mode=True)
+        code_snippets = extract_downloadable_code(response_text, min_chars=700)
+
+        discord_files: list[discord.File] = []
+        for img in rendered_images:
+            discord_files.append(discord.File(io.BytesIO(img["bytes"]), filename=img["filename"]))
+        for code in code_snippets:
+            discord_files.append(discord.File(io.BytesIO(code["bytes"]), filename=code["filename"]))
+
+        parts = smart_split_discord(processed_text, max_chars=1950)
+        first = True
+        for p in parts:
+            if first:
+                first = False
+                await waiting_msg.edit(content=p, attachments=discord_files)
+            else:
+                await ctx.send(content=p)
 
     @bot.command(name="models", help="Liste les modèles Antigravity disponibles")
     async def models_cmd(ctx: commands.Context) -> None:
@@ -1158,24 +1206,55 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         if not _is_allowed(message.author.id):
             return
 
+        img_b64 = None
+        img_name = None
+        if message.attachments:
+            for att in message.attachments:
+                if att.content_type and att.content_type.startswith("image/"):
+                    try:
+                        raw_bytes = await att.read()
+                        img_b64 = base64.b64encode(raw_bytes).decode("utf-8")
+                        img_name = att.filename
+                        break
+                    except Exception as e:
+                        logger.warning("Erreur lecture pièce jointe on_message: %s", e)
+
+        prompt = message.content.strip()
+        if not prompt and img_b64:
+            prompt = "Analyse cette image en détail et décris ce qu'elle contient ou réponds aux éléments visibles."
+
+        if not prompt and not img_b64:
+            return
+
         async with message.channel.typing():
-            res = await forward_to_runner(message.content, continue_session=True)
+            res = await forward_to_runner(
+                prompt,
+                continue_session=True,
+                image_base64=img_b64,
+                image_filename=img_name,
+            )
             if res.get("success"):
                 out = res.get("output", "").strip() or "✅ Tâche terminée."
             else:
                 out = f"❌ Erreur : {res.get('error', 'Le serveur maison n\'a pas répondu.')}"
 
-            if len(out) <= 2000:
-                await message.reply(out)
-            else:
-                parts = [out[i:i + 1950] for i in range(0, len(out), 1950)]
-                first = True
-                for p in parts:
-                    if first:
-                        first = False
-                        await message.reply(p)
-                    else:
-                        await message.channel.send(p)
+            processed_text, rendered_images = await extract_and_render_latex(out, dark_mode=True)
+            code_snippets = extract_downloadable_code(out, min_chars=700)
+
+            discord_files: list[discord.File] = []
+            for img in rendered_images:
+                discord_files.append(discord.File(io.BytesIO(img["bytes"]), filename=img["filename"]))
+            for code in code_snippets:
+                discord_files.append(discord.File(io.BytesIO(code["bytes"]), filename=code["filename"]))
+
+            parts = smart_split_discord(processed_text, max_chars=1950)
+            first = True
+            for p in parts:
+                if first:
+                    first = False
+                    await message.reply(p, files=discord_files)
+                else:
+                    await message.channel.send(p)
 
 
 async def broadcast_discord_message(text: str) -> None:

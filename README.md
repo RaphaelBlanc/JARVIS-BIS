@@ -28,6 +28,16 @@
   - Mémoire de conversation persistante avec suivi des tours de discussion.
   - Commutation de session ou de modèle à la volée sans redémarrer le serveur.
   - Possibilité de reprendre d'anciennes conversations passées ou de purger le chat.
+- **📐 Support LaTeX & Formules Mathématiques** :
+  - Rendu graphique automatique des équations de bloc (`$$...$$`) en images PNG nettes adaptées au mode sombre.
+  - Conversion automatique des formules en ligne (`$...$`) en symboles mathématiques Unicode clairs (ex: `α`, `β`, `π`, `x²`, `√`, `∫`, `∈`, `ℝ`).
+- **👁️ Support Multimodal & Analyse d'Images** :
+  - Envoyez une photo, capture d'écran, schéma ou exercice directement sur Discord (`/ask [image]` ou upload direct) ou Telegram (envoi de photo avec légende).
+  - Analyse visuelle complète assurée par le modèle multimodal Gemini via Antigravity CLI.
+- **📋 Code Copiable en 1 Clic & Fichiers Attachés** :
+  - Coloration syntaxique complète avec activation du bouton de copie natif Telegram et Discord.
+  - Découpage intelligent (`smart_split`) évitant toute troncature au milieu d'un bloc de code.
+  - Envoi automatique des extraits de code volumineux sous forme de fichiers téléchargeables (`.py`, `.js`, `.sh`, etc.).
 - **🔌 Connecteurs MCP (Model Context Protocol)** :
   - 📅 **Google Agenda** : Lecture et création d'événements.
   - ✉️ **Gmail** : Tri et résumé intelligent des e-mails prioritaires.

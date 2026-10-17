@@ -7,7 +7,9 @@ et répond à l'utilisateur avec le résultat.
 """
 
 import asyncio
+import base64
 import html
+import io
 import json
 import logging
 import os
@@ -15,6 +17,12 @@ import re
 import threading
 from pathlib import Path
 from typing import Optional
+
+from formatters import (
+    extract_and_render_latex,
+    extract_downloadable_code,
+    latex_to_unicode,
+)
 
 
 from fastapi import APIRouter, Request, Response
@@ -74,28 +82,32 @@ def _is_allowed(user_id: int) -> bool:
 
 
 def markdown_to_telegram_html(text: str) -> str:
-    """Convertit du Markdown GitHub Flavored en HTML Telegram riche et élégant."""
+    """Convertit du Markdown GitHub Flavored en HTML Telegram riche avec code copiable et symboles mathématiques."""
     if not text:
         return ""
 
     # 1. Extraction et protection des blocs de code
-    code_blocks = []
+    code_blocks: list[tuple[str, str]] = []
     def save_code_block(match):
-        code_blocks.append(match.group(2))
+        lang = (match.group(1) or "").strip().lower()
+        code_blocks.append((lang, match.group(2)))
         return f"@@CODE_BLOCK_{len(code_blocks)-1}@@"
-    text = re.sub(r"```([a-zA-Z0-9_-]*)\n(.*?)```", save_code_block, text, flags=re.DOTALL)
+    text = re.sub(r"```([a-zA-Z0-9_\-\+]*)\n(.*?)```", save_code_block, text, flags=re.DOTALL)
 
     # 2. Extraction du code inline
-    inline_codes = []
+    inline_codes: list[str] = []
     def save_inline_code(match):
         inline_codes.append(match.group(1))
         return f"@@INLINE_CODE_{len(inline_codes)-1}@@"
     text = re.sub(r"`([^`\n]+)`", save_inline_code, text)
 
-    # 3. Échappement HTML du texte hors code
+    # 3. Conversion mathématique LaTeX inline résiduelle vers Unicode
+    text = latex_to_unicode(text)
+
+    # 4. Échappement HTML du texte hors code
     text = html.escape(text, quote=False)
 
-    # 4. Citations / Blockquotes (> texte) avec support natif Telegram
+    # 5. Citations / Blockquotes (> texte) avec support natif Telegram
     def replace_blockquotes(match):
         lines = [re.sub(r"^&gt;\s?", "", l) for l in match.group(0).split("\n")]
         content = "\n".join(lines).strip()
@@ -104,33 +116,34 @@ def markdown_to_telegram_html(text: str) -> str:
         return f"<blockquote>{content}</blockquote>"
     text = re.sub(r"(?:^&gt;[^\n]*\n?)+", replace_blockquotes, text, flags=re.MULTILINE)
 
-    # 5. Titres avec mise en valeur
+    # 6. Titres avec mise en valeur
     text = re.sub(r"^###\s+(.+)$", r"<b><u>\1</u></b>", text, flags=re.MULTILINE)
     text = re.sub(r"^##\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     text = re.sub(r"^#\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
 
-    # 6. Séparateurs horizontaux
+    # 7. Séparateurs horizontaux
     text = re.sub(r"^\s*[-*_]{3,}\s*$", "────────────────────────────", text, flags=re.MULTILINE)
 
-    # 7. Gras et Italique
+    # 8. Gras et Italique
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
     text = re.sub(r"(?<![a-zA-Z0-9])\*([^* \n][^*\n]*?)\*(?![a-zA-Z0-9])", r"<i>\1</i>", text)
     text = re.sub(r"(?<![a-zA-Z0-9])_([^_ \n][^_\n]*?)_(?![a-zA-Z0-9])", r"<i>\1</i>", text)
 
-    # 8. Barré
+    # 9. Barré
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
 
-    # 9. Liens [texte](url)
+    # 10. Liens [texte](url)
     text = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2">\1</a>', text)
 
-    # 10. Listes à puces avec jolis points
+    # 11. Listes à puces avec jolis points
     text = re.sub(r"^\s*[\*\-]\s+", "• ", text, flags=re.MULTILINE)
 
-    # 11. Restauration des blocs de code échappés
-    for i, code in enumerate(code_blocks):
-        escaped = html.escape(code.strip())
-        text = text.replace(f"@@CODE_BLOCK_{i}@@", f"<pre><code>{escaped}</code></pre>")
+    # 12. Restauration des blocs de code avec classe de langage (bouton Copier natif Telegram)
+    for i, (lang, code) in enumerate(code_blocks):
+        escaped = html.escape(code)
+        lang_attr = f' class="language-{lang}"' if lang else ""
+        text = text.replace(f"@@CODE_BLOCK_{i}@@", f"<pre><code{lang_attr}>{escaped}</code></pre>")
 
     for i, code in enumerate(inline_codes):
         escaped = html.escape(code)
@@ -249,32 +262,62 @@ async def send_or_edit_telegram_response(
     raw_text: str,
     reply_to_message=None,
 ) -> None:
-    """Met en forme en HTML Telegram et édite/envoie la réponse avec gestion propre des messages longs et erreurs."""
+    """Met en forme en HTML Telegram et édite/envoie la réponse avec gestion du LaTeX et des extraits de code."""
     if waiting_msg and hasattr(waiting_msg, "chat_id") and hasattr(waiting_msg, "message_id"):
         track_chat_message(waiting_msg.chat_id, waiting_msg.message_id)
 
-    html_text = markdown_to_telegram_html(raw_text)
+    # 1. Rendu graphique des équations LaTeX et extraction des gros blocs de code
+    processed_text, rendered_images = await extract_and_render_latex(raw_text, dark_mode=True)
+    code_snippets = extract_downloadable_code(raw_text, min_chars=800)
+
+    html_text = markdown_to_telegram_html(processed_text)
     chunks = split_telegram_message(html_text)
 
-    # 1. Tente d'éditer le message d'attente avec le premier morceau
+    # 2. Tente d'éditer le message d'attente avec le premier morceau
     first_chunk = chunks[0] if chunks else "✅ Tâche terminée."
     try:
         await waiting_msg.edit_text(first_chunk, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as exc:
         logger.warning("Échec affichage HTML Telegram (%s), repli sur texte brut.", exc)
-        raw_chunks = split_telegram_message(raw_text)
-        await waiting_msg.edit_text(raw_chunks[0] if raw_chunks else raw_text)
+        raw_chunks = split_telegram_message(processed_text)
+        await waiting_msg.edit_text(raw_chunks[0] if raw_chunks else processed_text)
         chunks = raw_chunks
 
-    # 2. S'il y a d'autres morceaux (message > 4000 chars), on les envoie à la suite
-    if len(chunks) > 1 and reply_to_message:
+    # 3. S'il y a d'autres morceaux (message > 4000 chars), on les envoie à la suite
+    target = reply_to_message or waiting_msg
+    if len(chunks) > 1 and target:
         for chunk in chunks[1:]:
             try:
-                m = await reply_to_message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+                m = await target.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
                 track_chat_message(m.chat_id, m.message_id)
             except Exception:
-                m = await reply_to_message.reply_text(chunk)
+                m = await target.reply_text(chunk)
                 track_chat_message(m.chat_id, m.message_id)
+
+    # 4. Envoi des équations mathématiques rendues en images
+    for img in rendered_images:
+        try:
+            m = await target.reply_photo(
+                photo=io.BytesIO(img["bytes"]),
+                caption=f"📐 <b>{html.escape(img['title'])}</b>",
+                parse_mode="HTML",
+            )
+            track_chat_message(m.chat_id, m.message_id)
+        except Exception as exc:
+            logger.warning("Erreur envoi image d'équation Telegram: %s", exc)
+
+    # 5. Envoi des extraits de code volumineux en documents téléchargeables
+    for snippet in code_snippets:
+        try:
+            m = await target.reply_document(
+                document=io.BytesIO(snippet["bytes"]),
+                filename=snippet["filename"],
+                caption=f"📄 Extrait de code (<b>{html.escape(snippet['lang'])}</b>)",
+                parse_mode="HTML",
+            )
+            track_chat_message(m.chat_id, m.message_id)
+        except Exception as exc:
+            logger.warning("Erreur envoi document de code Telegram: %s", exc)
 
 
 
@@ -1194,6 +1237,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_or_edit_telegram_response(waiting_msg, response_text, update.message)
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Traite les images et photos envoyées par l'utilisateur pour analyse multimodale."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        logger.warning("Photo refusée de l'utilisateur Telegram %d.", user.id)
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    chat_id = update.effective_chat.id
+    _save_chat_id(chat_id)
+    track_chat_message(chat_id, update.message.message_id)
+
+    # Récupération du fichier image (photo ou document)
+    photo_file = None
+    filename = "upload.jpg"
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        photo_file = await photo.get_file()
+        filename = f"photo_{photo.file_unique_id}.jpg"
+    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
+        photo_file = await update.message.document.get_file()
+        filename = update.message.document.file_name or "image.png"
+
+    if not photo_file:
+        return
+
+    waiting_msg = await update.message.reply_text("👁️ Réception et analyse de l'image...")
+    try:
+        photo_bytes = await photo_file.download_as_bytearray()
+        b64 = base64.b64encode(photo_bytes).decode("utf-8")
+        caption = (update.message.caption or "").strip()
+        prompt = caption if caption else "Analyse cette image en détail et décris ce qu'elle contient ou réponds aux éléments visibles."
+
+        logger.info("Image Telegram reçue de %d (%s, %d octets). Prompt: '%s'", user.id, filename, len(photo_bytes), prompt[:60])
+        result = await forward_to_runner(
+            prompt,
+            continue_session=True,
+            image_base64=b64,
+            image_filename=filename,
+        )
+
+        if result.get("success"):
+            response_text = result.get("output", "").strip() or "✅ Analyse terminée."
+        else:
+            error = result.get("error", "Erreur inconnue")
+            response_text = f"❌ Erreur : {error}"
+
+        await send_or_edit_telegram_response(waiting_msg, response_text, update.message)
+    except Exception as exc:
+        logger.error("Erreur traitement image Telegram: %s", exc)
+        await waiting_msg.edit_text(f"❌ Erreur lors du traitement de l'image : {exc}")
+
+
 
 from telegram.request import HTTPXRequest
 
@@ -1280,6 +1376,9 @@ def get_application() -> Application:
 
     # Handler messages texte normaux
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Handler images et photos
+    app.add_handler(MessageHandler(filters.PHOTO | (filters.Document.IMAGE), handle_photo))
 
     _application = app
     logger.info("Application Telegram configurée avec l'ensemble des commandes et boutons interactifs.")

@@ -6,9 +6,13 @@ Expose une API HTTP privée qui reçoit des requêtes depuis le serveur Render
 à Antigravity CLI (agy) via agy_bridge.
 """
 
+import base64
 import logging
 import os
+import re
 import time
+import uuid
+from pathlib import Path
 
 import uvicorn
 from dotenv import load_dotenv
@@ -111,6 +115,8 @@ class RunRequest(BaseModel):
     continue_session: bool = Field(default=True, description="Poursuivre la conversation existante.")
     reset_session: bool = Field(default=False, description="Démarrer une nouvelle conversation vierge.")
     permission_mode: str | None = Field(default=None, description="Politique de permission.")
+    image_base64: str | None = Field(default=None, description="Image encodée en base64 envoyée par l'utilisateur.")
+    image_filename: str | None = Field(default=None, description="Nom original du fichier image.")
 
 
 class RunResponse(BaseModel):
@@ -302,8 +308,23 @@ async def run(request: Request, body: RunRequest):
         body.continue_session,
     )
 
+    active_prompt = body.prompt
+    if body.image_base64:
+        try:
+            upload_dir = Path("/tmp/assistant_uploads")
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = re.sub(r"[^a-zA-Z0-9_\.-]", "_", body.image_filename or "image.png")
+            unique_filename = f"{uuid.uuid4().hex[:8]}_{safe_name}"
+            saved_img_path = upload_dir / unique_filename
+            with open(saved_img_path, "wb") as img_file:
+                img_file.write(base64.b64decode(body.image_base64))
+            logger.info("Image utilisateur enregistrée: %s (%d octets)", saved_img_path, saved_img_path.stat().st_size)
+            active_prompt = f"[Image fournie par l'utilisateur: {saved_img_path}]\n\n{active_prompt}"
+        except Exception as exc:
+            logger.warning("Erreur lors de l'enregistrement de l'image utilisateur: %s", exc)
+
     result = await run_agy(
-        prompt=body.prompt,
+        prompt=active_prompt,
         timeout=body.timeout,
         model=body.model,
         effort=body.effort,

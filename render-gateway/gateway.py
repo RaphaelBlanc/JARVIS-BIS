@@ -26,13 +26,15 @@ async def forward_to_runner(
     continue_session: bool = True,
     reset_session: bool = False,
     permission_mode: str | None = None,
+    image_base64: str | None = None,
+    image_filename: str | None = None,
 ) -> dict:
     """Transmet un prompt au home-runner et retourne sa réponse."""
     if not HOME_SERVER_URL:
         logger.error("HOME_SERVER_URL n'est pas configuré.")
         return {"success": False, "output": "", "error": "HOME_SERVER_URL non configuré"}
 
-    logger.info("Transmission au home-runner: prompt=%.60s… (continue=%s, timeout=%ds)", prompt, continue_session, timeout)
+    logger.info("Transmission au home-runner: prompt=%.60s… (continue=%s, timeout=%ds, image=%s)", prompt, continue_session, timeout, bool(image_base64))
 
     # Marge de 15s pour que httpx ne coupe pas avant que le runner ait renvoyé son diagnostic
     client_timeout = float(timeout + 15)
@@ -53,6 +55,9 @@ async def forward_to_runner(
                 payload["mode"] = mode
             if permission_mode:
                 payload["permission_mode"] = permission_mode
+            if image_base64:
+                payload["image_base64"] = image_base64
+                payload["image_filename"] = image_filename or "upload.png"
 
             resp = await client.post(
                 f"{HOME_SERVER_URL}/run",
