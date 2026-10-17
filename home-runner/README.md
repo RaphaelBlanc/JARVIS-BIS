@@ -84,13 +84,22 @@ journalctl -u assistant-home-runner -f
 
 ---
 
-## Endpoints
+## Endpoints de l'API
 
-| Méthode | Chemin    | Auth | Description |
-|---------|-----------|------|-------------|
-| `GET`   | `/ping`   | ✗    | Vérification de vie (`{"status":"ok"}`) |
-| `GET`   | `/health` | ✗    | Statut détaillé + disponibilité de `agy` |
-| `POST`  | `/run`    | ✓    | Exécute un prompt via `agy` |
+| Méthode | Chemin | Auth | Description |
+|---|---|---|---|
+| `GET` | `/ping` | ✗ | Vérification de vie rapide (`{"status":"ok"}`) |
+| `GET` | `/health` | ✗ | État de santé détaillé et disponibilité d'`agy` |
+| `POST` | `/run` | ✓ | Exécute un prompt via Antigravity CLI |
+| `GET` | `/models` | ✓ | Liste les modèles supportés et le modèle actif |
+| `GET` | `/session` | ✓ | Réglages de la session active (modèle, effort, conversation) |
+| `POST` | `/session` | ✓ | Met à jour le modèle, l'effort ou le mode d'exécution |
+| `POST` | `/session/reset` | ✓ | Réinitialise la session conversationnelle |
+| `GET` | `/conversations` | ✓ | Liste les conversations passées récentes |
+| `POST` | `/conversation/resume` | ✓ | Reprend une conversation passée par ID |
+| `GET` | `/conversation/{id}/history` | ✓ | Historique des échanges d'une conversation |
+| `DELETE` | `/conversation/{id}` | ✓ | Supprime une conversation passée (ou `all`) |
+| `POST` | `/conversation/delete` | ✓ | Supprime une conversation via payload JSON |
 
 ### Authentification
 

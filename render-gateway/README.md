@@ -48,13 +48,31 @@ Copiez `.env.example` en `.env` et renseignez les valeurs.
 4. Le webhook est enregistré automatiquement au démarrage du service.
 5. Pour vérifier : `GET https://api.telegram.org/bot<TOKEN>/getWebhookInfo`
 
-### Commandes disponibles
+### Commandes disponibles (Telegram)
 
-| Commande | Description |
-|---|---|
-| `/start` | Message de bienvenue |
-| `/help` | Affiche l'aide |
-| _Tout autre texte_ | Transmis au home-runner |
+| Commande | Aliases | Description |
+|---|---|---|
+| `/briefing` | `/brief` | Génère votre briefing matinal interactif |
+| `/agenda` | `/cal` | Consulte votre agenda Google Workspace |
+| `/tasks` | `/task`, `/todo` | Gère Google Tasks (`list`, `add`, `done`, `delete`) |
+| `/meteo [ville]` | `/weather` | Météo mondiale en direct (ex: `/meteo Paris`) |
+| `/search [requete]` | `/recherche` | Recherche sur le web avec DuckDuckGo |
+| `/summarize [url]` | — | Résume un article ou une page web |
+| `/models` | `/model` | Menu interactif de sélection des modèles |
+| `/setmodel [id]` | — | Change le modèle actif directement |
+| `/effort [level]` | — | Règle l'effort de réflexion (`low`, `medium`, `high`) |
+| `/mode [mode]` | — | Règle le mode d'exécution d'Antigravity |
+| `/permissions` | — | Règle la validation des actions sensibles |
+| `/new` | `/clear` | Démarre une nouvelle conversation vierge |
+| `/resume` | — | Liste ou recharge une conversation passée |
+| `/delete` | `/del`, `/delconv` | Supprime une conversation passée (`<id>` ou `all`) |
+| `/compact` | — | Compacte la mémoire de contexte |
+| `/session` | — | Affiche les détails de la session en cours |
+| `/status` | — | Statut global du serveur et d'Antigravity |
+| `/usage` | `/quota` | Consommation de quotas et jetons |
+| `/skills` | — | Liste les compétences MCP connectées |
+| `/help` | — | Affiche le menu d'aide |
+| _Tout autre texte_ | — | Transmis directement à l'assistant |
 
 ---
 
@@ -66,12 +84,34 @@ Copiez `.env.example` en `.env` et renseignez les valeurs.
 4. Invitez le bot sur votre serveur avec les permissions `Send Messages` + `Use Slash Commands`.
 5. (Dev) Renseignez `DISCORD_GUILD_ID` pour que les slash commands soient disponibles immédiatement.
 
-### Commandes disponibles
+### Commandes disponibles (Discord)
 
-| Commande | Description |
-|---|---|
-| `/ask <question>` | Slash command — pose une question à l'assistant |
-| `!ask <question>` | Commande préfixée — même fonctionnement |
+Toutes les commandes sont utilisables en **slash command native** (`/...`) ou en **commande préfixée** (`!...`) :
+
+| Slash Command | Commande préfixée | Description |
+|---|---|---|
+| `/briefing` | `!briefing` (alias `!brief`) | Déclenche le briefing matinal complet |
+| `/ask [question]` | `!ask [question]` | Pose une question ou donne une consigne |
+| `/agenda [periode]` | `!agenda [periode]` (alias `!cal`) | Consulte l'agenda Google (`aujourd'hui`, `demain`, `semaine`) |
+| `/tasks [action] [texte]` | `!tasks [action] [texte]` | Gestion Google Tasks (`list`, `add`, `done`, `del`) |
+| `/meteo [ville]` | `!meteo [ville]` (alias `!weather`) | Météo mondiale en temps réel |
+| `/search [requete]` | `!search [requete]` (alias `!recherche`) | Recherche sur le web avec DuckDuckGo |
+| `/summarize [url]` | `!summarize [url]` | Résumé intelligent d'une URL |
+| `/models` | `!models` | Liste les modèles Antigravity disponibles |
+| `/setmodel [model]` | `!setmodel [id]` | Change le modèle IA actif |
+| `/effort [level]` | `!effort [level]` | Ajuste l'effort de réflexion (`low`, `medium`, `high`) |
+| `/mode [mode]` | `!mode [mode]` | Règle le mode d'exécution (`auto`, `plan`, etc.) |
+| `/permissions [policy]` | `!permissions [policy]` | Politique d'exécution des outils sensibles |
+| `/new` | `!new` (alias `!clear`, `!reset`) | Réinitialise et nettoie le salon |
+| `/resume [conversation]` | `!resume [id]` | Reprend une conversation passée (rejoue le chat) |
+| `/delete [conversation]` | `!delete [id]` | Supprime une conversation ou `all` |
+| `/compact` | `!compact` | Compacter l'historique actif |
+| `/session` | `!session` | Affiche l'état de la session active |
+| `/status` | `!status` | Diagnostic système et état des bots |
+| `/usage` | `!usage` | Quotas et jetons consommés |
+| `/skills` | `!skills` | Affiche les compétences actives |
+| _N/A_ | `!help` | Affiche l'aide complète |
+| _Chat direct_ | _Chat direct_ | Parlez à l'assistant sans préfixe |
 
 ---
 

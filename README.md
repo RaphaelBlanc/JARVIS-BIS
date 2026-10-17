@@ -179,28 +179,51 @@ journalctl --user -u assistant-gateway -f
 
 ---
 
-## 🎮 Commandes Disponibles
+## 🎮 Guide Complet des Commandes
 
-### Sur Discord
+Toutes les fonctionnalités sont disponibles sur **Discord** (commandes slash natives `/` et préfixe `!`) et sur **Telegram** (`/`). Vous pouvez également poser vos questions en langage naturel directement dans le salon.
 
-| Commande | Description |
-|---|---|
-| `/ask <question>` | Pose une question ou donne une tâche à l'assistant |
-| `/briefing` | Déclenche immédiatement le briefing matinal complet |
-| `/model` | Affiche ou change le modèle d'IA actif (`gemini-3.8-flash-low`, `claude-sonnet-4-6`, etc.) |
-| `/session` | Affiche l'ID et l'état de la session active |
-| `/clear` | Efface le salon et démarre une nouvelle session vierge |
+### 1. 📅 Quotidien & Productivité
 
-### Sur Telegram
+| Commande Discord | Commande Telegram | Aliases | Description & Exemples |
+|---|---|---|---|
+| `/briefing` | `/briefing` | `/brief`, `!briefing` | Génère le briefing matinal complet (cours/agenda, mails filtrés, tâches, météo, actualités) |
+| `/agenda [periode]` | `/agenda` | `/cal`, `!agenda` | Consulte votre Google Agenda (`aujourd'hui`, `demain`, `semaine`) |
+| `/tasks [action] [texte]` | `/tasks` | `/task`, `/todo`, `!tasks` | Gère Google Tasks : `list`, `add <titre>`, `done <id>`, `delete <id>` |
+| `/meteo [ville]` | `/meteo [ville]` | `/weather`, `!meteo` | Prévisions météo mondiales en temps réel (ex: `/meteo Lyon`) |
+| `/search [requete]` | `/search [requete]` | `/recherche`, `!search` | Recherche sur le web via DuckDuckGo avec synthèse IA |
+| `/summarize [url]` | `/summarize [url]` | `!summarize` | Extrait et résume le contenu d'un article ou d'une page web |
 
-| Commande | Description |
-|---|---|
-| `/briefing` | Génère votre briefing matinal interactif |
-| `/model` | Menu interactif de sélection des modèles avec boutons |
-| `/session` | Affiche les détails de la session en cours |
-| `/clear` | Démarre une conversation neuve |
-| `/skills` | Liste des outils et intégrations actives |
-| `/help` | Affiche l'aide et les commandes |
+### 2. 🧠 Conversation, Sessions & Mémoire
+
+| Commande Discord | Commande Telegram | Aliases | Description & Exemples |
+|---|---|---|---|
+| `/ask [question]` | _Message direct_ | `!ask [question]` | Pose une question ou confie une mission à l'assistant |
+| `/new` | `/new` | `/clear`, `/reset`, `!new` | Démarre une nouvelle conversation vierge (nettoie le salon) |
+| `/resume [conversation]` | `/resume` | `!resume [id]` | Affiche la liste des sessions récentes ou recharge une session passée |
+| `/delete [conversation]` | `/delete` | `/del`, `/delconv`, `!delete` | Supprime une conversation passée (accepte un ID ou `all`) |
+| `/compact` | `/compact` | `!compact` | Compacter l'historique de la session pour économiser des tokens |
+| `/session` | `/session` | `!session` | Affiche l'ID actif, le modèle utilisé et le nombre d'échanges |
+
+### 3. ⚙️ Modèles d'IA & Paramètres Moteur
+
+| Commande Discord | Commande Telegram | Aliases | Description & Exemples |
+|---|---|---|---|
+| `/models` | `/models` | `/model`, `!models` | Liste les modèles Antigravity disponibles et le modèle actif |
+| `/setmodel [model]` | `/setmodel [id]` | `!setmodel [id]` | Change le modèle IA (`gemini-3.8-flash-low`, `claude-sonnet-4-6`, etc.) |
+| `/effort [level]` | `/effort [level]` | `!effort` | Ajuste l'effort de réflexion (`low`, `medium`, `high`, `xhigh`, `max`) |
+| `/mode [mode]` | `/mode [mode]` | `!mode` | Règle le mode d'exécution (`auto`, `plan`, `accept-edits`) |
+| `/permissions [policy]` | `/permissions` | `!permissions` | Règle la validation des actions (`always-proceed`, `request-review`) |
+
+### 4. 📊 Diagnostic & Informations
+
+| Commande Discord | Commande Telegram | Aliases | Description |
+|---|---|---|---|
+| `/status` | `/status` | `!status` | Statut global du système (santé du runner, état d'Antigravity CLI, session) |
+| `/usage` | `/usage` | `/quota`, `!usage` | Affiche l'état des quotas de requêtes et de tokens |
+| `/skills` | `/skills` | `!skills` | Affiche les compétences actives et serveurs MCP connectés |
+| _N/A_ | `/start` | — | Initialise l'assistant sur Telegram avec le message d'accueil |
+| `!help` | `/help` | — | Affiche le menu d'aide complet avec la liste des commandes |
 
 ---
 
