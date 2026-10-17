@@ -60,8 +60,8 @@ def find_agy() -> Optional[str]:
 
 # Configuration de session en mémoire
 SESSION_CONFIG = {
-    "model": "gemini-3.8-flash-high",
-    "effort": None,
+    "model": "gemini-3.8-flash-low",
+    "effort": "low",
     "mode": None,
     "has_active_session": False,
     "conversation_id": None,
@@ -69,9 +69,9 @@ SESSION_CONFIG = {
 }
 
 KNOWN_MODELS = [
-    {"id": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)", "desc": "Rapide et performant (recommandé)"},
+    {"id": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (Low)", "desc": "Ultra-rapide et direct (recommandé pour chat)"},
     {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash (Medium)", "desc": "Équilibré"},
-    {"id": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (Low)", "desc": "Très rapide, économe"},
+    {"id": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)", "desc": "Réflexion approfondie"},
     {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (Thinking)", "desc": "Raisonnement avancé et code"},
     {"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6 (Thinking)", "desc": "Capacité maximale"},
     {"id": "gpt-oss-120b-medium", "name": "GPT-OSS 120B (Medium)", "desc": "Open Source"},
@@ -316,7 +316,7 @@ async def run_agy(
         cmd.extend(["--model", active_model])
 
     # Effort de raisonnement
-    active_effort = effort or SESSION_CONFIG.get("effort")
+    active_effort = effort or SESSION_CONFIG.get("effort") or "low"
     if active_effort:
         cmd.extend(["--effort", active_effort])
 

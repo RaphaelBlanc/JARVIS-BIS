@@ -148,71 +148,22 @@ def _get_bot() -> AssistantBot:
 
 
 BRIEFING_PROMPT = (
-    "Effectue mon briefing matinal complet, motivant et structuré :\n"
+    "Effectue mon briefing matinal rapide, motivant et structuré :\n"
     "1. 📅 EMPLOI DU TEMPS DU JOUR (Heure / Cours / Salles) :\n"
-    "Consulte mon Google Agenda pour aujourd'hui (en vérifiant bien tous mes calendriers, y compris mon calendrier de cours EPITA/PREPA). "
-    "Présente mon planning de la journée sous forme de liste claire avec les horaires, l'intitulé du cours et la salle exacte :\n"
-    "• Heure début - Heure fin : [Matière / Intitulé] (📍 Salle [numéro])\n"
-    "S'il n'y a aucun cours aujourd'hui, mentionne-le clairement.\n\n"
-    "2. 📈 ACTUALITÉS ÉCONOMIQUES DE LA VEILLE :\n"
-    "Recherche les actualités économiques et financières marquantes de la veille (marchés boursiers, macroéconomie, tech & business) et résume les 2 ou 3 points essentiels.\n\n"
+    "Consulte mon Google Agenda aujourd'hui (en incluant mon calendrier de cours EPITA/PREPA). "
+    "Liste uniquement les horaires, le cours et la salle exacte : • Début - Fin : Intitulé (📍 Salle). "
+    "S'il n'y a pas de cours, mentionne-le brièvement.\n\n"
+    "2. 📈 ACTUALITÉS ÉCONOMIQUES :\n"
+    "Recherche rapidement les 2 faits économiques ou tech marquants de la veille (1 seule recherche concise) et résume-les en 2 puces percutantes.\n\n"
     "3. ✉️ E-MAILS IMPORTANTS :\n"
-    "Consulte mes e-mails récents reçus depuis hier via Gmail. "
-    "IMPORTANT : Filtre et ignore TOTALEMENT toutes les publicités, spams, newsletters commerciales et promotions. "
-    "Ne retiens que les messages importants (personnels, professionnels, école/EPITA, cours/examens, démarches). "
-    "Pour chaque e-mail important retenu, résume en 1 ou 2 phrases l'essentiel et l'action requise.\n\n"
+    "Consulte mes 5 derniers e-mails récents via Gmail. Ignore totalement spams, pubs et newsletters. "
+    "Ne retiens que les messages clés (EPITA, examens, personnel) et résume chaque message en 1 ligne.\n\n"
     "4. 🌤️ MÉTÉO DU JOUR :\n"
-    "Consulte la météo du jour pour ma ville (température, ciel, ressenti, pluie éventuelle).\n\n"
+    "Météo du jour pour ma ville (température, ciel, pluie).\n\n"
     "5. 📋 TÂCHES EN COURS :\n"
-    "Consulte mes tâches Google Tasks en cours non terminées si disponibles.\n\n"
-    "Présente le résultat avec un ton motivant, structuré et dynamique avec des émojis."
+    "Consulte mes tâches Google Tasks non terminées si disponibles.\n\n"
+    "CONSIGNE DE STYLE : Sois ultra-synthétique, direct et dynamique. Pas de bavardage, va droit au but avec des puces courtes."
 )
-
-
-@app_commands.command(name="briefing", description="Génère votre briefing matinal (e-mails triés, agenda, météo)")
-async def briefing_slash(interaction: discord.Interaction) -> None:
-    """Handler de la commande slash /briefing."""
-    if not _is_allowed(interaction.user.id):
-        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
-        return
-
-    logger.info("Commande /briefing de %d", interaction.user.id)
-    await interaction.response.send_message("⏳ Préparation de votre briefing matinal (tri des e-mails, agenda, météo)...")
-    result = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=120)
-
-    if result.get("success"):
-        response_text = result.get("output", "").strip() or "✅ Briefing terminé."
-    else:
-        error = result.get("error", "Erreur inconnue")
-        response_text = f"❌ Erreur : {error}"
-
-    # Si la réponse dépasse 2000 caractères, on la tronque proprement pour Discord
-    if len(response_text) > 2000:
-        response_text = response_text[:1990] + "..."
-
-    await interaction.edit_original_response(content=response_text)
-
-
-@app_commands.command(name="ask", description="Pose une question à l'assistant personnel")
-@app_commands.describe(question="Votre question ou tâche pour l'assistant")
-async def ask_slash(interaction: discord.Interaction, question: str) -> None:
-    """Handler de la commande slash /ask."""
-    if not _is_allowed(interaction.user.id):
-        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
-        return
-
-
-    logger.info("Commande /ask de %d: '%s'", interaction.user.id, question[:80])
-    await interaction.response.send_message("⏳ Traitement en cours...")
-    result = await forward_to_runner(question, continue_session=True)
-
-    if result.get("success"):
-        response_text = result.get("output", "").strip() or "✅ Tâche terminée (pas de sortie)."
-    else:
-        error = result.get("error", "Erreur inconnue")
-        response_text = f"❌ Erreur : {error}"
-
-    await interaction.edit_original_response(content=response_text)
 
 
 async def _fast_ack(interaction: discord.Interaction, message: str = "⏳ Traitement en cours...", ephemeral: bool = False) -> None:
@@ -226,17 +177,87 @@ async def _fast_ack(interaction: discord.Interaction, message: str = "⏳ Traite
             pass
 
 
-async def send_discord_long_response(interaction: discord.Interaction, text: str) -> None:
-    """Envoie une réponse découpée si elle dépasse 2000 caractères."""
+async def send_discord_long_response(
+    interaction: discord.Interaction,
+    text: str,
+    title: Optional[str] = None,
+) -> None:
+    """Envoie une réponse Discord optimisée :
+    - Si <= 2000 caractères : message texte standard (1 seul message).
+    - Si entre 2000 et 6000 caractères : intégrée dans des Embeds dans le MÊME message (1 seul message, pas de spam).
+    - Si > 6000 caractères : découpage propre par paragraphes.
+    """
     if not text:
         text = "✅ Tâche terminée (pas de sortie)."
-    parts = [text[i:i + 1950] for i in range(0, len(text), 1950)]
+
+    # Cas 1 : message court <= 2000 caractères -> message texte simple
+    if len(text) <= 2000:
+        try:
+            await interaction.edit_original_response(content=text, embeds=[])
+            return
+        except Exception:
+            try:
+                await interaction.followup.send(content=text)
+                return
+            except Exception as e:
+                logger.warning("Erreur envoi message court: %s", e)
+
+    # Cas 2 : message long (2000-6000 caractères) -> Embeds dans le MÊME message unique
+    chunks = []
+    lines = text.split("\n")
+    current_chunk = []
+    current_len = 0
+    for line in lines:
+        if current_len + len(line) + 1 > 3900:
+            chunks.append("\n".join(current_chunk))
+            current_chunk = [line]
+            current_len = len(line) + 1
+        else:
+            current_chunk.append(line)
+            current_len += len(line) + 1
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+
+    total_len = sum(len(c) for c in chunks)
+    if len(chunks) <= 4 and total_len <= 5800:
+        embeds = []
+        for idx, chunk in enumerate(chunks):
+            embed = discord.Embed(
+                description=chunk,
+                color=0x5865F2,
+            )
+            if idx == 0 and title:
+                embed.title = title
+            if len(chunks) > 1:
+                embed.set_footer(text=f"Partie {idx + 1}/{len(chunks)}")
+            embeds.append(embed)
+        try:
+            await interaction.edit_original_response(content=None, embeds=embeds)
+            return
+        except Exception as e:
+            logger.warning("Erreur edit_original_response avec embeds: %s", e)
+
+    # Cas 3 : Repli si > 6000 chars -> découpage propre par paragraphes
     first = True
+    parts = []
+    curr = []
+    curr_l = 0
+    for line in text.split("\n"):
+        if curr_l + len(line) + 1 > 1950:
+            parts.append("\n".join(curr))
+            curr = [line]
+            curr_l = len(line) + 1
+        else:
+            curr.append(line)
+            curr_l += len(line) + 1
+    if curr:
+        parts.append("\n".join(curr))
+
     for p in parts:
         if first:
             first = False
             try:
-                await interaction.edit_original_response(content=p)
+                await interaction.edit_original_response(content=p, embeds=[])
                 continue
             except Exception:
                 pass
@@ -244,6 +265,47 @@ async def send_discord_long_response(interaction: discord.Interaction, text: str
             await interaction.followup.send(p)
         except Exception as e:
             logger.warning("Erreur followup discord: %s", e)
+
+
+@app_commands.command(name="briefing", description="Génère votre briefing matinal (e-mails triés, agenda, météo)")
+async def briefing_slash(interaction: discord.Interaction) -> None:
+    """Handler de la commande slash /briefing."""
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+
+    logger.info("Commande /briefing de %d", interaction.user.id)
+    await _fast_ack(interaction, "⏳ Préparation de votre briefing matinal (tri des e-mails, agenda, météo)...")
+    result = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=240)
+
+    if result.get("success"):
+        response_text = result.get("output", "").strip() or "✅ Briefing terminé."
+    else:
+        error = result.get("error", "Erreur inconnue")
+        response_text = f"❌ Erreur : {error}"
+
+    await send_discord_long_response(interaction, response_text, title="🌅 Votre Briefing Matinal")
+
+
+@app_commands.command(name="ask", description="Pose une question à l'assistant personnel")
+@app_commands.describe(question="Votre question ou tâche pour l'assistant")
+async def ask_slash(interaction: discord.Interaction, question: str) -> None:
+    """Handler de la commande slash /ask."""
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+
+    logger.info("Commande /ask de %d: '%s'", interaction.user.id, question[:80])
+    await _fast_ack(interaction, "⏳ Traitement en cours...")
+    result = await forward_to_runner(question, continue_session=True, timeout=180)
+
+    if result.get("success"):
+        response_text = result.get("output", "").strip() or "✅ Tâche terminée (pas de sortie)."
+    else:
+        error = result.get("error", "Erreur inconnue")
+        response_text = f"❌ Erreur : {error}"
+
+    await send_discord_long_response(interaction, response_text)
 
 
 async def clear_channel_messages(channel: Optional[discord.abc.Messageable], limit: int = 50) -> None:

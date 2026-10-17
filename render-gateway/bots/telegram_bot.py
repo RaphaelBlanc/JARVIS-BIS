@@ -1085,24 +1085,21 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 SAVED_CHATS_FILE = Path(__file__).resolve().parent.parent / "saved_chats.json"
 
 BRIEFING_PROMPT = (
-    "Effectue mon briefing matinal complet, motivant et structuré :\n"
+    "Effectue mon briefing matinal rapide, motivant et structuré :\n"
     "1. 📅 EMPLOI DU TEMPS DU JOUR (Heure / Cours / Salles) :\n"
-    "Consulte mon Google Agenda pour aujourd'hui (en vérifiant bien tous mes calendriers, y compris mon calendrier de cours EPITA/PREPA). "
-    "Présente mon planning de la journée sous forme de liste claire avec les horaires, l'intitulé du cours et la salle exacte :\n"
-    "• Heure début - Heure fin : [Matière / Intitulé] (📍 Salle [numéro])\n"
-    "S'il n'y a aucun cours aujourd'hui, mentionne-le clairement.\n\n"
-    "2. 📈 ACTUALITÉS ÉCONOMIQUES DE LA VEILLE :\n"
-    "Recherche les actualités économiques et financières marquantes de la veille (marchés boursiers, macroéconomie, tech & business) et résume les 2 ou 3 points essentiels.\n\n"
+    "Consulte mon Google Agenda aujourd'hui (en incluant mon calendrier de cours EPITA/PREPA). "
+    "Liste uniquement les horaires, le cours et la salle exacte : • Début - Fin : Intitulé (📍 Salle). "
+    "S'il n'y a pas de cours, mentionne-le brièvement.\n\n"
+    "2. 📈 ACTUALITÉS ÉCONOMIQUES :\n"
+    "Recherche rapidement les 2 faits économiques ou tech marquants de la veille (1 seule recherche concise) et résume-les en 2 puces percutantes.\n\n"
     "3. ✉️ E-MAILS IMPORTANTS :\n"
-    "Consulte mes e-mails récents reçus depuis hier via Gmail. "
-    "IMPORTANT : Filtre et ignore TOTALEMENT toutes les publicités, spams, newsletters commerciales et promotions. "
-    "Ne retiens que les messages importants (personnels, professionnels, école/EPITA, cours/examens, démarches). "
-    "Pour chaque e-mail important retenu, résume en 1 ou 2 phrases l'essentiel et l'action requise.\n\n"
+    "Consulte mes 5 derniers e-mails récents via Gmail. Ignore totalement spams, pubs et newsletters. "
+    "Ne retiens que les messages clés (EPITA, examens, personnel) et résume chaque message en 1 ligne.\n\n"
     "4. 🌤️ MÉTÉO DU JOUR :\n"
-    "Consulte la météo du jour pour ma ville (température, ciel, ressenti, pluie éventuelle).\n\n"
+    "Météo du jour pour ma ville (température, ciel, pluie).\n\n"
     "5. 📋 TÂCHES EN COURS :\n"
-    "Consulte mes tâches Google Tasks en cours non terminées si disponibles.\n\n"
-    "Présente le résultat avec un ton motivant, structuré et dynamique avec des émojis."
+    "Consulte mes tâches Google Tasks non terminées si disponibles.\n\n"
+    "CONSIGNE DE STYLE : Sois ultra-synthétique, direct et dynamique. Pas de bavardage, va droit au but avec des puces courtes."
 )
 
 
@@ -1157,7 +1154,7 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     _save_chat_id(update.effective_chat.id)
     waiting_msg = await update.message.reply_text("⏳ Préparation de votre briefing matinal (analyse e-mails, agenda, météo)...")
-    res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=120)
+    res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=240)
     output = res.get("output", "").strip() or "⚠️ Impossible de générer le briefing matinal."
     await send_or_edit_telegram_response(waiting_msg, output, update.message)
 

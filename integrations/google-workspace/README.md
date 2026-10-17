@@ -19,6 +19,9 @@ Ce module permet de connecter votre compte Google à votre assistant personnel (
   - Rechercher des fichiers et dossiers.
   - Télécharger et lire le contenu de documents, feuilles de calcul ou PDF.
   - Uploader de nouveaux fichiers et créer des dossiers.
+- **📋 Google Tasks** :
+  - Lister les listes de tâches et les tâches en cours.
+  - Ajouter, cocher (terminer) et supprimer des tâches automatiquement.
 
 ---
 

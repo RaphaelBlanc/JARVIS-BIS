@@ -64,6 +64,23 @@ def _get_headers() -> dict[str, str]:
     }
 
 
+def _format_error(resp: httpx.Response) -> str:
+    """Formate un message d'erreur clair et actionnable selon le retour de Google."""
+    if resp.status_code == 403:
+        try:
+            err_data = resp.json().get("error", {})
+            msg = err_data.get("message", "")
+            if "has not been used in project" in msg or "is disabled" in msg:
+                return (
+                    "Google Tasks non accessible : l'API Google Tasks n'est pas encore activée dans votre console Google Cloud. "
+                    "Cliquez sur 'Activer' ici : https://console.developers.google.com/apis/api/tasks.googleapis.com/overview?project=516108585524"
+                )
+        except Exception:
+            pass
+        return "Google Tasks non accessible : permissions insuffisantes ou API désactivée (HTTP 403)."
+    return f"Erreur Google Tasks : HTTP {resp.status_code} ({resp.text})"
+
+
 @server.tool()
 async def tasks_list_tasklists() -> str:
     """Liste toutes les listes de tâches de l'utilisateur."""
@@ -71,7 +88,7 @@ async def tasks_list_tasklists() -> str:
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(f"{TASKS_API_BASE}/users/@me/lists", headers=headers)
         if resp.status_code != 200:
-            return f"Erreur lors de la récupération des listes : HTTP {resp.status_code} ({resp.text})"
+            return _format_error(resp)
 
         data = resp.json()
         items = data.get("items", [])
@@ -106,7 +123,7 @@ async def tasks_list_tasks(
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(f"{TASKS_API_BASE}/lists/{tasklist_id}/tasks", headers=headers, params=params)
         if resp.status_code != 200:
-            return f"Erreur lors de la récupération des tâches : HTTP {resp.status_code} ({resp.text})"
+            return _format_error(resp)
 
         items = resp.json().get("items", [])
         if not items:
@@ -151,7 +168,7 @@ async def tasks_create_task(
         if resp.status_code in (200, 201):
             created = resp.json()
             return f"✅ Tâche créée avec succès : **{created.get('title')}** (ID: `{created.get('id')}`)"
-        return f"Erreur lors de la création de la tâche : HTTP {resp.status_code} ({resp.text})"
+        return _format_error(resp)
 
 
 @server.tool()
@@ -168,7 +185,7 @@ async def tasks_complete_task(task_id: str, tasklist_id: str = "@default") -> st
         resp = await client.patch(f"{TASKS_API_BASE}/lists/{tasklist_id}/tasks/{task_id}", headers=headers, json=body)
         if resp.status_code == 200:
             return f"✅ Tâche `{task_id}` marquée comme terminée !"
-        return f"Erreur lors de la mise à jour : HTTP {resp.status_code} ({resp.text})"
+        return _format_error(resp)
 
 
 @server.tool()
@@ -184,7 +201,7 @@ async def tasks_delete_task(task_id: str, tasklist_id: str = "@default") -> str:
         resp = await client.delete(f"{TASKS_API_BASE}/lists/{tasklist_id}/tasks/{task_id}", headers=headers)
         if resp.status_code in (200, 204):
             return f"🗑️ Tâche `{task_id}` supprimée."
-        return f"Erreur lors de la suppression : HTTP {resp.status_code} ({resp.text})"
+        return _format_error(resp)
 
 
 if __name__ == "__main__":

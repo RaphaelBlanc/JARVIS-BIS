@@ -167,6 +167,18 @@ def test_api_access(access_token: str) -> None:
         except Exception as e:
             print(f"  ❌ Google Drive : Erreur ({e})")
 
+        # Test 4 : Google Tasks
+        try:
+            res_tasks = client.get("https://tasks.googleapis.com/tasks/v1/users/@me/lists", headers=headers)
+            if res_tasks.status_code == 200:
+                tasks_data = res_tasks.json()
+                lists = [item.get("title") for item in tasks_data.get("items", [])]
+                print(f"  📋 Google Tasks : Connecté avec succès ({len(lists)} liste(s) trouvée(s) : {', '.join(lists)})")
+            else:
+                print(f"  ⚠️ Google Tasks : Erreur HTTP {res_tasks.status_code} ({res_tasks.text})")
+        except Exception as e:
+            print(f"  ❌ Google Tasks : Erreur ({e})")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Authentification Google Workspace pour Antigravity MCP")

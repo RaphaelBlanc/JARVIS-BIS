@@ -19,7 +19,7 @@ MAX_RESPONSE_LENGTH: int = 4000
 
 async def forward_to_runner(
     prompt: str,
-    timeout: int = 120,
+    timeout: int = 180,
     model: str | None = None,
     effort: str | None = None,
     mode: str | None = None,
