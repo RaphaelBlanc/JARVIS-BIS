@@ -8,6 +8,7 @@ Permet de :
 4. Détecter et préparer les extraits de code pour téléchargement et copie instantanée.
 """
 
+import asyncio
 import html
 import io
 import logging
@@ -226,6 +227,12 @@ def build_latex_png_url(
     return f"https://latex.codecogs.com/png.image?{encoded}"
 
 
+# Cache mémoire des rendus CodeCogs : une formule identique n'est téléchargée
+# qu'une seule fois, ce qui évite un aller-retour réseau à chaque réponse.
+_RENDER_CACHE: dict[tuple[str, bool], bytes] = {}
+_RENDER_CACHE_MAX = 128
+
+
 async def render_latex_to_png(
     formula: str,
     dark_mode: bool = True,
@@ -245,12 +252,20 @@ async def render_latex_to_png(
     if not clean_formula:
         return None
 
+    cache_key = (clean_formula, dark_mode)
+    cached = _RENDER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     url = build_latex_png_url(clean_formula, dark_mode=dark_mode)
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url)
             if resp.status_code == 200 and len(resp.content) > 100:
+                if len(_RENDER_CACHE) >= _RENDER_CACHE_MAX:
+                    _RENDER_CACHE.pop(next(iter(_RENDER_CACHE)))
+                _RENDER_CACHE[cache_key] = resp.content
                 return resp.content
     except Exception as exc:
         logger.debug("Échec rendu CodeCogs pour '%s': %s", clean_formula[:40], exc)
@@ -288,32 +303,47 @@ async def extract_and_render_latex(
     protected_text, code_spans, code_token = _protect_code_spans(text)
     updated_text = protected_text
 
-    # Recherche des blocs d'équations
+    # Recherche des blocs d'équations. Les rendus d'un même motif sont lancés
+    # en parallèle : quatre équations ne coûtent plus quatre allers-retours
+    # CodeCogs successifs.
     eq_index = 1
     for pattern in BLOCK_LATEX_PATTERNS:
-        matches = list(pattern.finditer(updated_text))
-        for match in matches:
-            if len(rendered_images) >= max_equations:
-                break
-            raw_block = match.group(0)
-            formula = match.group(1).strip()
-            if not formula:
-                continue
+        if len(rendered_images) >= max_equations:
+            break
 
-            png_bytes = await render_latex_to_png(formula, dark_mode=dark_mode)
-            if png_bytes:
-                filename = f"equation_{eq_index}.png"
-                rendered_images.append({
-                    "bytes": png_bytes,
-                    "filename": filename,
-                    "title": f"Équation {eq_index}",
-                    "formula": formula,
-                })
-                # Remplacement dans le texte par une référence propre et lisible
-                unicode_eq = latex_to_unicode(f"${formula}$")
-                replacement = f"\n📐 **[Équation {eq_index}]** : `{unicode_eq}`\n"
-                updated_text = updated_text.replace(raw_block, replacement, 1)
-                eq_index += 1
+        matches: list[tuple[str, str]] = []
+        for match in pattern.finditer(updated_text):
+            if len(rendered_images) + len(matches) >= max_equations:
+                break
+            formula = match.group(1).strip()
+            if formula:
+                matches.append((match.group(0), formula))
+
+        if not matches:
+            continue
+
+        pngs = await asyncio.gather(
+            *(
+                render_latex_to_png(formula, dark_mode=dark_mode)
+                for _, formula in matches
+            )
+        )
+
+        for (raw_block, formula), png_bytes in zip(matches, pngs):
+            if not png_bytes:
+                continue
+            filename = f"equation_{eq_index}.png"
+            rendered_images.append({
+                "bytes": png_bytes,
+                "filename": filename,
+                "title": f"Équation {eq_index}",
+                "formula": formula,
+            })
+            # Remplacement dans le texte par une référence propre et lisible
+            unicode_eq = latex_to_unicode(f"${formula}$")
+            replacement = f"\n📐 **[Équation {eq_index}]** : `{unicode_eq}`\n"
+            updated_text = updated_text.replace(raw_block, replacement, 1)
+            eq_index += 1
 
     # Convertir également le LaTeX inline résiduel ($...$) en Unicode
     updated_text = latex_to_unicode(updated_text)
