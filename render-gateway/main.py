@@ -32,6 +32,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# httpx loggue les URLs complètes en INFO, ce qui expose le token du bot
+# Telegram dans journalctl. On ne garde que les avertissements/erreurs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # ── Imports locaux (après dotenv) ─────────────────────────────────────────────
 
 from bots.telegram_bot import (  # noqa: E402
