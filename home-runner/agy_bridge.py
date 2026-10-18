@@ -101,6 +101,12 @@ def _normalize_model_effort(
             elif effort != suffix:
                 if effort in _FLASH_EFFORTS:
                     model = f"{_FLASH_MODEL_PREFIX}{effort}"
+                elif effort in {"xhigh", "max"}:
+                    # Ces niveaux n'existent pas dans la gamme Flash : on
+                    # utilise le maximum disponible plutôt que de laisser
+                    # agy rejeter la combinaison.
+                    model = f"{_FLASH_MODEL_PREFIX}high"
+                    effort = "high"
                 else:
                     effort = suffix
     return model, effort
@@ -120,16 +126,24 @@ def update_session(
     """Met à jour les paramètres de session."""
     if model:
         SESSION_CONFIG["model"] = model.strip()
+        # Un modèle Flash impose son propre niveau d'effort.
+        if model.startswith(_FLASH_MODEL_PREFIX):
+            suffix = model[len(_FLASH_MODEL_PREFIX):]
+            if suffix in _FLASH_EFFORTS:
+                SESSION_CONFIG["effort"] = suffix
+
     if effort:
         SESSION_CONFIG["effort"] = effort.strip().lower()
+        # L'effort explicitement demandé est prioritaire : on aligne le modèle
+        # Flash dessus (ou on retombe sur high pour xhigh/max).
+        SESSION_CONFIG["model"], SESSION_CONFIG["effort"] = _normalize_model_effort(
+            SESSION_CONFIG.get("model"), SESSION_CONFIG.get("effort")
+        )
+
     if mode:
         SESSION_CONFIG["mode"] = mode.strip().lower()
     if permission_mode:
         SESSION_CONFIG["permission_mode"] = permission_mode.strip().lower()
-
-    SESSION_CONFIG["model"], SESSION_CONFIG["effort"] = _normalize_model_effort(
-        SESSION_CONFIG.get("model"), SESSION_CONFIG.get("effort")
-    )
     return dict(SESSION_CONFIG)
 
 
