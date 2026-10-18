@@ -12,6 +12,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
@@ -27,10 +28,12 @@ from agy_bridge import (
     find_agy,
     get_conversation_history,
     get_session_info,
+    get_worker_info,
     list_recent_conversations,
-    reset_session as bridge_reset_session,
+    reset_session_async,
     resume_conversation,
     run_agy,
+    shutdown_agy_worker,
     update_session,
 )
 
@@ -66,12 +69,21 @@ logger = logging.getLogger("home-runner")
 # Application FastAPI
 # ---------------------------------------------------------------------------
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Arrête proprement le worker agy persistant lors de l'arrêt du service."""
+    yield
+    await shutdown_agy_worker()
+
+
 app = FastAPI(
     title="Home Runner",
     description="Passerelle locale qui exécute Antigravity CLI (agy) pour l'assistant personnel.",
     version="1.0.0",
     docs_url=None,   # Désactive Swagger UI (API privée)
     redoc_url=None,  # Désactive ReDoc
+    lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
@@ -192,6 +204,7 @@ async def health():
         "agy_path": agy_path,
         "agy_timeout_default": AGY_TIMEOUT,
         "session": get_session_info(),
+        "agy_worker": get_worker_info(),
     }
 
     if not agy_available:
@@ -232,7 +245,7 @@ async def session_update(request: Request, body: SessionUpdateRequest):
 async def session_reset(request: Request):
     """Oublie l'historique et démarre une session vierge."""
     _check_secret(request)
-    res = bridge_reset_session()
+    res = await reset_session_async()
     logger.info("Session conversationnelle réinitialisée.")
     return {"status": "reset", "session": res}
 

@@ -12,6 +12,8 @@ import logging
 import os
 import re
 import shutil
+import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -267,8 +269,338 @@ def delete_all_conversations() -> dict:
 # simultanés corrompraient l'historique et les paramètres de session.
 _AGY_LOCK = asyncio.Lock()
 
+# ── Worker persistant (mode stream-json) ─────────────────────────────────────
+#
+# `agy --input-format stream-json` accepte plusieurs tours dans un même
+# processus. On garde donc un worker vivant entre les messages : le démarrage,
+# l'authentification, la résolution de modèle et l'initialisation MCP ne sont
+# payés qu'une seule fois au lieu d'être refaits à chaque requête.
 
-async def _run_agy_unlocked(
+AGY_PERSISTENT: bool = os.getenv("AGY_PERSISTENT", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+AGY_WORKER_IDLE_TIMEOUT: float = float(os.getenv("AGY_WORKER_IDLE_TIMEOUT", "900"))
+AGY_STARTUP_TIMEOUT: float = float(os.getenv("AGY_STARTUP_TIMEOUT", "30"))
+
+
+class _AgyStreamWorker:
+    """Un processus `agy` stream-json réutilisé pour plusieurs tours."""
+
+    def __init__(
+        self,
+        agy_path: str,
+        model: Optional[str],
+        effort: Optional[str],
+        mode: Optional[str],
+        permission_mode: Optional[str],
+        continue_session: bool,
+        conversation_id: Optional[str],
+        has_active_session: bool,
+    ) -> None:
+        self.agy_path = agy_path
+        self.model = model
+        self.effort = effort
+        self.mode = mode
+        self.permission_mode = permission_mode
+        self.continue_session = continue_session
+        self.conversation_id = conversation_id
+        self.has_active_session = has_active_session
+        self.proc: Optional[asyncio.subprocess.Process] = None
+        self._stderr_task: Optional[asyncio.Task] = None
+        self._stderr_tail: deque[str] = deque(maxlen=40)
+        self.last_used = time.monotonic()
+        self.busy = False
+
+    def matches(
+        self,
+        model: Optional[str],
+        effort: Optional[str],
+        mode: Optional[str],
+        permission_mode: Optional[str],
+    ) -> bool:
+        """Indique si le worker peut servir la configuration demandée."""
+        return (
+            self.model == model
+            and self.effort == effort
+            and self.mode == mode
+            and self.permission_mode == permission_mode
+        )
+
+    def is_alive(self) -> bool:
+        return (
+            self.proc is not None
+            and self.proc.returncode is None
+            and self.proc.stdin is not None
+        )
+
+    def _exit_message(self, prefix: str) -> str:
+        code = self.proc.returncode if self.proc is not None else None
+        details = ""
+        if self._stderr_tail:
+            details = " Dernière sortie: " + " | ".join(list(self._stderr_tail)[-3:])
+        return f"{prefix} (code={code}).{details}"
+
+    async def _drain_stderr(self) -> None:
+        """Vide stderr en continu pour éviter de bloquer le processus."""
+        proc = self.proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                text = strip_ansi(line.decode(errors="replace")).strip()
+                if text:
+                    self._stderr_tail.append(text)
+                    logger.debug("agy stderr: %s", text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Erreur de lecture de stderr agy: %s", exc)
+
+    async def _read_event(self, timeout: float) -> dict:
+        """Lit un événement NDJSON avec un délai maximal."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            try:
+                line = await asyncio.wait_for(
+                    self.proc.stdout.readline(), timeout=remaining  # type: ignore[union-attr]
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    self._exit_message("flux stdout agy fermé")
+                ) from exc
+            if not line:
+                raise RuntimeError(self._exit_message("agy s'est arrêté"))
+            text = line.decode(errors="replace").strip()
+            if not text:
+                continue
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                logger.debug("Ligne agy non JSON ignorée: %.200s", text)
+
+    async def start(self) -> dict:
+        """Démarre le processus et attend l'événement `init`."""
+        cmd = [
+            self.agy_path,
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+        ]
+        if self.continue_session:
+            if self.conversation_id:
+                cmd.extend(["--conversation", self.conversation_id])
+            elif self.has_active_session:
+                cmd.append("-c")
+        if self.model:
+            cmd.extend(["--model", self.model])
+        if self.effort:
+            cmd.extend(["--effort", self.effort])
+        if self.mode:
+            cmd.extend(["--mode", self.mode])
+        if self.permission_mode == "always-proceed":
+            cmd.append("--dangerously-skip-permissions")
+
+        env = {
+            **os.environ,
+            "TERM": "dumb",
+            "NO_COLOR": "1",
+            "FORCE_COLOR": "0",
+            "COLORTERM": "",
+        }
+
+        logger.info(
+            "Démarrage worker agy persistant: %s (conversation=%s)",
+            " ".join(cmd[:6]),
+            self.conversation_id or ("continue" if self.has_active_session else "nouvelle"),
+        )
+        self.proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+        deadline = asyncio.get_running_loop().time() + AGY_STARTUP_TIMEOUT
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(
+                    f"agy n'a pas envoyé d'événement init en {AGY_STARTUP_TIMEOUT}s"
+                )
+            event = await self._read_event(remaining)
+            if event.get("event") == "init":
+                self.conversation_id = (
+                    event.get("conversation_id") or self.conversation_id
+                )
+                self.last_used = time.monotonic()
+                logger.info(
+                    "Worker agy prêt (conversation=%s).", self.conversation_id
+                )
+                return event
+
+    async def send(self, prompt: str, timeout: int) -> dict:
+        """Envoie un tour et attend l'événement `result` correspondant."""
+        if not self.is_alive():
+            raise RuntimeError(self._exit_message("worker agy non disponible"))
+
+        payload = {"event": "user", "message": {"content": prompt}}
+        self.busy = True
+        self.last_used = time.monotonic()
+        try:
+            assert self.proc is not None and self.proc.stdin is not None
+            self.proc.stdin.write(
+                json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
+            )
+            await self.proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            self.busy = False
+            raise RuntimeError(
+                self._exit_message(f"entrée agy fermée: {exc}")
+            ) from exc
+        except Exception:
+            self.busy = False
+            raise
+
+        try:
+            deadline = asyncio.get_running_loop().time() + timeout
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                event = await self._read_event(remaining)
+                if event.get("event") == "result":
+                    self.last_used = time.monotonic()
+                    return event.get("result", {})
+        finally:
+            self.busy = False
+
+    async def stop(self) -> None:
+        """Arrête proprement le worker, puis le tue si nécessaire."""
+        proc = self.proc
+        self.proc = None
+        if proc is not None:
+            try:
+                if proc.stdin is not None and not proc.stdin.is_closing():
+                    proc.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001
+                pass
+
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+            self._stderr_task = None
+        logger.info("Worker agy arrêté.")
+
+
+_WORKER: Optional[_AgyStreamWorker] = None
+_WATCHDOG_TASK: Optional[asyncio.Task] = None
+
+
+def get_worker_info() -> dict:
+    """Retourne l'état du worker persistant, pour /health et le diagnostic."""
+    worker = _WORKER
+    return {
+        "persistent": AGY_PERSISTENT,
+        "running": bool(worker and worker.is_alive()),
+        "conversation_id": worker.conversation_id if worker else None,
+        "idle_seconds": (
+            round(time.monotonic() - worker.last_used, 1) if worker else None
+        ),
+        "idle_timeout": AGY_WORKER_IDLE_TIMEOUT,
+    }
+
+
+async def _stop_worker() -> None:
+    """Arrête et oublie le worker courant."""
+    global _WORKER
+    worker = _WORKER
+    _WORKER = None
+    if worker is not None:
+        await worker.stop()
+
+
+async def _worker_watchdog() -> None:
+    """Arrête le worker après une longue période d'inactivité."""
+    while True:
+        await asyncio.sleep(30)
+        if _AGY_LOCK.locked():
+            continue
+        try:
+            await _AGY_LOCK.acquire()
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            worker = _WORKER
+            if (
+                worker is not None
+                and not worker.busy
+                and time.monotonic() - worker.last_used > AGY_WORKER_IDLE_TIMEOUT
+            ):
+                logger.info(
+                    "Arrêt du worker agy inactif depuis %.0fs.",
+                    time.monotonic() - worker.last_used,
+                )
+                await _stop_worker()
+        finally:
+            _AGY_LOCK.release()
+
+
+def _ensure_watchdog() -> None:
+    global _WATCHDOG_TASK
+    if _WATCHDOG_TASK is None or _WATCHDOG_TASK.done():
+        _WATCHDOG_TASK = asyncio.create_task(_worker_watchdog())
+
+
+async def shutdown_agy_worker() -> None:
+    """Arrête proprement le worker (appelé à l'arrêt du home-runner)."""
+    global _WATCHDOG_TASK
+    task = _WATCHDOG_TASK
+    _WATCHDOG_TASK = None
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    async with _AGY_LOCK:
+        await _stop_worker()
+
+
+async def reset_session_async() -> dict:
+    """Réinitialise la session et arrête le worker qui la détenait."""
+    async with _AGY_LOCK:
+        await _stop_worker()
+        return reset_session()
+
+
+async def _run_agy_oneshot(
     prompt: str,
     timeout: int = 120,
     model: Optional[str] = None,
@@ -277,6 +609,7 @@ async def _run_agy_unlocked(
     continue_session: bool = True,
     reset_session_flag: bool = False,
     permission_mode: Optional[str] = None,
+    update_session: bool = True,
 ) -> dict:
     """
     Lance `agy` en subprocess non-interactif (-p / --print) avec support de continuité conversationnelle.
@@ -369,7 +702,8 @@ async def _run_agy_unlocked(
         success = proc.returncode == 0
 
         if success:
-            SESSION_CONFIG["has_active_session"] = True
+            if update_session:
+                SESSION_CONFIG["has_active_session"] = True
             logger.info("agy terminé avec succès (code 0). Sortie : %d caractères.", len(out))
         else:
             logger.warning(
@@ -410,6 +744,171 @@ async def _run_agy_unlocked(
         }
 
 
+async def _run_agy_persistent(
+    prompt: str,
+    timeout: int,
+    model: Optional[str],
+    effort: Optional[str],
+    mode: Optional[str],
+    continue_session: bool,
+    reset_session_flag: bool,
+    permission_mode: Optional[str],
+) -> dict:
+    """Exécute un tour via le worker stream-json persistant.
+
+    Les commandes sans continuité (`continue_session=False`) et les commandes
+    slash d'agy utilisent l'ancien mode one-shot : elles ne doivent pas
+    polluer la conversation principale, et certaines slash commands ne sont
+    pas disponibles en stream-json.
+    """
+    global _WORKER
+
+    agy_path = find_agy()
+    if not agy_path:
+        return {
+            "success": False,
+            "output": "",
+            "error": "agy introuvable dans PATH et dans les emplacements connus.",
+            "session": dict(SESSION_CONFIG),
+        }
+
+    if reset_session_flag:
+        await _stop_worker()
+        SESSION_CONFIG["has_active_session"] = False
+        SESSION_CONFIG["conversation_id"] = None
+
+    active_model = model or SESSION_CONFIG.get("model")
+    active_effort = effort or SESSION_CONFIG.get("effort") or "low"
+    active_mode = mode or SESSION_CONFIG.get("mode")
+    active_perm = permission_mode or SESSION_CONFIG.get(
+        "permission_mode", "always-proceed"
+    )
+
+    is_slash = prompt.lstrip().startswith("/")
+    if not continue_session or is_slash:
+        # Un seul processus agy à la fois : on arrête le worker principal
+        # avant de lancer une commande one-shot.
+        await _stop_worker()
+        return await _run_agy_oneshot(
+            prompt=prompt,
+            timeout=timeout,
+            model=model,
+            effort=effort,
+            mode=mode,
+            continue_session=continue_session,
+            reset_session_flag=False,
+            permission_mode=permission_mode,
+            update_session=continue_session,
+        )
+
+    worker = _WORKER
+    if worker is not None and not worker.is_alive():
+        await _stop_worker()
+        worker = None
+
+    # `/session/reset` remet has_active_session à False sans forcément arrêter
+    # le worker : on ne doit alors surtout pas réutiliser l'ancienne conversation.
+    if worker is not None and not SESSION_CONFIG.get("has_active_session"):
+        await _stop_worker()
+        worker = None
+
+    if worker is not None and not worker.matches(
+        active_model, active_effort, active_mode, active_perm
+    ):
+        await _stop_worker()
+        worker = None
+
+    if worker is not None:
+        current_id = SESSION_CONFIG.get("conversation_id")
+        if (
+            current_id
+            and worker.conversation_id
+            and worker.conversation_id != current_id
+        ):
+            await _stop_worker()
+            worker = None
+
+    if worker is None:
+        worker = _AgyStreamWorker(
+            agy_path=agy_path,
+            model=active_model,
+            effort=active_effort,
+            mode=active_mode,
+            permission_mode=active_perm,
+            continue_session=True,
+            conversation_id=SESSION_CONFIG.get("conversation_id"),
+            has_active_session=SESSION_CONFIG.get("has_active_session", False),
+        )
+        try:
+            await worker.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Échec du worker agy persistant (%s) ; repli sur une exécution one-shot.",
+                exc,
+            )
+            await worker.stop()
+            return await _run_agy_oneshot(
+                prompt=prompt,
+                timeout=timeout,
+                model=model,
+                effort=effort,
+                mode=mode,
+                continue_session=continue_session,
+                reset_session_flag=False,
+                permission_mode=permission_mode,
+                update_session=True,
+            )
+        _WORKER = worker
+        _ensure_watchdog()
+
+    try:
+        result = await worker.send(prompt, timeout)
+    except asyncio.TimeoutError:
+        logger.error("Worker agy : timeout de %ds dépassé.", timeout)
+        await _stop_worker()
+        return {
+            "success": False,
+            "output": "",
+            "error": f"Timeout dépassé ({timeout}s). Le processus a été interrompu.",
+            "session": dict(SESSION_CONFIG),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Erreur du worker agy : %s", exc)
+        await _stop_worker()
+        return {
+            "success": False,
+            "output": "",
+            "error": str(exc),
+            "session": dict(SESSION_CONFIG),
+        }
+
+    status = str(result.get("status", "")).upper()
+    success = status == "SUCCESS"
+    output = result.get("response", "") or ""
+    error = result.get("error")
+
+    if success:
+        SESSION_CONFIG["has_active_session"] = True
+        if worker.conversation_id:
+            SESSION_CONFIG["conversation_id"] = worker.conversation_id
+        logger.info(
+            "agy (worker) terminé avec succès. Sortie : %d caractères.", len(output)
+        )
+    else:
+        logger.warning(
+            "agy (worker) terminé avec statut %s : %s",
+            status or "?",
+            error or "(sans détail)",
+        )
+
+    return {
+        "success": success,
+        "output": output,
+        "error": None if success else error,
+        "session": dict(SESSION_CONFIG),
+    }
+
+
 async def run_agy(
     prompt: str,
     timeout: int = 120,
@@ -436,7 +935,18 @@ async def run_agy(
 
     await _AGY_LOCK.acquire()
     try:
-        return await _run_agy_unlocked(
+        if AGY_PERSISTENT:
+            return await _run_agy_persistent(
+                prompt=prompt,
+                timeout=timeout,
+                model=model,
+                effort=effort,
+                mode=mode,
+                continue_session=continue_session,
+                reset_session_flag=reset_session_flag,
+                permission_mode=permission_mode,
+            )
+        return await _run_agy_oneshot(
             prompt=prompt,
             timeout=timeout,
             model=model,
@@ -445,6 +955,7 @@ async def run_agy(
             continue_session=continue_session,
             reset_session_flag=reset_session_flag,
             permission_mode=permission_mode,
+            update_session=continue_session,
         )
     finally:
         _AGY_LOCK.release()
