@@ -1,11 +1,12 @@
 """Tests des formatters : protection du code, LaTeX et découpage Discord."""
 
 import unittest
+import urllib.parse
 from unittest.mock import AsyncMock, patch
 
 from bots.telegram_bot import markdown_to_telegram_html
 from formatters import latex_to_unicode, smart_split_discord
-from formatters.latex_renderer import extract_and_render_latex
+from formatters.latex_renderer import build_latex_png_url, extract_and_render_latex
 
 
 class TestLatexCodeProtection(unittest.TestCase):
@@ -23,6 +24,22 @@ class TestLatexCodeProtection(unittest.TestCase):
     def test_code_block_with_block_equation_is_preserved(self):
         text = "```python\n# $$E=mc^2$$\nprint('ok')\n```"
         self.assertEqual(latex_to_unicode(text), text)
+
+
+class TestCodeCogsUrl(unittest.TestCase):
+    def test_dark_mode_uses_bg_and_fg_without_color_command(self):
+        url = build_latex_png_url("E=mc^2", dark_mode=True)
+        decoded = urllib.parse.unquote(url)
+
+        self.assertIn(r"\bg{2b2d31}\fg{ffffff}", decoded)
+        self.assertNotIn(r"\color", decoded)
+        self.assertTrue(decoded.endswith(" E=mc^2"))
+
+    def test_light_mode_uses_white_background_and_black_text(self):
+        url = build_latex_png_url("E=mc^2", dark_mode=False)
+        decoded = urllib.parse.unquote(url)
+
+        self.assertIn(r"\bg{ffffff}\fg{000000}", decoded)
 
 
 class TestExtractAndRenderLatex(unittest.IsolatedAsyncioTestCase):

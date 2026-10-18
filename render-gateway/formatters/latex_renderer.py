@@ -206,6 +206,26 @@ def latex_to_unicode(text: str) -> str:
 
 # ── Rendu d'équation en image PNG ─────────────────────────────────────────────
 
+def build_latex_png_url(
+    formula: str,
+    dark_mode: bool = True,
+    dpi: int = 220,
+) -> str:
+    """Construit l'URL CodeCogs d'une formule PNG.
+
+    CodeCogs attend ``\\bg{...}`` puis ``\\fg{...}``. L'ancienne combinaison
+    ``\\color{...}\\bg{...}`` faisait afficher ``\\bg...`` comme du texte dans
+    l'image.
+    """
+    clean_formula = formula.strip().strip("$").strip()
+    bg_color = "2b2d31" if dark_mode else "ffffff"
+    text_color = "ffffff" if dark_mode else "000000"
+
+    params = f"\\dpi{{{dpi}}}\\bg{{{bg_color}}}\\fg{{{text_color}}} {clean_formula}"
+    encoded = urllib.parse.quote(params)
+    return f"https://latex.codecogs.com/png.image?{encoded}"
+
+
 async def render_latex_to_png(
     formula: str,
     dark_mode: bool = True,
@@ -225,14 +245,7 @@ async def render_latex_to_png(
     if not clean_formula:
         return None
 
-    # Configuration des couleurs : fond sombre Discord #2b2d31, texte blanc
-    bg_color = "2b2d31" if dark_mode else "ffffff"
-    text_color = "ffffff" if dark_mode else "000000"
-
-    # Paramètres CodeCogs : 200 DPI pour netteté sur écrans Retina
-    params = f"\\dpi{{220}}\\color{{{text_color}}}\\bg{{{bg_color}}} {clean_formula}"
-    encoded = urllib.parse.quote(params)
-    url = f"https://latex.codecogs.com/png.image?{encoded}"
+    url = build_latex_png_url(clean_formula, dark_mode=dark_mode)
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
