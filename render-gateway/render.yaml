@@ -13,6 +13,12 @@ services:
         sync: false
       - key: TELEGRAM_WEBHOOK_URL
         sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: MAX_RESPONSE_LENGTH
+        sync: false
+      - key: ALLOW_ALL_USERS
+        sync: false
       - key: DISCORD_TOKEN
         sync: false
       - key: DISCORD_GUILD_ID

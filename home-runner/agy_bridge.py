@@ -262,7 +262,13 @@ def delete_all_conversations() -> dict:
 
 
 
-async def run_agy(
+# Verrou global : une seule exécution d'agy à la fois. Les conversations
+# partagent le même transcript et le même SESSION_CONFIG ; deux processus
+# simultanés corrompraient l'historique et les paramètres de session.
+_AGY_LOCK = asyncio.Lock()
+
+
+async def _run_agy_unlocked(
     prompt: str,
     timeout: int = 120,
     model: Optional[str] = None,
@@ -402,3 +408,43 @@ async def run_agy(
             "error": str(exc),
             "session": dict(SESSION_CONFIG),
         }
+
+
+async def run_agy(
+    prompt: str,
+    timeout: int = 120,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    mode: Optional[str] = None,
+    continue_session: bool = True,
+    reset_session_flag: bool = False,
+    permission_mode: Optional[str] = None,
+) -> dict:
+    """Exécute agy en garantissant qu'une seule requête tourne à la fois.
+
+    Si une requête est déjà en cours, on répond immédiatement par une erreur
+    explicite plutôt que de lancer un second processus sur la même session.
+    """
+    if _AGY_LOCK.locked():
+        logger.warning("Requête agy refusée : une exécution est déjà en cours.")
+        return {
+            "success": False,
+            "output": "",
+            "error": "Une autre requête est déjà en cours. Réessayez dans quelques instants.",
+            "session": dict(SESSION_CONFIG),
+        }
+
+    await _AGY_LOCK.acquire()
+    try:
+        return await _run_agy_unlocked(
+            prompt=prompt,
+            timeout=timeout,
+            model=model,
+            effort=effort,
+            mode=mode,
+            continue_session=continue_session,
+            reset_session_flag=reset_session_flag,
+            permission_mode=permission_mode,
+        )
+    finally:
+        _AGY_LOCK.release()

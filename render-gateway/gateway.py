@@ -14,7 +14,9 @@ logger = logging.getLogger(__name__)
 
 HOME_SERVER_URL: str = os.getenv("HOME_SERVER_URL", "")
 SECRET_KEY: str = os.getenv("SECRET_KEY", "")
-MAX_RESPONSE_LENGTH: int = 4000
+# 0 (ou une valeur négative) désactive la troncature. La valeur par défaut
+# laisse passer les réponses longues ; les bots se chargent du découpage.
+MAX_RESPONSE_LENGTH: int = int(os.getenv("MAX_RESPONSE_LENGTH", "50000"))
 
 
 async def forward_to_runner(
@@ -68,7 +70,7 @@ async def forward_to_runner(
             data: dict = resp.json()
 
             output: str = data.get("output", "")
-            if len(output) > MAX_RESPONSE_LENGTH:
+            if MAX_RESPONSE_LENGTH > 0 and len(output) > MAX_RESPONSE_LENGTH:
                 logger.info(
                     "Réponse tronquée: %d → %d chars.", len(output), MAX_RESPONSE_LENGTH
                 )

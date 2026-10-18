@@ -23,8 +23,11 @@ Copiez `.env.example` en `.env` et renseignez les valeurs.
 | `TELEGRAM_WEBHOOK_URL` | ✅ | URL publique de ce service Render (ex: `https://mon-assistant.onrender.com`) |
 | `DISCORD_TOKEN` | ⚠️ optionnel | Token du bot Discord |
 | `DISCORD_GUILD_ID` | ⚠️ optionnel | ID du serveur Discord (slash commands en dev) |
-| `TELEGRAM_ALLOWED_USER_IDS` | ⚠️ optionnel | IDs Telegram autorisés, séparés par virgule. Vide = tout le monde |
-| `DISCORD_ALLOWED_USER_IDS` | ⚠️ optionnel | IDs Discord autorisés, séparés par virgule. Vide = tout le monde |
+| `TELEGRAM_WEBHOOK_SECRET` | ⚠️ optionnel | Secret du webhook Telegram. Vide = dérivé automatiquement de `SECRET_KEY` |
+| `MAX_RESPONSE_LENGTH` | ⚠️ optionnel | Longueur max d'une réponse avant troncature (défaut `50000`, `0` = illimité) |
+| `TELEGRAM_ALLOWED_USER_IDS` | ⚠️ optionnel | IDs Telegram autorisés, séparés par virgule. Vide = **refus de tout le monde** (fail-closed) |
+| `DISCORD_ALLOWED_USER_IDS` | ⚠️ optionnel | IDs Discord autorisés, séparés par virgule. Vide = **refus de tout le monde** (fail-closed) |
+| `ALLOW_ALL_USERS` | ⚠️ optionnel | `1` pour autoriser tout le monde sans whitelist (non recommandé) |
 
 ---
 

@@ -89,6 +89,7 @@ if [ ! -f "$RENDER_GATEWAY_DIR/.env" ]; then
     sed -i "s|https://ton-tunnel.trycloudflare.com|http://127.0.0.1:8080|" "$RENDER_GATEWAY_DIR/.env"
     echo -e "${GREEN}✓ render-gateway/.env créé (configuré par défaut sur http://127.0.0.1:8080).${NC}"
     echo -e "${YELLOW}👉 Pensez à éditer render-gateway/.env pour ajouter vos tokens DISCORD_TOKEN et TELEGRAM_TOKEN.${NC}"
+    echo -e "${YELLOW}👉 Sécurité fail-closed : renseignez DISCORD_ALLOWED_USER_IDS et TELEGRAM_ALLOWED_USER_IDS, sinon définissez ALLOW_ALL_USERS=1 pour ouvrir l'accès.${NC}"
 else
     echo -e "${GREEN}✓ render-gateway/.env existe déjà.${NC}"
 fi

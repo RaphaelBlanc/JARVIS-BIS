@@ -160,9 +160,12 @@ TELEGRAM_TOKEN=123456789:ABCDEF...
 # Bot Discord (obtenu via le portail développeur Discord)
 DISCORD_TOKEN=MTE...
 
-# Sécurité (optionnel : restreindre à vos propres identifiants)
+# Sécurité (fail-closed : sans ID autorisé, les bots refusent tout le monde)
 DISCORD_ALLOWED_USER_IDS=123456789012345678
 TELEGRAM_ALLOWED_USER_IDS=123456789
+
+# Pour ouvrir l'accès sans whitelist (non recommandé) :
+# ALLOW_ALL_USERS=1
 ```
 
 ### 4. Lancement en tâche de fond (Systemd)
@@ -240,7 +243,8 @@ Toutes les fonctionnalités sont disponibles sur **Discord** (commandes slash na
 ## 🔒 Sécurité & Confidentialité
 
 - **Authentification forte** : Chaque échange entre la passerelle (`render-gateway`) et le moteur local (`home-runner`) est protégé par une clé `X-Secret-Key` de 256 bits.
-- **Accès restreint (Whitelist)** : Vous pouvez définir `DISCORD_ALLOWED_USER_IDS` et `TELEGRAM_ALLOWED_USER_IDS` afin que personne d'autre ne puisse interagir avec votre assistant.
+- **Accès restreint (Whitelist)** : Définissez `DISCORD_ALLOWED_USER_IDS` et `TELEGRAM_ALLOWED_USER_IDS` afin que personne d'autre ne puisse interagir avec votre assistant. Par défaut (**fail-closed**), une whitelist vide refuse tout le monde ; pour ouvrir l'accès sans whitelist, définissez explicitement `ALLOW_ALL_USERS=1` (non recommandé).
+- **Webhook Telegram authentifié** : En mode webhook, chaque requête est validée via le header `X-Telegram-Bot-Api-Secret-Token`. Le secret est dérivé automatiquement de `SECRET_KEY`, ou peut être fixé via `TELEGRAM_WEBHOOK_SECRET`.
 - **Protection des données** : Tous vos identifiants, tokens OAuth Google et conversations restent stockés localement sur votre machine et sont exclus du suivi Git via `.gitignore`.
 
 ---

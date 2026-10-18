@@ -8,12 +8,14 @@ et répond à l'utilisateur avec le résultat.
 
 import asyncio
 import base64
+import hashlib
 import html
 import io
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 from pathlib import Path
 from typing import Optional
@@ -61,12 +63,39 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_WEBHOOK_URL: str = os.getenv("TELEGRAM_WEBHOOK_URL", "")
 
+
+def _derive_webhook_secret() -> str:
+    """Retourne le secret du webhook Telegram.
+
+    Un secret explicite (``TELEGRAM_WEBHOOK_SECRET``) est prioritaire. Sinon,
+    on dérive un secret stable à partir de ``SECRET_KEY`` : cela protège le
+    webhook sans configuration supplémentaire et sans exposer la clé partagée.
+    """
+    explicit = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+    if explicit:
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", explicit):
+            return explicit
+        logger.warning(
+            "TELEGRAM_WEBHOOK_SECRET invalide (caractères autorisés : A-Za-z0-9_-) ; "
+            "un secret sera dérivé de SECRET_KEY."
+        )
+    base = os.getenv("SECRET_KEY", "").strip()
+    if not base:
+        return ""
+    return hashlib.sha256(f"telegram-webhook:{base}".encode("utf-8")).hexdigest()
+
+
+TELEGRAM_WEBHOOK_SECRET: str = _derive_webhook_secret()
+
 _RAW_ALLOWED_IDS: str = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").strip()
 ALLOWED_USER_IDS: set[int] = (
     {int(uid.strip()) for uid in _RAW_ALLOWED_IDS.split(",") if uid.strip()}
     if _RAW_ALLOWED_IDS
     else set()
 )
+ALLOW_ALL_USERS: bool = os.getenv("ALLOW_ALL_USERS", "").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 # Singleton Application (initialisé via get_application())
 _application: Optional[Application] = None
@@ -75,10 +104,22 @@ _application: Optional[Application] = None
 
 
 def _is_allowed(user_id: int) -> bool:
-    """Vérifie si un utilisateur est autorisé à utiliser le bot."""
-    if not ALLOWED_USER_IDS:
-        return True  # pas de restriction configurée
-    return user_id in ALLOWED_USER_IDS
+    """Vérifie si un utilisateur est autorisé à utiliser le bot.
+
+    Par défaut, une liste vide refuse tout le monde (fail-closed). Pour ouvrir
+    l'accès sans whitelist, il faut définir explicitement ``ALLOW_ALL_USERS=1``.
+    """
+    if ALLOWED_USER_IDS:
+        return user_id in ALLOWED_USER_IDS
+    return ALLOW_ALL_USERS
+
+
+if not ALLOWED_USER_IDS and not ALLOW_ALL_USERS:
+    logger.warning(
+        "TELEGRAM_ALLOWED_USER_IDS est vide et ALLOW_ALL_USERS n'est pas activé : "
+        "tous les messages Telegram seront refusés. Renseignez votre ID "
+        "utilisateur ou définissez ALLOW_ALL_USERS=1 pour ouvrir l'accès."
+    )
 
 
 def markdown_to_telegram_html(text: str) -> str:
@@ -570,6 +611,10 @@ async def cmd_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Gère les clics sur les boutons interactifs Telegram."""
     query = update.callback_query
+    user = update.effective_user
+    if not user or not _is_allowed(user.id):
+        await query.answer("⛔ Accès non autorisé.", show_alert=True)
+        return
     await query.answer()
     data = query.data or ""
 
@@ -1387,7 +1432,17 @@ def get_application() -> Application:
 
 async def setup_webhook(app: Application, webhook_url: str) -> None:
     """Enregistre le webhook Telegram auprès de l'API Telegram et configure les commandes."""
-    await app.bot.set_webhook(url=webhook_url)
+    webhook_kwargs = {"url": webhook_url}
+    if TELEGRAM_WEBHOOK_SECRET:
+        webhook_kwargs["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+        logger.info("Webhook Telegram protégé par un secret token.")
+    else:
+        logger.warning(
+            "TELEGRAM_WEBHOOK_SECRET absent et SECRET_KEY vide : "
+            "le webhook Telegram n'est pas authentifié."
+        )
+
+    await app.bot.set_webhook(**webhook_kwargs)
     try:
         await app.bot.set_my_commands(BOT_COMMANDS)
         logger.info("Commandes Telegram enregistrées avec succès (autocomplétion active).")
@@ -1467,6 +1522,12 @@ async def telegram_webhook(request: Request) -> Response:
 
     Reçoit les mises à jour Telegram en JSON et les traite via l'Application.
     """
+    if TELEGRAM_WEBHOOK_SECRET:
+        provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not secrets.compare_digest(provided, TELEGRAM_WEBHOOK_SECRET):
+            logger.warning("Webhook Telegram refusé : secret token absent ou invalide.")
+            return Response(content="Forbidden", status_code=403)
+
     tg_app = get_application()
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)

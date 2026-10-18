@@ -13,11 +13,48 @@ import io
 import logging
 import re
 import urllib.parse
+import uuid
 from typing import Any, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# ── Protection des blocs de code ──────────────────────────────────────────────
+# Les formules LaTeX ne doivent jamais être interprétées à l'intérieur d'un bloc
+# de code ou d'un code inline. On les remplace temporairement par des sentinelles
+# avant le traitement mathématique, puis on les restaure à l'identique.
+
+_FENCED_CODE_PATTERN = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_PATTERN = re.compile(r"`[^`\n]+`")
+
+
+def _protect_code_spans(text: str) -> tuple[str, list[str], str]:
+    """Remplace les blocs de code et le code inline par des sentinelles.
+
+    Returns:
+        (texte_protégé, contenus_originaux, jeton)
+        Le jeton rend les sentinelles uniques à chaque appel, ce qui évite
+        toute collision lorsque la protection est appliquée en cascade.
+    """
+    spans: list[str] = []
+    token = uuid.uuid4().hex
+
+    def _stash(match: re.Match[str]) -> str:
+        spans.append(match.group(0))
+        return f"\x00ASSISTANT_CODE_{token}_{len(spans) - 1}\x00"
+
+    text = _FENCED_CODE_PATTERN.sub(_stash, text)
+    text = _INLINE_CODE_PATTERN.sub(_stash, text)
+    return text, spans, token
+
+
+def _restore_code_spans(text: str, spans: list[str], token: str) -> str:
+    """Restaure les blocs de code protégés par ``_protect_code_spans``."""
+    for index, span in enumerate(spans):
+        text = text.replace(f"\x00ASSISTANT_CODE_{token}_{index}\x00", span)
+    return text
+
 
 # ── Remplacement mathématique Unicode pour le texte en ligne ───────────────────
 
@@ -123,9 +160,15 @@ SUBSCRIPTS = {
 
 
 def latex_to_unicode(text: str) -> str:
-    """Transforme les équations en ligne $...$ et symboles LaTeX en équivalent Unicode élégant."""
+    """Transforme les équations en ligne $...$ et symboles LaTeX en équivalent Unicode élégant.
+
+    Les blocs de code (```...```) et le code inline (`...`) sont protégés :
+    leur contenu n'est jamais modifié.
+    """
     if not text:
         return ""
+
+    protected_text, code_spans, code_token = _protect_code_spans(text)
 
     def convert_formula(formula: str) -> str:
         res = formula.strip()
@@ -157,7 +200,8 @@ def latex_to_unicode(text: str) -> str:
         raw = match.group(1)
         return convert_formula(raw)
 
-    return re.sub(r"(?<!\$)\$(?!\$)([^\$\n]+)\$(?!\$)", replace_inline, text)
+    converted = re.sub(r"(?<!\$)\$(?!\$)([^\$\n]+)\$(?!\$)", replace_inline, protected_text)
+    return _restore_code_spans(converted, code_spans, code_token)
 
 
 # ── Rendu d'équation en image PNG ─────────────────────────────────────────────
@@ -226,7 +270,10 @@ async def extract_and_render_latex(
         return text, []
 
     rendered_images: list[dict[str, Any]] = []
-    updated_text = text
+    # Les blocs de code sont mis de côté : une formule qui s'y trouve est du
+    # code source, pas une équation à rendre.
+    protected_text, code_spans, code_token = _protect_code_spans(text)
+    updated_text = protected_text
 
     # Recherche des blocs d'équations
     eq_index = 1
@@ -258,7 +305,8 @@ async def extract_and_render_latex(
     # Convertir également le LaTeX inline résiduel ($...$) en Unicode
     updated_text = latex_to_unicode(updated_text)
 
-    return updated_text, rendered_images
+    # Restaure les blocs de code exactement tels qu'ils ont été fournis.
+    return _restore_code_spans(updated_text, code_spans, code_token), rendered_images
 
 
 # ── Détection et extraction des gros blocs de code ────────────────────────────
@@ -295,12 +343,31 @@ def extract_downloadable_code(text: str, min_chars: int = 600) -> list[dict[str,
 
 
 def smart_split_discord(text: str, max_chars: int = 1950) -> list[str]:
-    """Découpe un texte pour Discord en préservant l'intégrité et la colorisation des blocs de code."""
+    """Découpe un texte pour Discord en préservant l'intégrité et la colorisation des blocs de code.
+
+    Les lignes uniques démesurées (base64, code minifié, longue URL) sont
+    découpées avant l'analyse ligne par ligne afin qu'aucun message ne dépasse
+    la limite de Discord.
+    """
+    if max_chars < 50:
+        max_chars = 50
     if len(text) <= max_chars:
         return [text]
 
+    # Une ligne ne doit jamais occuper tout le budget : on garde de la place
+    # pour les fences de code ajoutées lors du découpage.
+    max_line_len = max(200, max_chars - 200)
+    normalized_lines: list[str] = []
+    for line in text.split("\n"):
+        if len(line) <= max_line_len:
+            normalized_lines.append(line)
+        else:
+            normalized_lines.extend(
+                line[i:i + max_line_len] for i in range(0, len(line), max_line_len)
+            )
+
     parts: list[str] = []
-    lines = text.split("\n")
+    lines = normalized_lines
     current_chunk: list[str] = []
     current_len = 0
     in_code_block = False
@@ -336,5 +403,16 @@ def smart_split_discord(text: str, max_chars: int = 1950) -> list[str]:
     if current_chunk:
         parts.append("\n".join(current_chunk))
 
-    return parts
+    # Filet de sécurité : aucun morceau ne doit dépasser la limite Discord,
+    # même dans un cas limite où une fence de code très longue serait ajoutée.
+    safe_parts: list[str] = []
+    for part in parts:
+        if len(part) <= max_chars:
+            safe_parts.append(part)
+        else:
+            safe_parts.extend(
+                part[i:i + max_chars] for i in range(0, len(part), max_chars)
+            )
+
+    return safe_parts
 

@@ -51,16 +51,31 @@ ALLOWED_USER_IDS: set[int] = (
     if _RAW_ALLOWED_IDS
     else set()
 )
+ALLOW_ALL_USERS: bool = os.getenv("ALLOW_ALL_USERS", "").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 def _is_allowed(user_id: int) -> bool:
-    """Vérifie si un utilisateur est autorisé à utiliser le bot."""
-    if not ALLOWED_USER_IDS:
-        return True
-    return user_id in ALLOWED_USER_IDS
+    """Vérifie si un utilisateur est autorisé à utiliser le bot.
+
+    Par défaut, une liste vide refuse tout le monde (fail-closed). Pour ouvrir
+    l'accès sans whitelist, il faut définir explicitement ``ALLOW_ALL_USERS=1``.
+    """
+    if ALLOWED_USER_IDS:
+        return user_id in ALLOWED_USER_IDS
+    return ALLOW_ALL_USERS
+
+
+if not ALLOWED_USER_IDS and not ALLOW_ALL_USERS:
+    logger.warning(
+        "DISCORD_ALLOWED_USER_IDS est vide et ALLOW_ALL_USERS n'est pas activé : "
+        "toutes les commandes Discord seront refusées. Renseignez votre ID "
+        "utilisateur ou définissez ALLOW_ALL_USERS=1 pour ouvrir l'accès."
+    )
 
 
 # ── Bot Discord ───────────────────────────────────────────────────────────────
