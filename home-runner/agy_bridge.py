@@ -79,6 +79,32 @@ KNOWN_MODELS = [
     {"id": "gpt-oss-120b-medium", "name": "GPT-OSS 120B (Medium)", "desc": "Open Source"},
 ]
 
+_FLASH_MODEL_PREFIX = "gemini-3.8-flash-"
+_FLASH_EFFORTS = {"low", "medium", "high"}
+
+
+def _normalize_model_effort(
+    model: Optional[str], effort: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """Aligne le modèle Flash et l'effort pour éviter le conflit CLI.
+
+    Les modèles ``gemini-3.8-flash-*`` encodent déjà l'effort dans leur nom :
+    ``agy`` refuse par exemple ``--model gemini-3.8-flash-low --effort medium``.
+    On choisit donc le modèle Flash correspondant à l'effort demandé, et on
+    retombe sur l'effort du modèle pour les niveaux non disponibles en Flash.
+    """
+    if model and model.startswith(_FLASH_MODEL_PREFIX):
+        suffix = model[len(_FLASH_MODEL_PREFIX):]
+        if suffix in _FLASH_EFFORTS:
+            if not effort:
+                effort = suffix
+            elif effort != suffix:
+                if effort in _FLASH_EFFORTS:
+                    model = f"{_FLASH_MODEL_PREFIX}{effort}"
+                else:
+                    effort = suffix
+    return model, effort
+
 
 def get_session_info() -> dict:
     """Retourne la configuration actuelle de la session."""
@@ -100,6 +126,10 @@ def update_session(
         SESSION_CONFIG["mode"] = mode.strip().lower()
     if permission_mode:
         SESSION_CONFIG["permission_mode"] = permission_mode.strip().lower()
+
+    SESSION_CONFIG["model"], SESSION_CONFIG["effort"] = _normalize_model_effort(
+        SESSION_CONFIG.get("model"), SESSION_CONFIG.get("effort")
+    )
     return dict(SESSION_CONFIG)
 
 
@@ -649,13 +679,14 @@ async def _run_agy_oneshot(
             cmd.append("-c")
 
 
-    # Modèle
+    # Modèle et effort de raisonnement (normalisés pour les modèles Flash)
     active_model = model or SESSION_CONFIG.get("model")
+    active_effort = effort or SESSION_CONFIG.get("effort") or "low"
+    active_model, active_effort = _normalize_model_effort(
+        active_model, active_effort
+    )
     if active_model:
         cmd.extend(["--model", active_model])
-
-    # Effort de raisonnement
-    active_effort = effort or SESSION_CONFIG.get("effort") or "low"
     if active_effort:
         cmd.extend(["--effort", active_effort])
 
@@ -779,6 +810,9 @@ async def _run_agy_persistent(
 
     active_model = model or SESSION_CONFIG.get("model")
     active_effort = effort or SESSION_CONFIG.get("effort") or "low"
+    active_model, active_effort = _normalize_model_effort(
+        active_model, active_effort
+    )
     active_mode = mode or SESSION_CONFIG.get("mode")
     active_perm = permission_mode or SESSION_CONFIG.get(
         "permission_mode", "always-proceed"
