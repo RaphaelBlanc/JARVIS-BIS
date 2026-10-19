@@ -325,6 +325,15 @@ AGY_PERSISTENT: bool = os.getenv("AGY_PERSISTENT", "1").strip().lower() not in {
 }
 AGY_WORKER_IDLE_TIMEOUT: float = float(os.getenv("AGY_WORKER_IDLE_TIMEOUT", "900"))
 AGY_STARTUP_TIMEOUT: float = float(os.getenv("AGY_STARTUP_TIMEOUT", "30"))
+# Sandbox terminal d'agy activé par défaut. Peut être désactivé avec AGY_SANDBOX=0.
+AGY_SANDBOX: bool = os.getenv("AGY_SANDBOX", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+
+
+def _sandbox_args() -> list[str]:
+    """Retourne les arguments de sandbox à ajouter à la commande agy."""
+    return ["--sandbox"] if AGY_SANDBOX else []
 
 
 class _AgyStreamWorker:
@@ -436,6 +445,7 @@ class _AgyStreamWorker:
             "stream-json",
             "--output-format",
             "stream-json",
+            *_sandbox_args(),
         ]
         if self.continue_session:
             if self.conversation_id:
@@ -572,6 +582,7 @@ def get_worker_info() -> dict:
     worker = _WORKER
     return {
         "persistent": AGY_PERSISTENT,
+        "sandbox": AGY_SANDBOX,
         "running": bool(worker and worker.is_alive()),
         "conversation_id": worker.conversation_id if worker else None,
         "idle_seconds": (
@@ -682,7 +693,7 @@ async def _run_agy_oneshot(
         SESSION_CONFIG["conversation_id"] = None
 
     # Construction des arguments agy
-    cmd = [agy_path]
+    cmd = [agy_path, *_sandbox_args()]
 
     # Reprise de conversation ciblée (--conversation) ou continue (-c) UNIQUEMENT si continue_session est True
     if continue_session and not reset_session_flag:

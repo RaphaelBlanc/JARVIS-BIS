@@ -25,15 +25,20 @@ from formatters import (
     extract_downloadable_code,
     latex_to_unicode,
 )
-from stt import transcribe_audio
+from stt import MAX_AUDIO_BYTES, transcribe_audio
+from briefing import build_briefing_prompt
 from reminders import (
     add_reminder,
     cancel_reminder,
-    detect_natural_reminder_datetime,
+    complete_reminder,
+    detect_natural_reminder_full,
     format_remaining_time,
     format_reminder_confirmation,
+    format_reminder_notification,
     list_active_reminders,
-    split_time_and_message,
+    parse_reminder_command,
+    recurrence_label,
+    snooze_reminder,
 )
 
 
@@ -54,14 +59,20 @@ from telegram.ext import (
 )
 
 from gateway import (
+    add_memory_fact,
+    clear_memory_facts,
     delete_conversation_remote,
+    delete_memory_fact,
+    delete_memory_profile,
     fetch_conversations,
     fetch_health,
+    fetch_memory,
     fetch_models,
     fetch_session,
     forward_to_runner,
     reset_session_remote,
     resume_conversation_remote,
+    set_memory_profile,
     update_session_remote,
 )
 
@@ -414,11 +425,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/meteo [ville]` — Météo en direct (Open-Meteo mondiale)\n"
         "• `/search <requête>` — Recherche web DuckDuckGo\n"
         "• `/summarize <url>` — Résumer une page web ou un article\n"
-        "• `/rappel <durée> <message>` — Programmer un rappel (15m, 1h30, 14h30)\n"
+        "• `/rappel [récurrence] <durée> <message>` — Programmer un rappel\n"
+        "  Ex: `/rappel chaque jour 8h Faire mes étirements`\n"
         "• `/rappels` — Lister vos rappels actifs\n"
+        "• `/snooze <id> [durée]` — Reporter un rappel (10m par défaut)\n"
+        "• `/rappel_termine <id>` — Clôturer un rappel\n"
         "• `/annuler_rappel <id>` — Annuler un rappel\n"
         "• `/status` — État complet du système et des services\n\n"
         "💬 *Discussion & Mémoire*\n"
+        "• `/souviens <texte>` — Ajouter un souvenir durable\n"
+        "• `/oublie <id|all>` — Supprimer un souvenir\n"
+        "• `/profil [clé] [valeur]` — Afficher ou modifier votre profil\n"
         "• Écrivez simplement votre message pour échanger naturellement.\n"
         "• 🎤 Envoyez un message vocal : il est transcrit puis traité automatiquement.\n"
         "• 👁️ Envoyez une photo : elle est analysée directement.\n"
@@ -637,6 +654,56 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     await query.answer()
     data = query.data or ""
+
+    if data.startswith("reminder:"):
+        parts = data.split(":")
+        chat_id = query.message.chat_id if query.message else None
+        try:
+            if len(parts) == 4 and parts[1] == "snooze":
+                minutes = int(parts[2])
+                reminder_id = int(parts[3])
+                reminder = snooze_reminder(
+                    reminder_id, f"{minutes}m", chat_id=chat_id
+                )
+                if reminder is None:
+                    await query.edit_message_text(
+                        f"❌ Rappel #{reminder_id} introuvable ou déjà traité."
+                    )
+                    return
+                await query.edit_message_text(
+                    f"⏰ Rappel #{reminder_id} reporté.\n"
+                    f"{format_reminder_confirmation(reminder)}",
+                    reply_markup=None,
+                )
+                return
+
+            if len(parts) == 3 and parts[1] == "done":
+                reminder_id = int(parts[2])
+                reminder = complete_reminder(reminder_id, chat_id=chat_id)
+                if reminder is None:
+                    await query.edit_message_text(
+                        f"❌ Rappel #{reminder_id} introuvable ou déjà traité."
+                    )
+                    return
+                if (
+                    reminder.get("status") == "pending"
+                    and reminder.get("completed_occurrence")
+                ):
+                    await query.edit_message_text(
+                        f"✅ Occurrence terminée.\n"
+                        f"{format_reminder_confirmation(reminder)}",
+                        reply_markup=None,
+                    )
+                else:
+                    await query.edit_message_text(
+                        f"✅ Rappel #{reminder_id} terminé.",
+                        reply_markup=None,
+                    )
+                return
+        except (TypeError, ValueError):
+            pass
+        await query.edit_message_text("❌ Action de rappel invalide.")
+        return
 
     if data.startswith("setmodel:"):
         model_id = data.split(":", 1)[1]
@@ -1192,24 +1259,6 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 SAVED_CHATS_FILE = Path(__file__).resolve().parent.parent / "saved_chats.json"
 
-BRIEFING_PROMPT = (
-    "Effectue mon briefing matinal rapide, motivant et structuré :\n"
-    "1. 📅 EMPLOI DU TEMPS DU JOUR (Heure / Cours / Salles) :\n"
-    "Consulte mon Google Agenda aujourd'hui (en incluant mon calendrier de cours EPITA/PREPA). "
-    "Liste uniquement les horaires, le cours et la salle exacte : • Début - Fin : Intitulé (📍 Salle). "
-    "S'il n'y a pas de cours, mentionne-le brièvement.\n\n"
-    "2. 📈 ACTUALITÉS ÉCONOMIQUES :\n"
-    "Recherche rapidement les 2 faits économiques ou tech marquants de la veille (1 seule recherche concise) et résume-les en 2 puces percutantes.\n\n"
-    "3. ✉️ E-MAILS IMPORTANTS :\n"
-    "Consulte mes 5 derniers e-mails récents via Gmail. Ignore totalement spams, pubs et newsletters. "
-    "Ne retiens que les messages clés (EPITA, examens, personnel) et résume chaque message en 1 ligne.\n\n"
-    "4. 🌤️ MÉTÉO DU JOUR :\n"
-    "Météo du jour pour ma ville (température, ciel, pluie).\n\n"
-    "5. 📋 TÂCHES EN COURS :\n"
-    "Consulte mes tâches Google Tasks non terminées si disponibles.\n\n"
-    "CONSIGNE DE STYLE : Sois ultra-synthétique, direct et dynamique. Pas de bavardage, va droit au but avec des puces courtes."
-)
-
 
 def _save_chat_id(chat_id: int) -> None:
     """Enregistre l'ID du chat Telegram pour permettre les notifications automatiques."""
@@ -1236,24 +1285,28 @@ def get_saved_chat_ids() -> list[int]:
     return []
 
 
-async def _send_broadcast_message_impl(text: str) -> None:
+async def _send_broadcast_message_impl(text: str) -> bool:
     """Implémentation de la diffusion, exécutée dans la boucle du bot Telegram."""
     app = get_application()
     html_text = markdown_to_telegram_html(text)
     chunks = split_telegram_message(html_text)
+    sent = 0
     for cid in get_saved_chat_ids():
         for chunk in chunks:
             try:
                 await app.bot.send_message(chat_id=cid, text=chunk, parse_mode="HTML", disable_web_page_preview=True)
+                sent += 1
             except Exception as exc:
                 logger.warning("Erreur diffusion Telegram HTML vers %s: %s", cid, exc)
                 try:
                     await app.bot.send_message(chat_id=cid, text=text)
+                    sent += 1
                 except Exception:
                     pass
+    return sent > 0
 
 
-async def send_broadcast_message(text: str) -> None:
+async def send_broadcast_message(text: str) -> bool:
     """Diffuse un message en respectant la boucle asyncio du bot Telegram."""
     loop = _TELEGRAM_LOOP
     try:
@@ -1265,10 +1318,9 @@ async def send_broadcast_message(text: str) -> None:
         future = asyncio.run_coroutine_threadsafe(
             _send_broadcast_message_impl(text), loop
         )
-        await asyncio.wrap_future(future)
-        return
+        return await asyncio.wrap_future(future)
 
-    await _send_broadcast_message_impl(text)
+    return await _send_broadcast_message_impl(text)
 
 
 async def _send_telegram_message_impl(chat_id: str, text: str) -> None:
@@ -1295,6 +1347,214 @@ async def send_telegram_message(chat_id: str, text: str) -> None:
     await _send_telegram_message_impl(chat_id, text)
 
 
+def _reminder_keyboard(reminder_id: int) -> InlineKeyboardMarkup:
+    """Boutons d'action d'un rappel Telegram."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⏰ +10 min", callback_data=f"reminder:snooze:10:{reminder_id}"
+                ),
+                InlineKeyboardButton(
+                    "⏰ +1 h", callback_data=f"reminder:snooze:60:{reminder_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✅ Terminé", callback_data=f"reminder:done:{reminder_id}"
+                )
+            ],
+        ]
+    )
+
+
+async def _send_telegram_reminder_impl(reminder: dict) -> None:
+    """Envoie un rappel avec ses boutons d'action, dans la boucle Telegram."""
+    app = get_application()
+    await app.bot.send_message(
+        chat_id=int(reminder["chat_id"]),
+        text=format_reminder_notification(reminder),
+        reply_markup=_reminder_keyboard(int(reminder["id"])),
+    )
+
+
+async def send_telegram_reminder(reminder: dict) -> None:
+    """Envoie un rappel Telegram en respectant la boucle asyncio du bot."""
+    loop = _TELEGRAM_LOOP
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if loop is not None and loop.is_running() and loop is not current_loop:
+        future = asyncio.run_coroutine_threadsafe(
+            _send_telegram_reminder_impl(reminder), loop
+        )
+        await asyncio.wrap_future(future)
+        return
+
+    await _send_telegram_reminder_impl(reminder)
+
+
+def _format_memory(memory: dict) -> str:
+    """Formate le profil et les souvenirs pour Telegram."""
+    profile = memory.get("profile", {})
+    facts = memory.get("facts", [])
+    if not profile and not facts:
+        return "🧠 Aucune mémoire durable enregistrée."
+    lines = ["🧠 Mémoire durable"]
+    if profile:
+        lines.append("\nProfil :")
+        for key, value in sorted(profile.items()):
+            lines.append(f"• {key} : {value}")
+    if facts:
+        lines.append("\nSouvenirs :")
+        for fact in facts:
+            lines.append(f"• {fact['id']} — {fact['text']}")
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3790].rstrip() + "\n…"
+    return text
+
+
+async def cmd_souviens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ajoute un souvenir durable : /souviens <texte>."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    text = " ".join(context.args or []).strip()
+    if not text:
+        await update.message.reply_text(
+            "Utilisation : `/souviens <texte>`. Ex: `/souviens J'aime le café sans sucre`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    result = await add_memory_fact(text)
+    if not result.get("success"):
+        await update.message.reply_text(
+            f"❌ Impossible d'enregistrer le souvenir : {result.get('error', 'inconnue')}"
+        )
+        return
+    fact = result.get("fact", {})
+    await update.message.reply_text(
+        f"🧠 Souvenir enregistré ({fact.get('id', '?')}) : {fact.get('text', text)}"
+    )
+
+
+async def cmd_oublie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Supprime un souvenir ou toute la liste : /oublie <id|all>."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Utilisation : `/oublie <id>` ou `/oublie all`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    target = context.args[0].strip()
+    if target.lower() in {"all", "tout", "tous"}:
+        result = await clear_memory_facts()
+        if not result.get("success"):
+            await update.message.reply_text(
+                f"❌ Erreur : {result.get('error', 'inconnue')}"
+            )
+            return
+        await update.message.reply_text(
+            f"🧹 {result.get('deleted_count', 0)} souvenir(s) supprimé(s)."
+        )
+        return
+
+    result = await delete_memory_fact(target)
+    if not result.get("success"):
+        await update.message.reply_text(f"❌ Souvenir {target} introuvable.")
+        return
+    await update.message.reply_text(f"🧹 Souvenir {target} supprimé.")
+
+
+async def cmd_profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Affiche ou modifie le profil durable."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args or []
+    if not args:
+        result = await fetch_memory()
+        if not result.get("success"):
+            await update.message.reply_text(
+                f"❌ Impossible de lire la mémoire : {result.get('error', 'inconnue')}"
+            )
+            return
+        await update.message.reply_text(
+            _format_memory(result.get("memory", {}))
+        )
+        return
+
+    if args[0].lower() in {"suppr", "supprime", "delete"}:
+        if len(args) < 2:
+            await update.message.reply_text("Utilisation : `/profil suppr <clé>`.")
+            return
+        result = await delete_memory_profile(args[1])
+        if not result.get("success"):
+            await update.message.reply_text(f"❌ Préférence {args[1]} introuvable.")
+            return
+        await update.message.reply_text(f"🧹 Préférence {args[1]} supprimée.")
+        return
+
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Utilisation : `/profil <clé> <valeur>`. Ex: `/profil ville Toulouse`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    key = args[0]
+    value = " ".join(args[1:]).strip()
+    result = await set_memory_profile(key, value)
+    if not result.get("success"):
+        await update.message.reply_text(
+            f"❌ Impossible de modifier le profil : {result.get('error', 'inconnue')}"
+        )
+        return
+    await update.message.reply_text(f"🧠 Profil mis à jour : {key} = {value}")
+
+
+_MEMORY_CAPTURE_RE = re.compile(
+    r"^\s*(?:souviens[- ]toi|retiens|m[ée]morise)"
+    r"(?:\s+que|\s+qu['’]|\s*:)\s+(.+)",
+    re.IGNORECASE,
+)
+
+
+async def _try_capture_memory(
+    update: Update, prompt: str, waiting_msg
+) -> bool:
+    """Détecte « souviens-toi que... » et enregistre un souvenir."""
+    match = _MEMORY_CAPTURE_RE.match(prompt)
+    if not match:
+        return False
+    text = match.group(1).strip()
+    if not text:
+        return False
+    result = await add_memory_fact(text)
+    if not result.get("success"):
+        return False
+    fact = result.get("fact", {})
+    logger.info("Souvenir mémoire créé (#%s) : %s", fact.get("id"), text)
+    await waiting_msg.edit_text(
+        f"🧠 Souvenir enregistré ({fact.get('id', '?')}) : {fact.get('text', text)}"
+    )
+    return True
+
+
 async def cmd_rappel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Crée un rappel : /rappel <durée> <message>."""
     user = update.effective_user
@@ -1306,13 +1566,17 @@ async def cmd_rappel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     raw = " ".join(context.args or []).strip()
     if not raw:
         await update.message.reply_text(
-            "⏰ Utilisation : `/rappel <durée> <message>`\n"
-            "Exemples : `/rappel 15m Sortir le pain` ou `/rappel 14h30 Appeler le médecin`.",
+            "⏰ Utilisation : `/rappel [récurrence] <durée> <message>`\n"
+            "Exemples :\n"
+            "• `/rappel 15m Sortir le pain`\n"
+            "• `/rappel 14h30 Appeler le médecin`\n"
+            "• `/rappel chaque jour 8h Faire mes étirements`\n"
+            "• `/rappel tous les lundis 9h Réunion d'équipe`",
             parse_mode="Markdown",
         )
         return
 
-    remind_at, message, error = split_time_and_message(raw)
+    remind_at, message, recurrence, error = parse_reminder_command(raw)
     if remind_at is None or not message:
         await update.message.reply_text(f"❌ {error}")
         return
@@ -1324,11 +1588,13 @@ async def cmd_rappel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         message=message,
         remind_at=remind_at,
         target_name=getattr(user, "full_name", "") or "",
+        recurrence=recurrence,
     )
     logger.info(
-        "Rappel #%s créé via /rappel (telegram -> %s) : %s",
+        "Rappel #%s créé via /rappel (telegram -> %s, récurrence=%s) : %s",
         reminder["id"],
         update.effective_chat.id,
+        recurrence,
         message,
     )
     await update.message.reply_text(format_reminder_confirmation(reminder))
@@ -1348,10 +1614,13 @@ async def cmd_rappels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     lines = ["⏰ Rappels actifs :"]
     for reminder in reminders:
-        lines.append(
+        line = (
             f"• #{reminder['id']} — {reminder['message']} — "
             f"{format_remaining_time(reminder['remind_at'])}"
         )
+        if reminder.get("recurrence"):
+            line += f" — 🔁 {recurrence_label(reminder['recurrence'])}"
+        lines.append(line)
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1386,6 +1655,83 @@ async def cmd_annuler_rappel(
         )
 
 
+async def cmd_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reporte un rappel : /snooze <id> [durée]."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Utilisation : `/snooze <id> [durée]`. Ex: `/snooze 4 10m`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        reminder_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ L'ID doit être un nombre.")
+        return
+
+    duration = args[1] if len(args) > 1 else "10m"
+    if duration.isdigit():
+        duration += "m"
+
+    reminder = snooze_reminder(
+        reminder_id, duration, chat_id=update.effective_chat.id
+    )
+    if reminder is None:
+        await update.message.reply_text(
+            f"❌ Aucun rappel actif #{reminder_id} dans ce chat, ou durée invalide."
+        )
+        return
+
+    await update.message.reply_text(
+        f"⏰ Rappel #{reminder_id} reporté : {format_reminder_confirmation(reminder)}"
+    )
+
+
+async def cmd_rappel_termine(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Clôt un rappel : /rappel_termine <id>."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Utilisation : `/rappel_termine <id>`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        reminder_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ L'ID doit être un nombre.")
+        return
+
+    reminder = complete_reminder(reminder_id, chat_id=update.effective_chat.id)
+    if reminder is None:
+        await update.message.reply_text(
+            f"❌ Aucun rappel actif #{reminder_id} dans ce chat."
+        )
+        return
+
+    if reminder.get("status") == "pending" and reminder.get("completed_occurrence"):
+        await update.message.reply_text(
+            f"✅ Occurrence terminée.\n{format_reminder_confirmation(reminder)}"
+        )
+    else:
+        await update.message.reply_text(f"✅ Rappel #{reminder_id} terminé.")
+
+
 async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Génère le briefing matinal complet (tri des e-mails, agenda, météo)."""
     user = update.effective_user
@@ -1395,7 +1741,9 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     _save_chat_id(update.effective_chat.id)
     waiting_msg = await update.message.reply_text("⏳ Préparation de votre briefing matinal (analyse e-mails, agenda, météo)...")
-    res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=240)
+    res = await forward_to_runner(
+        build_briefing_prompt(), continue_session=False, timeout=240
+    )
     output = res.get("output", "").strip() or "⚠️ Impossible de générer le briefing matinal."
     await send_or_edit_telegram_response(waiting_msg, output, update.message)
 
@@ -1408,11 +1756,11 @@ async def _try_create_natural_reminder(
     Retourne True si un rappel a été créé (le message ne doit alors pas être
     transmis à agy).
     """
-    detected = detect_natural_reminder_datetime(prompt)
+    detected = detect_natural_reminder_full(prompt)
     if not detected:
         return False
 
-    remind_at, message = detected
+    remind_at, message, recurrence = detected
     try:
         reminder = add_reminder(
             platform="telegram",
@@ -1421,6 +1769,7 @@ async def _try_create_natural_reminder(
             message=message,
             remind_at=remind_at,
             target_name=getattr(update.effective_user, "full_name", "") or "",
+            recurrence=recurrence,
         )
     except Exception as exc:
         logger.error("Erreur création rappel naturel Telegram: %s", exc)
@@ -1439,6 +1788,8 @@ async def _try_create_natural_reminder(
 
 async def _process_prompt_and_reply(update: Update, prompt: str, waiting_msg) -> None:
     """Envoie un prompt au runner et édite le message d'attente avec la réponse."""
+    if await _try_capture_memory(update, prompt, waiting_msg):
+        return
     if await _try_create_natural_reminder(update, prompt, waiting_msg):
         return
 
@@ -1548,8 +1899,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if media is None:
         return
 
+    file_size = int(getattr(media, "file_size", 0) or 0)
+    if file_size > MAX_AUDIO_BYTES:
+        await update.message.reply_text(
+            f"❌ Fichier audio trop volumineux "
+            f"({file_size / 1024 / 1024:.1f} Mo)."
+        )
+        return
+
     waiting_msg = await update.message.reply_text("🎤 Transcription en cours...")
-    temp_path = Path(f"/tmp/telegram_voice_{secrets.token_hex(8)}.ogg")
+    suffix = Path(getattr(media, "file_name", "") or "").suffix or ".ogg"
+    temp_path = Path(f"/tmp/telegram_voice_{secrets.token_hex(8)}{suffix}")
 
     try:
         tg_file = await media.get_file()
@@ -1590,9 +1950,14 @@ from telegram.request import HTTPXRequest
 
 BOT_COMMANDS = [
     BotCommand("briefing", "Briefing matinal (mails triés, agenda, météo)"),
-    BotCommand("rappel", "Programmer un rappel (ex: 15m Sortir le pain)"),
+    BotCommand("rappel", "Programmer un rappel (ponctuel ou récurrent)"),
     BotCommand("rappels", "Lister vos rappels actifs"),
+    BotCommand("snooze", "Reporter un rappel (+10 min par défaut)"),
+    BotCommand("rappel_termine", "Clôturer un rappel"),
     BotCommand("annuler_rappel", "Annuler un rappel par son numéro"),
+    BotCommand("souviens", "Ajouter un souvenir durable"),
+    BotCommand("oublie", "Supprimer un souvenir"),
+    BotCommand("profil", "Afficher ou modifier votre profil"),
     BotCommand("resume", "Reprendre une discussion précédente"),
     BotCommand("delete", "Supprimer des discussions passées"),
     BotCommand("agenda", "Consulter Google Agenda (aujourd'hui, semaine)"),
@@ -1642,8 +2007,17 @@ def get_application() -> Application:
     app.add_handler(CommandHandler("reminder", cmd_rappel))
     app.add_handler(CommandHandler("rappels", cmd_rappels))
     app.add_handler(CommandHandler("reminders", cmd_rappels))
+    app.add_handler(CommandHandler("snooze", cmd_snooze))
+    app.add_handler(CommandHandler("report", cmd_snooze))
+    app.add_handler(CommandHandler("rappel_termine", cmd_rappel_termine))
+    app.add_handler(CommandHandler("rappel_done", cmd_rappel_termine))
     app.add_handler(CommandHandler("annuler_rappel", cmd_annuler_rappel))
     app.add_handler(CommandHandler("delrappel", cmd_annuler_rappel))
+    app.add_handler(CommandHandler("souviens", cmd_souviens))
+    app.add_handler(CommandHandler("retiens", cmd_souviens))
+    app.add_handler(CommandHandler("oublie", cmd_oublie))
+    app.add_handler(CommandHandler("profil", cmd_profil))
+    app.add_handler(CommandHandler("memoire", cmd_profil))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("del", cmd_delete))

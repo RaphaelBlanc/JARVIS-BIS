@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "").strip()
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "").strip()
 LOCAL_WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "base").strip()
+# "auto" (ou vide) laisse Whisper détecter la langue. Sinon forcer "fr", "en", etc.
+STT_LANGUAGE: str = os.getenv("WHISPER_LANGUAGE", "auto").strip().lower()
+STT_MAX_AUDIO_MB: int = int(os.getenv("STT_MAX_AUDIO_MB", "25"))
+MAX_AUDIO_BYTES: int = max(1, STT_MAX_AUDIO_MB) * 1024 * 1024
 
 # Modèle local chargé en singleton paresseux (lazy loading)
 _local_whisper_model = None
@@ -49,7 +53,9 @@ def _get_local_model():
     return _local_whisper_model
 
 
-async def _transcribe_groq(file_path: Path, language: str) -> Optional[str]:
+async def _transcribe_groq(
+    file_path: Path, language: Optional[str]
+) -> Optional[str]:
     """Transcrit l'audio via l'API ultra-rapide Groq Whisper."""
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -59,9 +65,10 @@ async def _transcribe_groq(file_path: Path, language: str) -> Optional[str]:
             files = {"file": (file_path.name, f, "audio/ogg")}
             data = {
                 "model": "whisper-large-v3-turbo",
-                "language": language,
                 "response_format": "text",
             }
+            if language:
+                data["language"] = language
             resp = await client.post(url, headers=headers, files=files, data=data)
             if resp.status_code == 200:
                 return resp.text.strip()
@@ -69,7 +76,9 @@ async def _transcribe_groq(file_path: Path, language: str) -> Optional[str]:
     return None
 
 
-async def _transcribe_openai(file_path: Path, language: str) -> Optional[str]:
+async def _transcribe_openai(
+    file_path: Path, language: Optional[str]
+) -> Optional[str]:
     """Transcrit l'audio via l'API OpenAI Whisper."""
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
@@ -79,9 +88,10 @@ async def _transcribe_openai(file_path: Path, language: str) -> Optional[str]:
             files = {"file": (file_path.name, f, "audio/ogg")}
             data = {
                 "model": "whisper-1",
-                "language": language,
                 "response_format": "text",
             }
+            if language:
+                data["language"] = language
             resp = await client.post(url, headers=headers, files=files, data=data)
             if resp.status_code == 200:
                 return resp.text.strip()
@@ -89,28 +99,72 @@ async def _transcribe_openai(file_path: Path, language: str) -> Optional[str]:
     return None
 
 
-def _transcribe_local_sync(file_path: Path, language: str) -> Optional[str]:
-    """Exécute la transcription locale dans un thread bloquant séparé."""
+def _transcribe_local_sync(
+    file_path: Path, language: Optional[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    """Exécute la transcription locale dans un thread bloquant séparé.
+
+    Retourne (texte, langue_détectée).
+    """
     model = _get_local_model()
     if model is None:
-        return None
+        return None, None
 
     try:
-        segments, info = model.transcribe(
-            str(file_path),
-            language=language,
-            beam_size=3,
-            vad_filter=True,  # Supprime les blancs/silences
-        )
+        kwargs = {
+            "beam_size": 3,
+            "vad_filter": True,  # Supprime les blancs/silences
+        }
+        if language:
+            kwargs["language"] = language
+        segments, info = model.transcribe(str(file_path), **kwargs)
         text_parts = [seg.text.strip() for seg in segments if seg.text.strip()]
-        return " ".join(text_parts).strip()
+        detected = getattr(info, "language", None) or language
+        probability = getattr(info, "language_probability", None)
+        if detected and probability is not None:
+            logger.info(
+                "Langue détectée par Whisper : %s (%.0f%%)",
+                detected,
+                float(probability) * 100,
+            )
+        elif detected:
+            logger.info("Langue de transcription : %s", detected)
+        return " ".join(text_parts).strip(), detected
     except Exception as exc:
         logger.error("Erreur durant la transcription locale faster-whisper : %s", exc)
+        return None, None
+
+
+async def warmup_stt() -> None:
+    """Préchauffe le modèle local pour éviter la latence du premier vocal."""
+    if GROQ_API_KEY or OPENAI_API_KEY:
+        logger.info("STT distant configuré : pas de préchauffage local nécessaire.")
+        return
+
+    logger.info(
+        "Préchauffage du modèle faster-whisper local ('%s') en arrière-plan...",
+        LOCAL_WHISPER_MODEL,
+    )
+    model = await asyncio.to_thread(_get_local_model)
+    if model is not None:
+        logger.info("Modèle faster-whisper local prêt.")
+
+
+def _resolve_language(language: Optional[str]) -> Optional[str]:
+    """Résout la langue demandée ; None signifie détection automatique."""
+    value = (language if language is not None else STT_LANGUAGE).strip().lower()
+    if not value or value in {"auto", "automatic", "détection", "detection"}:
         return None
+    return value
 
 
-async def transcribe_audio(file_path: Path, language: str = "fr") -> Tuple[Optional[str], str]:
+async def transcribe_audio(
+    file_path: Path, language: Optional[str] = None
+) -> Tuple[Optional[str], str]:
     """Transcrit un fichier audio (ogg, mp3, wav, m4a).
+
+    ``language`` vaut ``None`` par défaut : la langue est détectée
+    automatiquement (ou forcée via ``WHISPER_LANGUAGE``).
 
     Retourne :
         (texte_transcrit, moteur_utilisé)
@@ -119,13 +173,26 @@ async def transcribe_audio(file_path: Path, language: str = "fr") -> Tuple[Optio
     if not path.exists():
         return None, "Fichier audio introuvable"
 
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None, "Fichier audio illisible"
+    if size > MAX_AUDIO_BYTES:
+        return (
+            None,
+            f"Fichier audio trop volumineux ({size / 1024 / 1024:.1f} Mo, "
+            f"maximum {STT_MAX_AUDIO_MB} Mo)",
+        )
+
+    resolved_language = _resolve_language(language)
+
     # 1. Essai Groq (ultra-rapide)
     if GROQ_API_KEY:
         try:
             logger.info("Tentative de transcription audio via Groq Whisper...")
-            text = await _transcribe_groq(path, language)
+            text = await _transcribe_groq(path, resolved_language)
             if text:
-                return text, "groq-whisper"
+                return text, f"groq-whisper:{resolved_language or 'auto'}"
         except Exception as exc:
             logger.warning("Erreur Groq: %s, repli vers le moteur suivant...", exc)
 
@@ -133,16 +200,22 @@ async def transcribe_audio(file_path: Path, language: str = "fr") -> Tuple[Optio
     if OPENAI_API_KEY:
         try:
             logger.info("Tentative de transcription audio via OpenAI Whisper...")
-            text = await _transcribe_openai(path, language)
+            text = await _transcribe_openai(path, resolved_language)
             if text:
-                return text, "openai-whisper"
+                return text, f"openai-whisper:{resolved_language or 'auto'}"
         except Exception as exc:
             logger.warning("Erreur OpenAI: %s, repli vers le moteur suivant...", exc)
 
     # 3. Fallback Local faster-whisper (sur CPU dans un thread séparé)
-    logger.info("Transcription audio via faster-whisper local (modèle %s)...", LOCAL_WHISPER_MODEL)
-    text = await asyncio.to_thread(_transcribe_local_sync, path, language)
+    logger.info(
+        "Transcription audio via faster-whisper local (modèle %s, langue %s)...",
+        LOCAL_WHISPER_MODEL,
+        resolved_language or "auto",
+    )
+    text, detected = await asyncio.to_thread(
+        _transcribe_local_sync, path, resolved_language
+    )
     if text:
-        return text, f"local-whisper-{LOCAL_WHISPER_MODEL}"
+        return text, f"local-whisper-{LOCAL_WHISPER_MODEL}:{detected or 'auto'}"
 
     return None, "Échec de transcription sur tous les moteurs disponibles"

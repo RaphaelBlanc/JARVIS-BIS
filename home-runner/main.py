@@ -7,6 +7,7 @@ Expose une API HTTP privée qui reçoit des requêtes depuis le serveur Render
 """
 
 import base64
+import hmac
 import logging
 import os
 import re
@@ -36,6 +37,15 @@ from agy_bridge import (
     shutdown_agy_worker,
     update_session,
 )
+from memory import (
+    add_fact,
+    clear_facts,
+    delete_fact,
+    delete_profile,
+    get_memory,
+    render_memory_prompt,
+    set_profile,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +57,9 @@ load_dotenv()  # Charge .env si présent
 SECRET_KEY: str = os.environ.get("SECRET_KEY", "")
 PORT: int = int(os.environ.get("PORT", "8080"))
 AGY_TIMEOUT: int = int(os.environ.get("AGY_TIMEOUT", "120"))
+MAX_PROMPT_CHARS: int = int(os.environ.get("MAX_PROMPT_CHARS", "20000"))
+MAX_IMAGE_MB: int = int(os.environ.get("MAX_IMAGE_MB", "10"))
+MAX_IMAGE_BYTES: int = max(1, MAX_IMAGE_MB) * 1024 * 1024
 
 if not SECRET_KEY:
     raise RuntimeError(
@@ -135,7 +148,12 @@ async def log_requests(request: Request, call_next):
 class RunRequest(BaseModel):
     """Corps de la requête POST /run."""
 
-    prompt: str = Field(..., min_length=1, description="Le prompt à envoyer à agy.")
+    prompt: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_PROMPT_CHARS,
+        description="Le prompt à envoyer à agy.",
+    )
     timeout: int = Field(
         default=AGY_TIMEOUT,
         ge=1,
@@ -148,8 +166,16 @@ class RunRequest(BaseModel):
     continue_session: bool = Field(default=True, description="Poursuivre la conversation existante.")
     reset_session: bool = Field(default=False, description="Démarrer une nouvelle conversation vierge.")
     permission_mode: str | None = Field(default=None, description="Politique de permission.")
-    image_base64: str | None = Field(default=None, description="Image encodée en base64 envoyée par l'utilisateur.")
-    image_filename: str | None = Field(default=None, description="Nom original du fichier image.")
+    image_base64: str | None = Field(
+        default=None,
+        max_length=MAX_IMAGE_BYTES * 2,
+        description="Image encodée en base64 envoyée par l'utilisateur.",
+    )
+    image_filename: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Nom original du fichier image.",
+    )
 
 
 class RunResponse(BaseModel):
@@ -175,6 +201,20 @@ class DeleteConversationRequest(BaseModel):
 
     conversation_id: str = Field(..., description="ID de la conversation à supprimer ou 'all'.")
 
+
+class MemoryFactRequest(BaseModel):
+    """Ajout d'un souvenir durable."""
+
+    text: str = Field(..., min_length=1, max_length=2000)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+
+
+class MemoryProfileRequest(BaseModel):
+    """Définition d'une préférence durable."""
+
+    key: str = Field(..., min_length=1, max_length=64)
+    value: str = Field(..., min_length=1, max_length=1000)
+
 # ---------------------------------------------------------------------------
 # Helpers d'authentification
 # ---------------------------------------------------------------------------
@@ -188,7 +228,11 @@ def _check_secret(request: Request) -> None:
         HTTPException 401 si le header est absent ou incorrect.
     """
     provided = request.headers.get("X-Secret-Key", "")
-    if not provided or provided != SECRET_KEY:
+    if (
+        not provided
+        or not SECRET_KEY
+        or not hmac.compare_digest(provided, SECRET_KEY)
+    ):
         logger.warning(
             "Accès refusé depuis %s — clé incorrecte ou absente.",
             request.client.host if request.client else "inconnu",
@@ -328,6 +372,62 @@ async def delete_conv_post(request: Request, body: DeleteConversationRequest):
 
 
 
+@app.get("/memory", summary="Lire la mémoire durable et le profil")
+async def memory_get(request: Request):
+    """Retourne le profil et les souvenirs durables."""
+    _check_secret(request)
+    return {"success": True, "memory": get_memory()}
+
+
+@app.post("/memory/facts", summary="Ajouter un souvenir durable")
+async def memory_add_fact(request: Request, body: MemoryFactRequest):
+    """Ajoute un souvenir injecté dans les prompts suivants."""
+    _check_secret(request)
+    try:
+        fact = add_fact(body.text, tags=body.tags)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    logger.info("Souvenir mémoire ajouté : #%s", fact["id"])
+    return {"success": True, "fact": fact}
+
+
+@app.delete("/memory/facts/{fact_id}", summary="Supprimer un souvenir")
+async def memory_delete_fact(request: Request, fact_id: str):
+    """Supprime un souvenir par son identifiant."""
+    _check_secret(request)
+    if not delete_fact(fact_id):
+        raise HTTPException(status_code=404, detail="Souvenir introuvable.")
+    return {"success": True, "deleted_id": fact_id}
+
+
+@app.delete("/memory/facts", summary="Supprimer tous les souvenirs")
+async def memory_clear_facts(request: Request):
+    """Vide la liste des souvenirs, sans toucher au profil."""
+    _check_secret(request)
+    count = clear_facts()
+    return {"success": True, "deleted_count": count}
+
+
+@app.post("/memory/profile", summary="Définir une préférence durable")
+async def memory_set_profile(request: Request, body: MemoryProfileRequest):
+    """Ajoute ou remplace une préférence dans le profil."""
+    _check_secret(request)
+    try:
+        set_profile(body.key, body.value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "memory": get_memory()}
+
+
+@app.delete("/memory/profile/{key}", summary="Supprimer une préférence durable")
+async def memory_delete_profile(request: Request, key: str):
+    """Supprime une préférence du profil."""
+    _check_secret(request)
+    if not delete_profile(key):
+        raise HTTPException(status_code=404, detail="Préférence introuvable.")
+    return {"success": True, "deleted_key": key}
+
+
 @app.post("/run", response_model=RunResponse, summary="Exécute un prompt via agy")
 async def run(request: Request, body: RunRequest):
     """
@@ -345,17 +445,54 @@ async def run(request: Request, body: RunRequest):
     active_prompt = body.prompt
     if body.image_base64:
         try:
+            image_bytes = base64.b64decode(body.image_base64, validate=True)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail="Image base64 invalide."
+            ) from exc
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Image trop volumineuse ({len(image_bytes) / 1024 / 1024:.1f} Mo, "
+                    f"maximum {MAX_IMAGE_MB} Mo)."
+                ),
+            )
+
+        try:
             upload_dir = Path("/tmp/assistant_uploads")
             upload_dir.mkdir(parents=True, exist_ok=True)
-            safe_name = re.sub(r"[^a-zA-Z0-9_\.-]", "_", body.image_filename or "image.png")
+            safe_name = re.sub(
+                r"[^a-zA-Z0-9_\.-]", "_", body.image_filename or "image.png"
+            )
             unique_filename = f"{uuid.uuid4().hex[:8]}_{safe_name}"
             saved_img_path = upload_dir / unique_filename
             with open(saved_img_path, "wb") as img_file:
-                img_file.write(base64.b64decode(body.image_base64))
-            logger.info("Image utilisateur enregistrée: %s (%d octets)", saved_img_path, saved_img_path.stat().st_size)
-            active_prompt = f"[Image fournie par l'utilisateur: {saved_img_path}]\n\n{active_prompt}"
+                img_file.write(image_bytes)
+            logger.info(
+                "Image utilisateur enregistrée: %s (%d octets)",
+                saved_img_path,
+                len(image_bytes),
+            )
+            active_prompt = (
+                f"[Image fournie par l'utilisateur: {saved_img_path}]\n\n"
+                f"{active_prompt}"
+            )
         except Exception as exc:
-            logger.warning("Erreur lors de l'enregistrement de l'image utilisateur: %s", exc)
+            logger.error("Erreur lors de l'enregistrement de l'image utilisateur: %s", exc)
+            raise HTTPException(
+                status_code=500, detail="Impossible d'enregistrer l'image."
+            ) from exc
+
+    # Injecte la mémoire durable dans les prompts normaux. Les commandes slash
+    # d'agy ne doivent pas être préfixées par du contexte.
+    if not active_prompt.lstrip().startswith("/"):
+        memory_context = render_memory_prompt()
+        if memory_context:
+            active_prompt = f"{memory_context}\n\n{active_prompt}"
+            logger.info(
+                "Contexte mémoire injecté (%d caractères).", len(memory_context)
+            )
 
     result = await run_agy(
         prompt=active_prompt,

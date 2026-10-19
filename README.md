@@ -168,7 +168,22 @@ TELEGRAM_ALLOWED_USER_IDS=123456789
 # ALLOW_ALL_USERS=1
 ```
 
-### 4. Lancement en tâche de fond (Systemd)
+### 4. Briefing matinal configurable
+
+Le briefing est piloté par variables d'environnement dans `render-gateway/.env` :
+
+```dotenv
+BRIEFING_ENABLED=1
+BRIEFING_TIME=08:00
+BRIEFING_DAYS=mon,tue,wed,thu,fri
+BRIEFING_TIMEZONE=Europe/Paris
+BRIEFING_CITY=Toulouse
+BRIEFING_SECTIONS=agenda,news,email,weather,tasks
+```
+
+La diffusion est suivie séparément pour Telegram et Discord dans `briefing_state.json` : si une plateforme échoue, elle est retentée sans renvoyer le briefing sur celle qui a déjà réussi.
+
+### 5. Lancement en tâche de fond (Systemd)
 
 Pour que votre assistant démarre automatiquement au boot du système et survive aux redémarrages :
 
@@ -206,11 +221,13 @@ Toutes les fonctionnalités sont disponibles sur **Discord** (commandes slash na
 | `/meteo [ville]` | `/meteo [ville]` | `/weather`, `!meteo` | Prévisions météo mondiales en temps réel (ex: `/meteo Lyon`) |
 | `/search [requete]` | `/search [requete]` | `/recherche`, `!search` | Recherche sur le web via DuckDuckGo avec synthèse IA |
 | `/summarize [url]` | `/summarize [url]` | `!summarize` | Extrait et résume le contenu d'un article ou d'une page web |
-| `/rappel [delai] [message]` | `/rappel [delai] [message]` | `/reminder`, `!rappel` | Programme un rappel persistant (ex: `/rappel 15m Sortir le pain`) |
+| `/rappel [recurrence] [delai] [message]` | `/rappel [recurrence] [delai] [message]` | `/reminder`, `!rappel` | Programme un rappel ponctuel ou récurrent (ex: `/rappel chaque jour 8h Faire mes étirements`) |
 | `/rappels` | `/rappels` | `/reminders`, `!rappels` | Liste les rappels actifs |
+| `/snooze [id] [duree]` | `/snooze [id] [duree]` | `/report`, `!snooze` | Reporte un rappel (10 min par défaut) |
+| `/rappel_termine [id]` | `/rappel_termine [id]` | `/rappel_done`, `!rappel_termine` | Clôture un rappel (et programme la prochaine occurrence si récurrent) |
 | `/annuler_rappel [id]` | `/annuler_rappel [id]` | `!annuler_rappel` | Annule un rappel par son numéro |
 
-> Les rappels fonctionnent aussi en langage naturel, y compris via les messages vocaux : « Rappelle-moi dans 15 min de sortir le pain » ou « Je veux un rappel dans 3 minutes pour... ».
+> Les rappels fonctionnent aussi en langage naturel, y compris via les messages vocaux : « Rappelle-moi dans 15 min de sortir le pain », « Rappelle-moi chaque lundi à 9h de... » ou « Je veux un rappel dans 3 minutes pour... ».
 
 ### 2. 🧠 Conversation, Sessions & Mémoire
 
@@ -222,6 +239,11 @@ Toutes les fonctionnalités sont disponibles sur **Discord** (commandes slash na
 | `/delete [conversation]` | `/delete` | `/del`, `/delconv`, `!delete` | Supprime une conversation passée (accepte un ID ou `all`) |
 | `/compact` | `/compact` | `!compact` | Compacter l'historique de la session pour économiser des tokens |
 | `/session` | `/session` | `!session` | Affiche l'ID actif, le modèle utilisé et le nombre d'échanges |
+| `/souviens [texte]` | `/souviens [texte]` | `/retiens`, `!souviens` | Ajoute un souvenir durable, injecté dans les prompts suivants |
+| `/oublie [id\|all]` | `/oublie [id\|all]` | `!oublie` | Supprime un souvenir ou toute la liste |
+| `/profil [clé] [valeur]` | `/profil [clé] [valeur]` | `/memoire`, `!profil` | Affiche ou modifie le profil durable (ville, préférences...) |
+
+> La mémoire durable est stockée localement dans `home-runner/memory.json` et survit aux redémarrages et aux nouvelles conversations.
 
 ### 3. ⚙️ Modèles d'IA & Paramètres Moteur
 
@@ -250,6 +272,8 @@ Toutes les fonctionnalités sont disponibles sur **Discord** (commandes slash na
 - **Authentification forte** : Chaque échange entre la passerelle (`render-gateway`) et le moteur local (`home-runner`) est protégé par une clé `X-Secret-Key` de 256 bits.
 - **Accès restreint (Whitelist)** : Définissez `DISCORD_ALLOWED_USER_IDS` et `TELEGRAM_ALLOWED_USER_IDS` afin que personne d'autre ne puisse interagir avec votre assistant. Par défaut (**fail-closed**), une whitelist vide refuse tout le monde ; pour ouvrir l'accès sans whitelist, définissez explicitement `ALLOW_ALL_USERS=1` (non recommandé).
 - **Webhook Telegram authentifié** : En mode webhook, chaque requête est validée via le header `X-Telegram-Bot-Api-Secret-Token`. Le secret est dérivé automatiquement de `SECRET_KEY`, ou peut être fixé via `TELEGRAM_WEBHOOK_SECRET`.
+- **Sandbox d'exécution** : `agy` est lancé avec `--sandbox` par défaut (`AGY_SANDBOX=1`), ce qui limite les actions terminal. Les prompts sont aussi bornés (`MAX_PROMPT_CHARS`) et les images limitées (`MAX_IMAGE_MB`).
+- **Contenu non fiable** : les e-mails, pages web et documents sont traités comme des données, jamais comme des instructions. Les actions destructrices doivent être confirmées dans le chat.
 - **Protection des données** : Tous vos identifiants, tokens OAuth Google et conversations restent stockés localement sur votre machine et sont exclus du suivi Git via `.gitignore`.
 
 ---

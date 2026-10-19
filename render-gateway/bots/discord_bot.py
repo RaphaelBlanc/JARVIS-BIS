@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -27,26 +28,37 @@ from formatters import (
     latex_to_unicode,
     smart_split_discord,
 )
-from stt import transcribe_audio
+from stt import MAX_AUDIO_BYTES, transcribe_audio
+from briefing import build_briefing_prompt
 from reminders import (
     add_reminder,
     cancel_reminder,
-    detect_natural_reminder_datetime,
+    complete_reminder,
+    detect_natural_reminder_full,
     format_remaining_time,
     format_reminder_confirmation,
+    format_reminder_notification,
     list_active_reminders,
-    split_time_and_message,
+    parse_reminder_command,
+    recurrence_label,
+    snooze_reminder,
 )
 
 from gateway import (
+    add_memory_fact,
+    clear_memory_facts,
     delete_conversation_remote,
+    delete_memory_fact,
+    delete_memory_profile,
     fetch_conversations,
     fetch_health,
+    fetch_memory,
     fetch_models,
     fetch_session,
     forward_to_runner,
     reset_session_remote,
     resume_conversation_remote,
+    set_memory_profile,
     update_session_remote,
 )
 
@@ -129,6 +141,13 @@ async def _transcribe_audio_attachment(
     attachment: discord.Attachment,
 ) -> Optional[str]:
     """Télécharge une pièce jointe audio Discord et la transcrit en texte."""
+    size = int(getattr(attachment, "size", 0) or 0)
+    if size > MAX_AUDIO_BYTES:
+        logger.warning(
+            "Pièce jointe audio Discord trop volumineuse : %.1f Mo.",
+            size / 1024 / 1024,
+        )
+        return None
     suffix = Path(attachment.filename or "voice.ogg").suffix or ".ogg"
     raw_bytes = await attachment.read()
 
@@ -173,7 +192,12 @@ class AssistantBot(commands.Bot):
             briefing_slash,
             reminder_slash,
             reminders_slash,
+            snooze_slash,
+            done_reminder_slash,
             cancel_reminder_slash,
+            remember_slash,
+            forget_slash,
+            profile_slash,
             ask_slash,
             resume_slash,
             delete_slash,
@@ -247,25 +271,6 @@ def _get_bot() -> AssistantBot:
 
 
 # ── Commandes slash avec autocomplétion & choix ───────────────────────────────
-
-
-BRIEFING_PROMPT = (
-    "Effectue mon briefing matinal rapide, motivant et structuré :\n"
-    "1. 📅 EMPLOI DU TEMPS DU JOUR (Heure / Cours / Salles) :\n"
-    "Consulte mon Google Agenda aujourd'hui (en incluant mon calendrier de cours EPITA/PREPA). "
-    "Liste uniquement les horaires, le cours et la salle exacte : • Début - Fin : Intitulé (📍 Salle). "
-    "S'il n'y a pas de cours, mentionne-le brièvement.\n\n"
-    "2. 📈 ACTUALITÉS ÉCONOMIQUES :\n"
-    "Recherche rapidement les 2 faits économiques ou tech marquants de la veille (1 seule recherche concise) et résume-les en 2 puces percutantes.\n\n"
-    "3. ✉️ E-MAILS IMPORTANTS :\n"
-    "Consulte mes 5 derniers e-mails récents via Gmail. Ignore totalement spams, pubs et newsletters. "
-    "Ne retiens que les messages clés (EPITA, examens, personnel) et résume chaque message en 1 ligne.\n\n"
-    "4. 🌤️ MÉTÉO DU JOUR :\n"
-    "Météo du jour pour ma ville (température, ciel, pluie).\n\n"
-    "5. 📋 TÂCHES EN COURS :\n"
-    "Consulte mes tâches Google Tasks non terminées si disponibles.\n\n"
-    "CONSIGNE DE STYLE : Sois ultra-synthétique, direct et dynamique. Pas de bavardage, va droit au but avec des puces courtes."
-)
 
 
 async def _fast_ack(interaction: discord.Interaction, message: str = "⏳ Traitement en cours...", ephemeral: bool = False) -> None:
@@ -359,7 +364,7 @@ async def briefing_slash(interaction: discord.Interaction) -> None:
 
     logger.info("Commande /briefing de %d", interaction.user.id)
     await _fast_ack(interaction, "⏳ Préparation de votre briefing matinal (tri des e-mails, agenda, météo)...")
-    result = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=240)
+    result = await forward_to_runner(build_briefing_prompt(), continue_session=False, timeout=240)
 
     if result.get("success"):
         response_text = result.get("output", "").strip() or "✅ Briefing terminé."
@@ -370,15 +375,17 @@ async def briefing_slash(interaction: discord.Interaction) -> None:
     await send_discord_long_response(interaction, response_text, title="🌅 Votre Briefing Matinal")
 
 
-@app_commands.command(name="rappel", description="Programmer un rappel à une durée ou une heure précise")
+@app_commands.command(name="rappel", description="Programmer un rappel ponctuel ou récurrent")
 @app_commands.describe(
     delai="Durée ou heure : 15m, 1h30, 14h30, 2h",
     message="Ce que l'assistant doit vous rappeler",
+    recurrence="Optionnel : chaque jour, chaque lundi, tous les 2 jours...",
 )
 async def reminder_slash(
     interaction: discord.Interaction,
     delai: str,
     message: str,
+    recurrence: Optional[str] = None,
 ) -> None:
     """Handler de la commande slash /rappel."""
     if not _is_allowed(interaction.user.id):
@@ -391,9 +398,8 @@ async def reminder_slash(
         )
         return
 
-    remind_at, parsed_message, error = split_time_and_message(
-        f"{delai} {message}"
-    )
+    raw = " ".join(part for part in (recurrence, delai, message) if part).strip()
+    remind_at, parsed_message, parsed_recurrence, error = parse_reminder_command(raw)
     if remind_at is None or not parsed_message:
         await interaction.response.send_message(
             f"❌ {error or 'Durée invalide.'}", ephemeral=True
@@ -407,12 +413,14 @@ async def reminder_slash(
         message=parsed_message,
         remind_at=remind_at,
         target_name=str(interaction.user),
+        recurrence=parsed_recurrence,
     )
     logger.info(
-        "Rappel #%s créé via /rappel (discord -> %s) : %s",
+        "Rappel #%s créé via /rappel (discord -> %s, récurrence=%s) : %s",
         reminder["id"],
         interaction.channel_id,
-        message,
+        parsed_recurrence,
+        parsed_message,
     )
     await interaction.response.send_message(format_reminder_confirmation(reminder))
 
@@ -431,10 +439,13 @@ async def reminders_slash(interaction: discord.Interaction) -> None:
 
     lines = ["⏰ **Rappels actifs :**"]
     for reminder in reminders:
-        lines.append(
+        line = (
             f"• **#{reminder['id']}** — {reminder['message']} — "
             f"{format_remaining_time(reminder['remind_at'])}"
         )
+        if reminder.get("recurrence"):
+            line += f" — 🔁 {recurrence_label(reminder['recurrence'])}"
+        lines.append(line)
     await interaction.response.send_message("\n".join(lines))
 
 
@@ -456,6 +467,210 @@ async def cancel_reminder_slash(
         await interaction.response.send_message(
             f"❌ Aucun rappel actif #{rappel_id} dans ce salon.", ephemeral=True
         )
+
+
+@app_commands.command(name="snooze", description="Reporter un rappel actif")
+@app_commands.describe(
+    rappel_id="Numéro affiché par /rappels",
+    duree="Durée du report : 10m par défaut, 1h, 2h...",
+)
+async def snooze_slash(
+    interaction: discord.Interaction,
+    rappel_id: int,
+    duree: str = "10m",
+) -> None:
+    """Handler de la commande slash /snooze."""
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+
+    if duree.isdigit():
+        duree += "m"
+    reminder = snooze_reminder(
+        rappel_id, duree, chat_id=interaction.channel_id or 0
+    )
+    if reminder is None:
+        await interaction.response.send_message(
+            f"❌ Aucun rappel actif #{rappel_id} dans ce salon, ou durée invalide.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"⏰ Rappel #{rappel_id} reporté.\n{format_reminder_confirmation(reminder)}"
+    )
+
+
+@app_commands.command(name="rappel_termine", description="Clôturer un rappel actif")
+@app_commands.describe(rappel_id="Numéro affiché par /rappels")
+async def done_reminder_slash(
+    interaction: discord.Interaction,
+    rappel_id: int,
+) -> None:
+    """Handler de la commande slash /rappel_termine."""
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+
+    reminder = complete_reminder(rappel_id, chat_id=interaction.channel_id or 0)
+    if reminder is None:
+        await interaction.response.send_message(
+            f"❌ Aucun rappel actif #{rappel_id} dans ce salon.", ephemeral=True
+        )
+        return
+
+    if reminder.get("status") == "pending" and reminder.get("completed_occurrence"):
+        await interaction.response.send_message(
+            f"✅ Occurrence terminée.\n{format_reminder_confirmation(reminder)}"
+        )
+    else:
+        await interaction.response.send_message(f"✅ Rappel #{rappel_id} terminé.")
+
+
+def _format_memory_discord(memory: dict) -> str:
+    """Formate le profil et les souvenirs pour Discord."""
+    profile = memory.get("profile", {})
+    facts = memory.get("facts", [])
+    if not profile and not facts:
+        return "🧠 Aucune mémoire durable enregistrée."
+    lines = ["🧠 **Mémoire durable**"]
+    if profile:
+        lines.append("\n**Profil :**")
+        for key, value in sorted(profile.items()):
+            lines.append(f"• `{key}` : {value}")
+    if facts:
+        lines.append("\n**Souvenirs :**")
+        for fact in facts:
+            lines.append(f"• `{fact['id']}` — {fact['text']}")
+    text = "\n".join(lines)
+    if len(text) > 1900:
+        text = text[:1890].rstrip() + "\n…"
+    return text
+
+
+@app_commands.command(name="souviens", description="Ajouter un souvenir durable")
+@app_commands.describe(texte="Le souvenir à conserver")
+async def remember_slash(
+    interaction: discord.Interaction, texte: str
+) -> None:
+    """Handler de la commande slash /souviens."""
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+
+    result = await add_memory_fact(texte)
+    if not result.get("success"):
+        await interaction.response.send_message(
+            f"❌ Impossible d'enregistrer le souvenir : {result.get('error', 'inconnue')}",
+            ephemeral=True,
+        )
+        return
+    fact = result.get("fact", {})
+    await interaction.response.send_message(
+        f"🧠 Souvenir enregistré (`{fact.get('id', '?')}`) : {fact.get('text', texte)}"
+    )
+
+
+@app_commands.command(name="oublie", description="Supprimer un souvenir ou toute la liste")
+@app_commands.describe(cible="Identifiant du souvenir, ou 'all'")
+async def forget_slash(
+    interaction: discord.Interaction, cible: str
+) -> None:
+    """Handler de la commande slash /oublie."""
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+
+    if cible.strip().lower() in {"all", "tout", "tous"}:
+        result = await clear_memory_facts()
+        if not result.get("success"):
+            await interaction.response.send_message(
+                f"❌ Erreur : {result.get('error', 'inconnue')}", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"🧹 {result.get('deleted_count', 0)} souvenir(s) supprimé(s)."
+        )
+        return
+
+    result = await delete_memory_fact(cible.strip())
+    if not result.get("success"):
+        await interaction.response.send_message(
+            f"❌ Souvenir `{cible}` introuvable.", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(f"🧹 Souvenir `{cible}` supprimé.")
+
+
+@app_commands.command(name="profil", description="Afficher ou modifier la mémoire durable")
+@app_commands.describe(
+    cle="Clé du profil (ex: ville), ou 'suppr'",
+    valeur="Valeur à enregistrer",
+)
+async def profile_slash(
+    interaction: discord.Interaction,
+    cle: Optional[str] = None,
+    valeur: Optional[str] = None,
+) -> None:
+    """Handler de la commande slash /profil."""
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+
+    if not cle:
+        result = await fetch_memory()
+        if not result.get("success"):
+            await interaction.response.send_message(
+                f"❌ Impossible de lire la mémoire : {result.get('error', 'inconnue')}",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            _format_memory_discord(result.get("memory", {}))
+        )
+        return
+
+    if cle.lower() in {"suppr", "supprime", "delete"}:
+        if not valeur:
+            await interaction.response.send_message(
+                "Utilisation : `/profil suppr <clé>`.", ephemeral=True
+            )
+            return
+        result = await delete_memory_profile(valeur)
+        if not result.get("success"):
+            await interaction.response.send_message(
+                f"❌ Préférence `{valeur}` introuvable.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"🧹 Préférence `{valeur}` supprimée."
+        )
+        return
+
+    if not valeur:
+        await interaction.response.send_message(
+            "Utilisation : `/profil <clé> <valeur>`. Ex: `/profil ville Toulouse`.",
+            ephemeral=True,
+        )
+        return
+
+    result = await set_memory_profile(cle, valeur)
+    if not result.get("success"):
+        await interaction.response.send_message(
+            f"❌ Impossible de modifier le profil : {result.get('error', 'inconnue')}",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        f"🧠 Profil mis à jour : `{cle}` = {valeur}"
+    )
+
+
+_MEMORY_CAPTURE_RE = re.compile(
+    r"^\s*(?:souviens[- ]toi|retiens|m[ée]morise)"
+    r"(?:\s+que|\s+qu['’]|\s*:)\s+(.+)",
+    re.IGNORECASE,
+)
 
 
 @app_commands.command(name="ask", description="Pose une question à l'assistant personnel (supporte texte, image et audio)")
@@ -1156,15 +1371,18 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         res = await forward_to_runner("/usage", continue_session=False)
         await waiting.edit(content=res.get("output", "Aucune information reçue."))
 
-    @bot.command(name="rappel", aliases=["reminder"], help="Programmer un rappel. Ex: !rappel 15m Sortir le pain")
+    @bot.command(name="rappel", aliases=["reminder"], help="Programmer un rappel. Ex: !rappel chaque jour 8h Sortir le pain")
     async def reminder_cmd(ctx: commands.Context, *, args: str = "") -> None:
         if not _is_allowed(ctx.author.id):
             return
         if not args.strip():
-            await ctx.send("⏰ Utilisation : `!rappel <durée> <message>`. Ex: `!rappel 15m Sortir le pain`.")
+            await ctx.send(
+                "⏰ Utilisation : `!rappel [récurrence] <durée> <message>`.\n"
+                "Ex: `!rappel 15m Sortir le pain` ou `!rappel chaque jour 8h Faire mes étirements`."
+            )
             return
 
-        remind_at, message, error = split_time_and_message(args)
+        remind_at, message, recurrence, error = parse_reminder_command(args)
         if remind_at is None or not message:
             await ctx.send(f"❌ {error}")
             return
@@ -1176,11 +1394,13 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             message=message,
             remind_at=remind_at,
             target_name=str(ctx.author),
+            recurrence=recurrence,
         )
         logger.info(
-            "Rappel #%s créé via !rappel (discord -> %s) : %s",
+            "Rappel #%s créé via !rappel (discord -> %s, récurrence=%s) : %s",
             reminder["id"],
             ctx.channel.id,
+            recurrence,
             message,
         )
         await ctx.send(format_reminder_confirmation(reminder))
@@ -1195,11 +1415,53 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             return
         lines = ["⏰ **Rappels actifs :**"]
         for reminder in reminders:
-            lines.append(
+            line = (
                 f"• **#{reminder['id']}** — {reminder['message']} — "
                 f"{format_remaining_time(reminder['remind_at'])}"
             )
+            if reminder.get("recurrence"):
+                line += f" — 🔁 {recurrence_label(reminder['recurrence'])}"
+            lines.append(line)
         await ctx.send("\n".join(lines))
+
+    @bot.command(name="snooze", aliases=["report"], help="Reporter un rappel. Ex: !snooze 3 10m")
+    async def snooze_cmd(
+        ctx: commands.Context, rappel_id: int = 0, duree: str = "10m"
+    ) -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        if not rappel_id:
+            await ctx.send("Utilisation : `!snooze <id> [durée]`.")
+            return
+        if duree.isdigit():
+            duree += "m"
+        reminder = snooze_reminder(rappel_id, duree, chat_id=ctx.channel.id)
+        if reminder is None:
+            await ctx.send(
+                f"❌ Aucun rappel actif #{rappel_id} dans ce salon, ou durée invalide."
+            )
+            return
+        await ctx.send(
+            f"⏰ Rappel #{rappel_id} reporté.\n{format_reminder_confirmation(reminder)}"
+        )
+
+    @bot.command(name="rappel_termine", aliases=["rappel_done", "done_rappel"], help="Clôturer un rappel. Ex: !rappel_termine 3")
+    async def done_reminder_cmd(ctx: commands.Context, rappel_id: int = 0) -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        if not rappel_id:
+            await ctx.send("Utilisation : `!rappel_termine <id>`.")
+            return
+        reminder = complete_reminder(rappel_id, chat_id=ctx.channel.id)
+        if reminder is None:
+            await ctx.send(f"❌ Aucun rappel actif #{rappel_id} dans ce salon.")
+            return
+        if reminder.get("status") == "pending" and reminder.get("completed_occurrence"):
+            await ctx.send(
+                f"✅ Occurrence terminée.\n{format_reminder_confirmation(reminder)}"
+            )
+        else:
+            await ctx.send(f"✅ Rappel #{rappel_id} terminé.")
 
     @bot.command(name="annuler_rappel", aliases=["annuler-rappel", "delrappel"], help="Annuler un rappel. Ex: !annuler_rappel 3")
     async def cancel_reminder_cmd(ctx: commands.Context, rappel_id: int = 0) -> None:
@@ -1214,12 +1476,81 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         else:
             await ctx.send(f"❌ Aucun rappel actif #{rappel_id} dans ce salon.")
 
+    @bot.command(name="souviens", aliases=["retiens"], help="Ajouter un souvenir durable. Ex: !souviens J'aime le café sans sucre")
+    async def remember_cmd(ctx: commands.Context, *, texte: str = "") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        if not texte.strip():
+            await ctx.send("Utilisation : `!souviens <texte>`.")
+            return
+        result = await add_memory_fact(texte)
+        if not result.get("success"):
+            await ctx.send(
+                f"❌ Impossible d'enregistrer le souvenir : {result.get('error', 'inconnue')}"
+            )
+            return
+        fact = result.get("fact", {})
+        await ctx.send(
+            f"🧠 Souvenir enregistré (`{fact.get('id', '?')}`) : {fact.get('text', texte)}"
+        )
+
+    @bot.command(name="oublie", help="Supprimer un souvenir. Ex: !oublie abc12345 ou !oublie all")
+    async def forget_cmd(ctx: commands.Context, cible: str = "") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        if not cible:
+            await ctx.send("Utilisation : `!oublie <id>` ou `!oublie all`.")
+            return
+        if cible.lower() in {"all", "tout", "tous"}:
+            result = await clear_memory_facts()
+            if not result.get("success"):
+                await ctx.send(f"❌ Erreur : {result.get('error', 'inconnue')}")
+                return
+            await ctx.send(f"🧹 {result.get('deleted_count', 0)} souvenir(s) supprimé(s).")
+            return
+        result = await delete_memory_fact(cible)
+        if not result.get("success"):
+            await ctx.send(f"❌ Souvenir `{cible}` introuvable.")
+            return
+        await ctx.send(f"🧹 Souvenir `{cible}` supprimé.")
+
+    @bot.command(name="profil", aliases=["memoire"], help="Afficher ou modifier le profil. Ex: !profil ville Toulouse")
+    async def profile_cmd(ctx: commands.Context, *, args: str = "") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        parts = args.split(maxsplit=1)
+        if not parts:
+            result = await fetch_memory()
+            if not result.get("success"):
+                await ctx.send(f"❌ Impossible de lire la mémoire : {result.get('error', 'inconnue')}")
+                return
+            await ctx.send(_format_memory_discord(result.get("memory", {})))
+            return
+        if parts[0].lower() in {"suppr", "supprime", "delete"}:
+            if len(parts) < 2:
+                await ctx.send("Utilisation : `!profil suppr <clé>`.")
+                return
+            result = await delete_memory_profile(parts[1])
+            if not result.get("success"):
+                await ctx.send(f"❌ Préférence `{parts[1]}` introuvable.")
+                return
+            await ctx.send(f"🧹 Préférence `{parts[1]}` supprimée.")
+            return
+        if len(parts) < 2:
+            await ctx.send("Utilisation : `!profil <clé> <valeur>`. Ex: `!profil ville Toulouse`.")
+            return
+        result = await set_memory_profile(parts[0], parts[1])
+        if not result.get("success"):
+            await ctx.send(f"❌ Impossible de modifier le profil : {result.get('error', 'inconnue')}")
+            return
+        await ctx.send(f"🧠 Profil mis à jour : `{parts[0]}` = {parts[1]}")
+
     @bot.command(name="briefing", aliases=["brief"], help="Génère votre briefing matinal (mails triés, agenda, météo)")
     async def briefing_cmd(ctx: commands.Context) -> None:
         if not _is_allowed(ctx.author.id):
             return
         waiting = await ctx.send("⏳ Préparation de votre briefing matinal (tri des e-mails, agenda, météo)...")
-        res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=120)
+        res = await forward_to_runner(build_briefing_prompt(), continue_session=False, timeout=120)
         output = res.get("output", "").strip() or "⚠️ Impossible de générer le briefing."
         if len(output) > 2000:
             output = output[:1990] + "..."
@@ -1506,9 +1837,22 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
                     )
                     return
 
-            detected = detect_natural_reminder_datetime(prompt)
+            memory_match = _MEMORY_CAPTURE_RE.match(prompt)
+            if memory_match:
+                memory_text = memory_match.group(1).strip()
+                if memory_text:
+                    result = await add_memory_fact(memory_text)
+                    if result.get("success"):
+                        fact = result.get("fact", {})
+                        await message.reply(
+                            f"🧠 Souvenir enregistré (`{fact.get('id', '?')}`) : "
+                            f"{fact.get('text', memory_text)}"
+                        )
+                        return
+
+            detected = detect_natural_reminder_full(prompt)
             if detected:
-                remind_at, reminder_message = detected
+                remind_at, reminder_message, recurrence = detected
                 reminder = add_reminder(
                     platform="discord",
                     chat_id=message.channel.id,
@@ -1516,6 +1860,7 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
                     message=reminder_message,
                     remind_at=remind_at,
                     target_name=str(message.author),
+                    recurrence=recurrence,
                 )
                 logger.info(
                     "Rappel #%s créé (discord -> %s) : %s",
@@ -1568,6 +1913,101 @@ async def _send_discord_chunks(channel, text: str) -> None:
         await channel.send(text)
 
 
+class ReminderActionView(discord.ui.View):
+    """Boutons de report/clôture attachés à un rappel Discord."""
+
+    def __init__(self, reminder_id: int) -> None:
+        super().__init__(timeout=None)
+        self.reminder_id = reminder_id
+        for label, minutes in (("⏰ +10 min", 10), ("⏰ +1 h", 60)):
+            button = discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"reminder:snooze:{minutes}:{reminder_id}",
+            )
+            button.callback = self._make_snooze_callback(minutes)
+            self.add_item(button)
+        done = discord.ui.Button(
+            label="✅ Terminé",
+            style=discord.ButtonStyle.success,
+            custom_id=f"reminder:done:{reminder_id}",
+        )
+        done.callback = self._done_callback
+        self.add_item(done)
+
+    def _make_snooze_callback(self, minutes: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            reminder = snooze_reminder(
+                self.reminder_id, f"{minutes}m", chat_id=interaction.channel_id
+            )
+            if reminder is None:
+                await interaction.response.send_message(
+                    f"❌ Rappel #{self.reminder_id} introuvable ou déjà traité.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.edit_message(
+                content=(
+                    f"⏰ Rappel #{self.reminder_id} reporté.\n"
+                    f"{format_reminder_confirmation(reminder)}"
+                ),
+                view=None,
+            )
+
+        return callback
+
+    async def _done_callback(self, interaction: discord.Interaction) -> None:
+        reminder = complete_reminder(
+            self.reminder_id, chat_id=interaction.channel_id
+        )
+        if reminder is None:
+            await interaction.response.send_message(
+                f"❌ Rappel #{self.reminder_id} introuvable ou déjà traité.",
+                ephemeral=True,
+            )
+            return
+        if reminder.get("status") == "pending" and reminder.get("completed_occurrence"):
+            content = (
+                f"✅ Occurrence terminée.\n"
+                f"{format_reminder_confirmation(reminder)}"
+            )
+        else:
+            content = f"✅ Rappel #{self.reminder_id} terminé."
+        await interaction.response.edit_message(content=content, view=None)
+
+
+async def _send_discord_reminder_impl(
+    channel_id: int, reminder: dict
+) -> None:
+    """Envoie un rappel Discord avec ses boutons d'action."""
+    bot = _get_bot()
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        channel = await bot.fetch_channel(channel_id)
+    await channel.send(
+        format_reminder_notification(reminder),
+        view=ReminderActionView(int(reminder["id"])),
+    )
+
+
+async def send_discord_reminder(channel_id: int, reminder: dict) -> None:
+    """Envoie un rappel Discord dans la boucle du bot."""
+    loop = _DISCORD_LOOP
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if loop is not None and loop.is_running() and loop is not current_loop:
+        future = asyncio.run_coroutine_threadsafe(
+            _send_discord_reminder_impl(channel_id, reminder), loop
+        )
+        await asyncio.wrap_future(future)
+        return
+
+    await _send_discord_reminder_impl(channel_id, reminder)
+
+
 async def _send_discord_message_impl(channel_id: int, text: str) -> None:
     """Envoie un message dans un salon Discord précis, dans la boucle du bot."""
     bot = _get_bot()
@@ -1595,7 +2035,7 @@ async def send_discord_message_to_channel(channel_id: int, text: str) -> None:
     await _send_discord_message_impl(channel_id, text)
 
 
-async def _broadcast_discord_message_impl(text: str) -> None:
+async def _broadcast_discord_message_impl(text: str) -> bool:
     """Implémentation de la diffusion, exécutée dans la boucle du bot Discord."""
     bot = _get_bot()
 
@@ -1609,7 +2049,7 @@ async def _broadcast_discord_message_impl(text: str) -> None:
         try:
             if channel.permissions_for(channel.guild.me).send_messages:
                 await _send_discord_chunks(channel, text)
-                return
+                return True
         except Exception as exc:
             logger.warning(
                 "Erreur diffusion Discord sur le salon %s: %s", channel_id, exc
@@ -1624,14 +2064,16 @@ async def _broadcast_discord_message_impl(text: str) -> None:
             ):
                 try:
                     await _send_discord_chunks(channel, text)
+                    return True
                 except Exception as exc:
                     logger.warning(
                         "Erreur diffusion Discord sur %s: %s", channel.name, exc
                     )
                 break
+    return False
 
 
-async def broadcast_discord_message(text: str) -> None:
+async def broadcast_discord_message(text: str) -> bool:
     """Diffuse un message en respectant la boucle asyncio du bot Discord."""
     loop = _DISCORD_LOOP
     try:
@@ -1643,10 +2085,9 @@ async def broadcast_discord_message(text: str) -> None:
         future = asyncio.run_coroutine_threadsafe(
             _broadcast_discord_message_impl(text), loop
         )
-        await asyncio.wrap_future(future)
-        return
+        return await asyncio.wrap_future(future)
 
-    await _broadcast_discord_message_impl(text)
+    return await _broadcast_discord_message_impl(text)
 
 
 # ── Lancement en arrière-plan ─────────────────────────────────────────────────

@@ -280,3 +280,67 @@ async def delete_conversation_remote(conversation_id: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+async def _memory_request(
+    method: str,
+    path: str,
+    json_body: Optional[dict] = None,
+) -> dict:
+    """Appelle l'API mémoire du home-runner et normalise les erreurs."""
+    if not HOME_SERVER_URL:
+        return {"success": False, "error": "HOME_SERVER_URL non configuré"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.request(
+                method,
+                f"{HOME_SERVER_URL}{path}",
+                headers={"X-Secret-Key": SECRET_KEY},
+                json=json_body,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as exc:
+        detail = "Erreur mémoire"
+        try:
+            detail = exc.response.json().get("detail", detail)
+        except Exception:
+            pass
+        return {"success": False, "error": detail}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Erreur API mémoire (%s %s): %s", method, path, exc)
+        return {"success": False, "error": str(exc)}
+
+
+async def fetch_memory() -> dict:
+    """Récupère le profil et les souvenirs durables."""
+    return await _memory_request("GET", "/memory")
+
+
+async def add_memory_fact(text: str, tags: Optional[list[str]] = None) -> dict:
+    """Ajoute un souvenir durable."""
+    return await _memory_request(
+        "POST", "/memory/facts", {"text": text, "tags": tags or []}
+    )
+
+
+async def delete_memory_fact(fact_id: str) -> dict:
+    """Supprime un souvenir durable par son identifiant."""
+    return await _memory_request("DELETE", f"/memory/facts/{fact_id}")
+
+
+async def clear_memory_facts() -> dict:
+    """Supprime tous les souvenirs durables."""
+    return await _memory_request("DELETE", "/memory/facts")
+
+
+async def set_memory_profile(key: str, value: str) -> dict:
+    """Définit une préférence durable."""
+    return await _memory_request(
+        "POST", "/memory/profile", {"key": key, "value": value}
+    )
+
+
+async def delete_memory_profile(key: str) -> dict:
+    """Supprime une préférence durable."""
+    return await _memory_request("DELETE", f"/memory/profile/{key}")
+
+

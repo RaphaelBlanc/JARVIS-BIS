@@ -57,8 +57,20 @@ from reminders import (  # noqa: E402
     get_due_reminders,
     init_db,
     list_active_reminders,
+    mark_reminder_failure,
     mark_reminder_sent,
+    next_occurrence_after,
     parse_delay_or_time,
+    reschedule_reminder,
+)
+from stt import warmup_stt  # noqa: E402
+from briefing import (  # noqa: E402
+    BRIEFING_TIMEZONE,
+    build_briefing_prompt,
+    mark_platform_sent,
+    pending_platforms,
+    schedule_description,
+    should_send_now,
 )
 
 # ── Variables d'environnement ─────────────────────────────────────────────────
@@ -108,34 +120,75 @@ def require_secret(
 # ── Planificateur de briefing matinal ─────────────────────────────────────────
 
 async def morning_briefing_scheduler() -> None:
-    """Tâche de fond qui envoie automatiquement le briefing chaque matin à 08:00."""
-    logger.info("Planificateur de briefing matinal actif (08:00 chaque matin).")
-    last_sent_date = None
+    """Envoie le briefing matinal selon la configuration, plateforme par plateforme."""
+    logger.info(
+        "Planificateur de briefing matinal actif : %s.", schedule_description()
+    )
+    last_failed_attempt: Optional[datetime.datetime] = None
+
     while True:
         try:
-            now = datetime.datetime.now()
-            today_str = now.strftime("%Y-%m-%d")
-            # Déclenchement à 08h00 si pas encore envoyé aujourd'hui
-            if now.hour == 8 and now.minute < 5 and last_sent_date != today_str:
-                logger.info("Déclenchement automatique du briefing matinal pour le %s...", today_str)
-                from bots.telegram_bot import BRIEFING_PROMPT, send_broadcast_message
-                from bots.discord_bot import broadcast_discord_message
-                from gateway import forward_to_runner
+            now = datetime.datetime.now(BRIEFING_TIMEZONE)
+            today_key = now.strftime("%Y-%m-%d")
+            if should_send_now(now):
+                pending = pending_platforms(today_key)
+                if pending and (
+                    last_failed_attempt is None
+                    or (now - last_failed_attempt).total_seconds() >= 60
+                ):
+                    logger.info(
+                        "Déclenchement du briefing matinal %s (en attente : %s)...",
+                        today_key,
+                        ", ".join(pending),
+                    )
+                    from bots.telegram_bot import send_broadcast_message
+                    from bots.discord_bot import broadcast_discord_message
+                    from gateway import forward_to_runner
 
-                res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=240)
-                if res.get("success"):
+                    res = await forward_to_runner(
+                        build_briefing_prompt(),
+                        continue_session=False,
+                        timeout=240,
+                    )
                     briefing_text = res.get("output", "").strip()
-                    if briefing_text:
-                        # Diffusion Telegram
-                        await send_broadcast_message(briefing_text)
-                        # Diffusion Discord
-                        await broadcast_discord_message(briefing_text)
-                        last_sent_date = today_str
-                        logger.info("Briefing matinal automatique diffusé avec succès !")
+                    if not res.get("success") or not briefing_text:
+                        last_failed_attempt = now
+                        logger.error(
+                            "Briefing non généré : %s",
+                            res.get("error", "sortie vide"),
+                        )
+                    else:
+                        if "telegram" in pending:
+                            try:
+                                if await send_broadcast_message(briefing_text):
+                                    mark_platform_sent(today_key, "telegram")
+                                    logger.info("Briefing diffusé sur Telegram.")
+                                else:
+                                    last_failed_attempt = now
+                            except Exception as exc:
+                                last_failed_attempt = now
+                                logger.error("Erreur diffusion briefing Telegram: %s", exc)
+
+                        if "discord" in pending:
+                            try:
+                                if await broadcast_discord_message(briefing_text):
+                                    mark_platform_sent(today_key, "discord")
+                                    logger.info("Briefing diffusé sur Discord.")
+                                else:
+                                    last_failed_attempt = now
+                            except Exception as exc:
+                                last_failed_attempt = now
+                                logger.error("Erreur diffusion briefing Discord: %s", exc)
+
+                        if not pending_platforms(today_key):
+                            last_failed_attempt = None
+                            logger.info("Briefing matinal %s diffusé partout.", today_key)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.error("Erreur dans le planificateur de briefing matinal: %s", exc)
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
 
 # ── Planificateur de rappels ──────────────────────────────────────────────────
@@ -156,15 +209,15 @@ async def distribute_reminder(reminder: dict) -> None:
     )
 
     if platform == "telegram":
-        from bots.telegram_bot import send_telegram_message
+        from bots.telegram_bot import send_telegram_reminder
 
-        await send_telegram_message(chat_id, text)
+        await send_telegram_reminder(reminder)
         return
 
     if platform == "discord":
-        from bots.discord_bot import send_discord_message_to_channel
+        from bots.discord_bot import send_discord_reminder
 
-        await send_discord_message_to_channel(int(chat_id), text)
+        await send_discord_reminder(int(chat_id), reminder)
         return
 
     raise ValueError(f"Plateforme de rappel inconnue : {platform!r}")
@@ -173,18 +226,49 @@ async def distribute_reminder(reminder: dict) -> None:
 async def reminder_scheduler() -> None:
     """Tâche de fond qui distribue les rappels arrivés à échéance."""
     init_db()
-    logger.info("Planificateur de rappels actif (vérification toutes les 5s).")
+    logger.info(
+        "Planificateur de rappels actif (vérification toutes les 5s, récurrences et backoff)."
+    )
     while True:
         try:
             for reminder in get_due_reminders():
+                reminder_id = reminder.get("id")
                 try:
                     await distribute_reminder(reminder)
-                    mark_reminder_sent(reminder["id"])
+
+                    recurrence = reminder.get("recurrence")
+                    if recurrence:
+                        current = datetime.datetime.fromisoformat(
+                            reminder["remind_at"]
+                        )
+                        next_at = next_occurrence_after(
+                            current,
+                            recurrence,
+                            datetime.datetime.now(TIMEZONE),
+                        )
+                        if next_at is not None:
+                            reschedule_reminder(reminder_id, next_at)
+                            logger.info(
+                                "Rappel récurrent #%s reprogrammé pour %s.",
+                                reminder_id,
+                                next_at.strftime("%d/%m à %H:%M"),
+                            )
+                            continue
+
+                    mark_reminder_sent(reminder_id)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     logger.error(
                         "Erreur distribution rappel #%s: %s",
-                        reminder.get("id"),
+                        reminder_id,
                         exc,
+                    )
+                    retry_at = mark_reminder_failure(reminder_id, str(exc))
+                    logger.info(
+                        "Rappel #%s : nouvelle tentative à %s.",
+                        reminder_id,
+                        retry_at.strftime("%H:%M:%S"),
                     )
         except asyncio.CancelledError:
             raise
@@ -230,9 +314,10 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("TELEGRAM_TOKEN manquant — bot Telegram inactif.")
 
-    # Démarre les tâches de fond (briefing + rappels)
+    # Démarre les tâches de fond (briefing + rappels + préchauffage STT)
     scheduler_task = asyncio.create_task(morning_briefing_scheduler())
     reminder_task = asyncio.create_task(reminder_scheduler())
+    warmup_task = asyncio.create_task(warmup_stt())
 
     logger.info("render-gateway prêt à recevoir des requêtes.")
 
@@ -240,7 +325,7 @@ async def lifespan(app: FastAPI):
 
     # Arrêt
     logger.info("=== Arrêt du render-gateway ===")
-    for task in (scheduler_task, reminder_task):
+    for task in (scheduler_task, reminder_task, warmup_task):
         task.cancel()
         try:
             await task
@@ -294,6 +379,10 @@ class ReminderCreateRequest(BaseModel):
         default=None,
         description="Durée relative. Ex: 15m, 1h30, 2h",
     )
+    recurrence: Optional[str] = Field(
+        default=None,
+        description="Récurrence : daily, weekdays, weekly:0-6, monthly, every:days:N",
+    )
 
 
 def _parse_iso_datetime(value: str) -> datetime.datetime:
@@ -342,6 +431,7 @@ async def create_reminder(payload: ReminderCreateRequest) -> dict:
         message=payload.message,
         remind_at=remind_at,
         target_name=payload.target_name,
+        recurrence=payload.recurrence,
     )
     return {"success": True, "reminder": reminder}
 
