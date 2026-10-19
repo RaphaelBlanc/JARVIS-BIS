@@ -29,6 +29,7 @@ from agy_bridge import (
     find_agy,
     get_conversation_history,
     get_session_info,
+    get_token_usage,
     get_worker_info,
     list_recent_conversations,
     reset_session_async,
@@ -43,6 +44,7 @@ from memory import (
     delete_fact,
     delete_profile,
     get_memory,
+    memory_version,
     render_memory_prompt,
     set_profile,
 )
@@ -77,6 +79,44 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger("home-runner")
+
+# Version mémoire injectée dans la conversation courante. Elle évite de
+# répéter le bloc de contexte durable à chaque requête.
+_LAST_INJECTED_MEMORY_VERSION: str | None = None
+
+
+def _reset_memory_injection() -> None:
+    """Oublie la version mémoire injectée (nouvelle session)."""
+    global _LAST_INJECTED_MEMORY_VERSION
+    _LAST_INJECTED_MEMORY_VERSION = None
+
+
+def _should_inject_memory(version: str) -> bool:
+    """Injecte la mémoire au premier tour ou si son contenu a changé."""
+    return (
+        not get_session_info().get("has_active_session", False)
+        or version != _LAST_INJECTED_MEMORY_VERSION
+    )
+
+
+def _format_token_usage() -> str:
+    """Résumé lisible du suivi local des tokens pour /usage."""
+    stats = get_token_usage()
+    if stats.get("tokens_available"):
+        return (
+            "📊 Suivi local des tokens (aujourd'hui) :\n"
+            f"• Requêtes : {stats['requests']}\n"
+            f"• Entrée : {stats['input_tokens']} tokens\n"
+            f"• Sortie : {stats['output_tokens']} tokens"
+        )
+    return (
+        "📊 Suivi local (aujourd'hui) :\n"
+        f"• Requêtes : {stats['requests']}\n"
+        f"• Prompts : {stats['prompt_chars']} caractères\n"
+        f"• Réponses : {stats['output_chars']} caractères\n"
+        "• Tokens : non exposés par agy"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Application FastAPI
@@ -279,6 +319,13 @@ async def health():
     return payload
 
 
+@app.get("/usage/stats", summary="Suivi local des tokens")
+async def usage_stats(request: Request):
+    """Retourne le total quotidien des tokens et des tailles de prompts."""
+    _check_secret(request)
+    return {"success": True, "usage": get_token_usage()}
+
+
 @app.get("/models", summary="Liste des modèles disponibles")
 async def list_models(request: Request):
     """Retourne la liste des modèles Antigravity supportés et le modèle actif."""
@@ -311,6 +358,7 @@ async def session_reset(request: Request):
     """Oublie l'historique et démarre une session vierge."""
     _check_secret(request)
     res = await reset_session_async()
+    _reset_memory_injection()
     logger.info("Session conversationnelle réinitialisée.")
     return {"status": "reset", "session": res}
 
@@ -484,14 +532,25 @@ async def run(request: Request, body: RunRequest):
                 status_code=500, detail="Impossible d'enregistrer l'image."
             ) from exc
 
-    # Injecte la mémoire durable dans les prompts normaux. Les commandes slash
+    # Injecte la mémoire durable dans les prompts normaux, uniquement pour une
+    # nouvelle session ou lorsque son contenu a changé. Les commandes slash
     # d'agy ne doivent pas être préfixées par du contexte.
+    memory_version_value: str | None = None
     if not active_prompt.lstrip().startswith("/"):
-        memory_context = render_memory_prompt()
-        if memory_context:
-            active_prompt = f"{memory_context}\n\n{active_prompt}"
-            logger.info(
-                "Contexte mémoire injecté (%d caractères).", len(memory_context)
+        memory_version_value = memory_version()
+        if _should_inject_memory(memory_version_value):
+            memory_context = render_memory_prompt()
+            if memory_context:
+                active_prompt = f"{memory_context}\n\n{active_prompt}"
+                logger.info(
+                    "Contexte mémoire injecté (%d caractères, version=%s).",
+                    len(memory_context),
+                    memory_version_value,
+                )
+        else:
+            logger.debug(
+                "Mémoire inchangée (version=%s) : pas de réinjection.",
+                memory_version_value,
             )
 
     result = await run_agy(
@@ -507,10 +566,18 @@ async def run(request: Request, body: RunRequest):
 
     if not result["success"]:
         logger.warning("run_agy a échoué : %s", result.get("error"))
+    elif memory_version_value is not None:
+        # Mémorise la version effectivement injectée pour les tours suivants.
+        global _LAST_INJECTED_MEMORY_VERSION
+        _LAST_INJECTED_MEMORY_VERSION = memory_version_value
+
+    output = result["output"]
+    if result["success"] and body.prompt.strip() == "/usage":
+        output = f"{output}\n\n{_format_token_usage()}".strip()
 
     return RunResponse(
         success=result["success"],
-        output=result["output"],
+        output=output,
         error=result.get("error"),
         session=result.get("session"),
     )

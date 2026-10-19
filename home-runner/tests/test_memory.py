@@ -58,6 +58,36 @@ class TestMemoryStore(unittest.TestCase):
         self.assertLessEqual(len(prompt), 160)
         self.assertIn("mémoire tronquée", prompt)
 
+    def test_memory_version_changes(self):
+        before = memory.memory_version()
+        memory.add_fact("Nouveau souvenir")
+        after_fact = memory.memory_version()
+        self.assertNotEqual(before, after_fact)
+
+        memory.set_profile("ville", "Toulouse")
+        after_profile = memory.memory_version()
+        self.assertNotEqual(after_fact, after_profile)
+
+    def test_only_ten_most_recent_facts_are_injected(self):
+        with patch.object(memory, "MEMORY_PROMPT_MAX_FACTS", 10):
+            for index in range(12):
+                memory.add_fact(f"Souvenir {index}")
+            prompt = memory.render_memory_prompt(max_chars=10000)
+        self.assertNotIn("- Souvenir 0\n", prompt)
+        self.assertNotIn("- Souvenir 1\n", prompt)
+        self.assertIn("- Souvenir 2\n", prompt)
+        self.assertIn("- Souvenir 11\n", prompt)
+
+    def test_default_prompt_budget_is_1500_chars(self):
+        with patch.object(memory, "MEMORY_PROMPT_MAX_CHARS", 1500):
+            memory.set_profile("ville", "Toulouse")
+            for index in range(20):
+                memory.add_fact(f"Un souvenir assez long numéro {index} " + "x" * 100)
+            prompt = memory.render_memory_prompt()
+        self.assertLessEqual(len(prompt), 1500)
+        self.assertIn("ville : Toulouse", prompt)
+        self.assertIn("mémoire tronquée", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

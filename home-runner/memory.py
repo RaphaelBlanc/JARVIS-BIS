@@ -10,6 +10,7 @@ les préférences au-delà des conversations et des redémarrages.
 """
 
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -29,7 +30,10 @@ MEMORY_PATH = Path(
 MAX_FACTS = int(os.getenv("MEMORY_MAX_FACTS", "200"))
 MAX_FACT_LENGTH = int(os.getenv("MEMORY_MAX_FACT_LENGTH", "2000"))
 MAX_PROFILE_VALUE_LENGTH = int(os.getenv("MEMORY_MAX_PROFILE_VALUE_LENGTH", "1000"))
-MEMORY_PROMPT_MAX_CHARS = int(os.getenv("MEMORY_PROMPT_MAX_CHARS", "4000"))
+# Budget du bloc mémoire injecté dans les prompts : profil + 10 souvenirs récents.
+MEMORY_PROMPT_MAX_CHARS = int(os.getenv("MEMORY_PROMPT_MAX_CHARS", "1500"))
+MEMORY_PROMPT_MAX_FACTS = int(os.getenv("MEMORY_PROMPT_MAX_FACTS", "10"))
+TRUNCATION_MARKER = "\n[…mémoire tronquée]"
 
 _LOCK = threading.RLock()
 
@@ -102,6 +106,29 @@ def get_memory() -> Dict[str, Any]:
     """Retourne une copie de la mémoire complète."""
     data = load_memory()
     return {"profile": dict(data["profile"]), "facts": [dict(f) for f in data["facts"]]}
+
+
+def memory_version(data: Optional[Dict[str, Any]] = None) -> str:
+    """Retourne une empreinte stable de la mémoire (profil + souvenirs).
+
+    Elle permet de n'injecter le contexte durable que lorsque son contenu a
+    changé, plutôt qu'à chaque requête.
+    """
+    if data is None:
+        data = load_memory()
+    canonical = json.dumps(
+        {
+            "profile": data.get("profile", {}),
+            "facts": [
+                {"id": fact.get("id"), "text": fact.get("text")}
+                for fact in data.get("facts", [])
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def add_fact(text: str, tags: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -197,12 +224,20 @@ def render_memory_prompt(
         for key, value in sorted(data["profile"].items()):
             lines.append(f"- {key} : {value}")
     if data["facts"]:
+        # Les souvenirs sont ajoutés dans l'ordre chronologique : on ne garde
+        # que les plus récents pour respecter le budget de tokens.
+        recent_facts = (
+            data["facts"][-MEMORY_PROMPT_MAX_FACTS:]
+            if MEMORY_PROMPT_MAX_FACTS > 0
+            else data["facts"]
+        )
         lines.append("Souvenirs :")
-        for fact in data["facts"]:
+        for fact in recent_facts:
             lines.append(f"- {fact['text']}")
     lines.append("[Fin du contexte utilisateur durable]")
 
     text = "\n".join(lines)
     if limit > 0 and len(text) > limit:
-        text = text[: max(0, limit - 30)].rstrip() + "\n[…mémoire tronquée]"
+        keep = max(0, limit - len(TRUNCATION_MARKER))
+        text = text[:keep].rstrip() + TRUNCATION_MARKER
     return text

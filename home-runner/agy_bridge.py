@@ -68,7 +68,12 @@ SESSION_CONFIG = {
     "has_active_session": False,
     "conversation_id": None,
     "permission_mode": "always-proceed",  # always-proceed | request-review
+    "turns": 0,
 }
+
+# Compaction automatique : au-delà de N tours, le worker est arrêté et la
+# conversation repart d'un historique vierge. 0 désactive la fonctionnalité.
+AUTO_COMPACT_TURNS = int(os.getenv("AUTO_COMPACT_TURNS", "20"))
 
 KNOWN_MODELS = [
     {"id": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (Low)", "desc": "Ultra-rapide et direct (recommandé pour chat)"},
@@ -151,7 +156,150 @@ def reset_session() -> dict:
     """Réinitialise la session conversationnelle (démarre une nouvelle conversation vierge)."""
     SESSION_CONFIG["has_active_session"] = False
     SESSION_CONFIG["conversation_id"] = None
+    SESSION_CONFIG["turns"] = 0
     return dict(SESSION_CONFIG)
+
+
+# ── Suivi local des tokens ────────────────────────────────────────────────────
+
+_TOKEN_USAGE: dict = {
+    "date": "",
+    "requests": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "prompt_chars": 0,
+    "output_chars": 0,
+    "tokens_available": False,
+}
+
+
+def _first_int(source: dict, keys: tuple[str, ...]) -> Optional[int]:
+    """Retourne la première valeur entière exploitable parmi ``keys``."""
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
+
+
+def _extract_token_counts(result: Optional[dict]) -> Optional[tuple[int, int]]:
+    """Extrait (entrée, sortie) depuis les différentes formes d'événement agy."""
+    if not isinstance(result, dict):
+        return None
+
+    candidates = []
+    for key in ("usage", "usageMetadata", "token_usage", "tokens", "stats"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    candidates.append(result)
+
+    for source in candidates:
+        prompt_tokens = _first_int(
+            source,
+            (
+                "input_tokens",
+                "prompt_tokens",
+                "promptTokenCount",
+                "inputTokenCount",
+                "inputTokens",
+            ),
+        )
+        output_tokens = _first_int(
+            source,
+            (
+                "output_tokens",
+                "completion_tokens",
+                "candidatesTokenCount",
+                "outputTokenCount",
+                "outputTokens",
+            ),
+        )
+        if prompt_tokens is not None or output_tokens is not None:
+            return prompt_tokens or 0, output_tokens or 0
+    return None
+
+
+def record_token_usage(
+    prompt: str,
+    output: str,
+    result: Optional[dict] = None,
+) -> Optional[tuple[int, int]]:
+    """Enregistre les tokens (ou à défaut la taille) d'une requête agy."""
+    global _TOKEN_USAGE
+
+    today = datetime.date.today().isoformat()
+    if _TOKEN_USAGE["date"] != today:
+        _TOKEN_USAGE = {
+            "date": today,
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompt_chars": 0,
+            "output_chars": 0,
+            "tokens_available": False,
+        }
+
+    _TOKEN_USAGE["requests"] += 1
+    _TOKEN_USAGE["prompt_chars"] += len(prompt or "")
+    _TOKEN_USAGE["output_chars"] += len(output or "")
+
+    counts = _extract_token_counts(result)
+    if counts is not None:
+        input_tokens, output_tokens = counts
+        _TOKEN_USAGE["input_tokens"] += input_tokens
+        _TOKEN_USAGE["output_tokens"] += output_tokens
+        _TOKEN_USAGE["tokens_available"] = True
+        logger.info(
+            "Tokens requête — entrée=%d, sortie=%d.",
+            input_tokens,
+            output_tokens,
+        )
+        return counts
+
+    # `agy` n'expose pas toujours l'usage : on trace au moins les tailles.
+    logger.info(
+        "Usage tokens indisponible — prompt=%d caractères, réponse=%d caractères.",
+        len(prompt or ""),
+        len(output or ""),
+    )
+    return None
+
+
+def get_token_usage() -> dict:
+    """Retourne le total quotidien des tokens et des tailles de texte."""
+    return dict(_TOKEN_USAGE)
+
+
+def _note_turn() -> None:
+    """Compte un tour conversationnel réussi."""
+    SESSION_CONFIG["turns"] = int(SESSION_CONFIG.get("turns", 0)) + 1
+
+
+def _auto_compact_due() -> bool:
+    """Indique si le seuil de compaction automatique est atteint."""
+    return AUTO_COMPACT_TURNS > 0 and int(
+        SESSION_CONFIG.get("turns", 0)
+    ) >= AUTO_COMPACT_TURNS
+
+
+async def _maybe_auto_compact() -> bool:
+    """Réinitialise proprement la conversation si le seuil est atteint."""
+    if not _auto_compact_due():
+        return False
+    logger.info(
+        "Compaction automatique : %d tours atteints (seuil=%d), "
+        "réinitialisation de l'historique.",
+        SESSION_CONFIG.get("turns", 0),
+        AUTO_COMPACT_TURNS,
+    )
+    await _stop_worker()
+    reset_session()
+    return True
 
 
 def get_conversation_history(conv_id: str, max_turns: int = 15) -> list[dict]:
@@ -199,6 +347,7 @@ def resume_conversation(conv_id: str) -> dict:
     clean_id = conv_id.strip()
     SESSION_CONFIG["conversation_id"] = clean_id
     SESSION_CONFIG["has_active_session"] = True
+    SESSION_CONFIG["turns"] = 0
     history = get_conversation_history(clean_id)
     return {
         "session": dict(SESSION_CONFIG),
@@ -589,6 +738,8 @@ def get_worker_info() -> dict:
             round(time.monotonic() - worker.last_used, 1) if worker else None
         ),
         "idle_timeout": AGY_WORKER_IDLE_TIMEOUT,
+        "turns": SESSION_CONFIG.get("turns", 0),
+        "auto_compact_turns": AUTO_COMPACT_TURNS,
     }
 
 
@@ -760,6 +911,14 @@ async def _run_agy_oneshot(
         if success:
             if update_session:
                 SESSION_CONFIG["has_active_session"] = True
+                if prompt.lstrip().startswith("/"):
+                    # `/compact` remet le compteur à zéro ; les autres slash
+                    # commands ne comptent pas comme des tours de conversation.
+                    if prompt.strip().startswith("/compact"):
+                        SESSION_CONFIG["turns"] = 0
+                else:
+                    _note_turn()
+                    await _maybe_auto_compact()
             logger.info("agy terminé avec succès (code 0). Sortie : %d caractères.", len(out))
         else:
             logger.warning(
@@ -767,6 +926,8 @@ async def _run_agy_oneshot(
                 proc.returncode,
                 err or "(vide)",
             )
+
+        record_token_usage(prompt, out)
 
         return {
             "success": success,
@@ -950,6 +1111,8 @@ async def _run_agy_persistent(
         SESSION_CONFIG["has_active_session"] = True
         if worker.conversation_id:
             SESSION_CONFIG["conversation_id"] = worker.conversation_id
+        _note_turn()
+        await _maybe_auto_compact()
         logger.info(
             "agy (worker) terminé avec succès. Sortie : %d caractères.", len(output)
         )
@@ -959,6 +1122,8 @@ async def _run_agy_persistent(
             status or "?",
             error or "(sans détail)",
         )
+
+    record_token_usage(prompt, output, result)
 
     return {
         "success": success,
