@@ -285,6 +285,7 @@ class AssistantBot(commands.Bot):
             search_slash,
             summarize_slash,
             status_slash,
+            server_slash,
             compact_slash,
             setmodel_slash,
             effort_slash,

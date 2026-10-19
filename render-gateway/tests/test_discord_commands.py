@@ -43,6 +43,12 @@ class TestDiscordCommandNames(unittest.TestCase):
     def test_slash_and_prefix_have_parity(self):
         self.assertEqual(sorted(set(self.slash)), sorted(set(self.prefix)))
 
+    def test_server_slash_is_added_to_command_tree(self):
+        """Une commande définie mais non ajoutée au tree n'apparaît pas sur Discord."""
+        debut = self.source.index("for cmd in [")
+        fin = self.source.index("]:", debut)
+        self.assertIn("server_slash", self.source[debut:fin])
+
 
 if __name__ == "__main__":
     unittest.main()
