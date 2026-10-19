@@ -100,7 +100,7 @@ async def morning_briefing_scheduler() -> None:
                 from bots.discord_bot import broadcast_discord_message
                 from gateway import forward_to_runner
 
-                res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=120)
+                res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=240)
                 if res.get("success"):
                     briefing_text = res.get("output", "").strip()
                     if briefing_text:

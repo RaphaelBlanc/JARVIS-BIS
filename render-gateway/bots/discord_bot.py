@@ -8,10 +8,13 @@ qui transmet les questions au home-runner via `gateway.forward_to_runner()`.
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 import discord
@@ -24,6 +27,7 @@ from formatters import (
     latex_to_unicode,
     smart_split_discord,
 )
+from stt import transcribe_audio
 
 from gateway import (
     delete_conversation_remote,
@@ -55,6 +59,10 @@ ALLOW_ALL_USERS: bool = os.getenv("ALLOW_ALL_USERS", "").strip().lower() in {
     "1", "true", "yes", "on"
 }
 
+# Boucle asyncio du bot Discord (thread séparé). Utilisée par le planificateur
+# de briefing pour envoyer des messages sans conflit de boucle.
+_DISCORD_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -78,6 +86,61 @@ if not ALLOWED_USER_IDS and not ALLOW_ALL_USERS:
     )
 
 
+SAVED_DISCORD_CHANNELS_FILE = (
+    Path(__file__).resolve().parent.parent / "saved_discord_channels.json"
+)
+
+
+def _save_discord_channel_id(channel_id: int) -> None:
+    """Enregistre le salon Discord pour les diffusions automatiques."""
+    try:
+        channels = set()
+        if SAVED_DISCORD_CHANNELS_FILE.exists():
+            with open(SAVED_DISCORD_CHANNELS_FILE, "r", encoding="utf-8") as f:
+                channels = set(json.load(f))
+        channels.add(channel_id)
+        with open(SAVED_DISCORD_CHANNELS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(channels), f)
+    except Exception as exc:
+        logger.warning("Erreur sauvegarde salon Discord %s: %s", channel_id, exc)
+
+
+def get_saved_discord_channel_ids() -> list[int]:
+    """Retourne les salons Discord enregistrés pour les diffusions."""
+    if not SAVED_DISCORD_CHANNELS_FILE.exists():
+        return []
+    try:
+        with open(SAVED_DISCORD_CHANNELS_FILE, "r", encoding="utf-8") as f:
+            return [int(cid) for cid in json.load(f)]
+    except Exception:
+        return []
+
+
+async def _transcribe_audio_attachment(
+    attachment: discord.Attachment,
+) -> Optional[str]:
+    """Télécharge une pièce jointe audio Discord et la transcrit en texte."""
+    suffix = Path(attachment.filename or "voice.ogg").suffix or ".ogg"
+    raw_bytes = await attachment.read()
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(raw_bytes)
+        temp_path = Path(tmp.name)
+
+    try:
+        text, engine = await transcribe_audio(temp_path)
+        if text:
+            logger.info(
+                "Message vocal Discord transcrit (%s) : '%s'", engine, text[:200]
+            )
+        return text
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 # ── Bot Discord ───────────────────────────────────────────────────────────────
 
 
@@ -94,6 +157,9 @@ class AssistantBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         """Enregistre l'ensemble des commandes slash avec autocomplétion."""
+        global _DISCORD_LOOP
+        _DISCORD_LOOP = asyncio.get_running_loop()
+
         for cmd in [
             briefing_slash,
             ask_slash,
@@ -292,10 +358,10 @@ async def briefing_slash(interaction: discord.Interaction) -> None:
     await send_discord_long_response(interaction, response_text, title="🌅 Votre Briefing Matinal")
 
 
-@app_commands.command(name="ask", description="Pose une question à l'assistant personnel (supporte texte et image)")
+@app_commands.command(name="ask", description="Pose une question à l'assistant personnel (supporte texte, image et audio)")
 @app_commands.describe(
     question="Votre question ou tâche pour l'assistant",
-    image="Image optionnelle à analyser (schéma, capture, photo, exercice)",
+    image="Image ou fichier audio optionnel à analyser",
 )
 async def ask_slash(
     interaction: discord.Interaction,
@@ -313,12 +379,25 @@ async def ask_slash(
     img_b64 = None
     img_name = None
     if image:
-        try:
-            raw_bytes = await image.read()
-            img_b64 = base64.b64encode(raw_bytes).decode("utf-8")
-            img_name = image.filename
-        except Exception as exc:
-            logger.warning("Erreur lecture pièce jointe /ask: %s", exc)
+        content_type = image.content_type or ""
+        if content_type.startswith("audio/"):
+            transcript = await _transcribe_audio_attachment(image)
+            if transcript:
+                question = (
+                    f"{question}\n\n[Transcription du message vocal: {transcript}]"
+                )
+            else:
+                await interaction.edit_original_response(
+                    content="❌ Je n'ai pas réussi à transcrire ce fichier audio."
+                )
+                return
+        else:
+            try:
+                raw_bytes = await image.read()
+                img_b64 = base64.b64encode(raw_bytes).decode("utf-8")
+                img_name = image.filename
+            except Exception as exc:
+                logger.warning("Erreur lecture pièce jointe /ask: %s", exc)
 
     result = await forward_to_runner(
         question,
@@ -833,14 +912,21 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         img_name = None
         if ctx.message.attachments:
             for att in ctx.message.attachments:
-                if att.content_type and att.content_type.startswith("image/"):
+                content_type = att.content_type or ""
+                if content_type.startswith("image/") and img_b64 is None:
                     try:
                         raw_bytes = await att.read()
                         img_b64 = base64.b64encode(raw_bytes).decode("utf-8")
                         img_name = att.filename
-                        break
                     except Exception as exc:
                         logger.warning("Erreur lecture image !ask: %s", exc)
+                elif content_type.startswith("audio/"):
+                    transcript = await _transcribe_audio_attachment(att)
+                    if transcript:
+                        question = (
+                            f"{question}\n\n[Transcription du message vocal: {transcript}]"
+                        )
+                    break
 
         waiting_msg = await ctx.send("⏳ Traitement en cours..." if not img_b64 else "👁️ Analyse de votre image en cours...")
         result = await forward_to_runner(
@@ -1221,27 +1307,47 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         if not _is_allowed(message.author.id):
             return
 
+        _save_discord_channel_id(message.channel.id)
+
         img_b64 = None
         img_name = None
+        audio_attachment = None
         if message.attachments:
             for att in message.attachments:
-                if att.content_type and att.content_type.startswith("image/"):
+                content_type = att.content_type or ""
+                if content_type.startswith("image/") and img_b64 is None:
                     try:
                         raw_bytes = await att.read()
                         img_b64 = base64.b64encode(raw_bytes).decode("utf-8")
                         img_name = att.filename
-                        break
                     except Exception as e:
                         logger.warning("Erreur lecture pièce jointe on_message: %s", e)
+                elif content_type.startswith("audio/") and audio_attachment is None:
+                    audio_attachment = att
 
         prompt = message.content.strip()
         if not prompt and img_b64:
             prompt = "Analyse cette image en détail et décris ce qu'elle contient ou réponds aux éléments visibles."
 
-        if not prompt and not img_b64:
+        if not prompt and not img_b64 and audio_attachment is None:
             return
 
         async with message.channel.typing():
+            transcript_prefix = ""
+            if audio_attachment is not None:
+                transcript = await _transcribe_audio_attachment(audio_attachment)
+                if transcript:
+                    transcript_prefix = f"🎤 **Transcription :** {transcript}\n\n"
+                    prompt = (
+                        f"{prompt}\n\n{transcript}".strip() if prompt else transcript
+                    )
+                elif not prompt and not img_b64:
+                    await message.reply(
+                        "❌ Je n'ai pas réussi à transcrire ce message vocal. "
+                        "Réessayez ou envoyez-le en texte."
+                    )
+                    return
+
             res = await forward_to_runner(
                 prompt,
                 continue_session=True,
@@ -1252,6 +1358,9 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
                 out = res.get("output", "").strip() or "✅ Tâche terminée."
             else:
                 out = f"❌ Erreur : {res.get('error', 'Le serveur maison n\'a pas répondu.')}"
+
+            if transcript_prefix:
+                out = transcript_prefix + out
 
             processed_text, rendered_images = await extract_and_render_latex(out, dark_mode=True)
             code_snippets = extract_downloadable_code(out, min_chars=700)
@@ -1272,22 +1381,67 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
                     await message.channel.send(p)
 
 
-async def broadcast_discord_message(text: str) -> None:
-    """Diffuse un message (ex: briefing automatique) sur le salon principal de chaque serveur."""
+async def _send_discord_chunks(channel, text: str) -> None:
+    """Envoie un texte en respectant la limite de 2000 caractères de Discord."""
+    if len(text) > 1950:
+        for i in range(0, len(text), 1900):
+            await channel.send(text[i:i + 1900])
+    else:
+        await channel.send(text)
+
+
+async def _broadcast_discord_message_impl(text: str) -> None:
+    """Implémentation de la diffusion, exécutée dans la boucle du bot Discord."""
     bot = _get_bot()
+
+    for channel_id in get_saved_discord_channel_ids():
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except Exception:
+                continue
+        try:
+            if channel.permissions_for(channel.guild.me).send_messages:
+                await _send_discord_chunks(channel, text)
+                return
+        except Exception as exc:
+            logger.warning(
+                "Erreur diffusion Discord sur le salon %s: %s", channel_id, exc
+            )
+
+    # Repli : recherche par nom de salon.
     for guild in bot.guilds:
         for channel in guild.text_channels:
-            if channel.name in ("général", "general", "bot", "assistant") and channel.permissions_for(guild.me).send_messages:
+            if (
+                channel.name in ("général", "general", "bot", "assistant")
+                and channel.permissions_for(guild.me).send_messages
+            ):
                 try:
-                    if len(text) > 1950:
-                        parts = [text[i:i + 1900] for i in range(0, len(text), 1900)]
-                        for p in parts:
-                            await channel.send(p)
-                    else:
-                        await channel.send(text)
+                    await _send_discord_chunks(channel, text)
                 except Exception as exc:
-                    logger.warning("Erreur diffusion Discord sur %s: %s", channel.name, exc)
+                    logger.warning(
+                        "Erreur diffusion Discord sur %s: %s", channel.name, exc
+                    )
                 break
+
+
+async def broadcast_discord_message(text: str) -> None:
+    """Diffuse un message en respectant la boucle asyncio du bot Discord."""
+    loop = _DISCORD_LOOP
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if loop is not None and loop.is_running() and loop is not current_loop:
+        future = asyncio.run_coroutine_threadsafe(
+            _broadcast_discord_message_impl(text), loop
+        )
+        await asyncio.wrap_future(future)
+        return
+
+    await _broadcast_discord_message_impl(text)
 
 
 # ── Lancement en arrière-plan ─────────────────────────────────────────────────

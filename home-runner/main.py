@@ -70,9 +70,30 @@ logger = logging.getLogger("home-runner")
 # ---------------------------------------------------------------------------
 
 
+def _cleanup_old_uploads(max_age_seconds: int = 7 * 24 * 3600) -> None:
+    """Supprime les images envoyées il y a plus de 7 jours."""
+    upload_dir = Path("/tmp/assistant_uploads")
+    if not upload_dir.exists():
+        return
+
+    now = time.time()
+    removed = 0
+    for item in upload_dir.iterdir():
+        try:
+            if item.is_file() and now - item.stat().st_mtime > max_age_seconds:
+                item.unlink()
+                removed += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Impossible de nettoyer %s: %s", item, exc)
+
+    if removed:
+        logger.info("%d ancienne(s) image(s) supprimée(s) de %s.", removed, upload_dir)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Arrête proprement le worker agy persistant lors de l'arrêt du service."""
+    _cleanup_old_uploads()
     yield
     await shutdown_agy_worker()
 

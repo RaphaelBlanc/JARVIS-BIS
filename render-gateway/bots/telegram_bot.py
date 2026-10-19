@@ -25,6 +25,7 @@ from formatters import (
     extract_downloadable_code,
     latex_to_unicode,
 )
+from stt import transcribe_audio
 
 
 from fastapi import APIRouter, Request, Response
@@ -99,6 +100,10 @@ ALLOW_ALL_USERS: bool = os.getenv("ALLOW_ALL_USERS", "").strip().lower() in {
 
 # Singleton Application (initialisé via get_application())
 _application: Optional[Application] = None
+
+# Boucle asyncio du polling Telegram (thread séparé). Utilisée par le
+# planificateur de briefing pour diffuser sans conflit de boucle.
+_TELEGRAM_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -403,6 +408,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/status` — État complet du système et des services\n\n"
         "💬 *Discussion & Mémoire*\n"
         "• Écrivez simplement votre message pour échanger naturellement.\n"
+        "• 🎤 Envoyez un message vocal : il est transcrit puis traité automatiquement.\n"
+        "• 👁️ Envoyez une photo : elle est analysée directement.\n"
         "• Vos messages s'enchaînent avec mémoire du contexte !\n"
         "• `/new` — Démarre une nouvelle conversation vierge\n"
         "• `/compact` — Compacte la mémoire de la conversation en cours\n"
@@ -1216,8 +1223,8 @@ def get_saved_chat_ids() -> list[int]:
     return []
 
 
-async def send_broadcast_message(text: str) -> None:
-    """Envoie un message formaté en HTML à tous les utilisateurs Telegram enregistrés."""
+async def _send_broadcast_message_impl(text: str) -> None:
+    """Implémentation de la diffusion, exécutée dans la boucle du bot Telegram."""
     app = get_application()
     html_text = markdown_to_telegram_html(text)
     chunks = split_telegram_message(html_text)
@@ -1233,6 +1240,24 @@ async def send_broadcast_message(text: str) -> None:
                     pass
 
 
+async def send_broadcast_message(text: str) -> None:
+    """Diffuse un message en respectant la boucle asyncio du bot Telegram."""
+    loop = _TELEGRAM_LOOP
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if loop is not None and loop.is_running() and loop is not current_loop:
+        future = asyncio.run_coroutine_threadsafe(
+            _send_broadcast_message_impl(text), loop
+        )
+        await asyncio.wrap_future(future)
+        return
+
+    await _send_broadcast_message_impl(text)
+
+
 async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Génère le briefing matinal complet (tri des e-mails, agenda, météo)."""
     user = update.effective_user
@@ -1245,6 +1270,20 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     res = await forward_to_runner(BRIEFING_PROMPT, continue_session=False, timeout=240)
     output = res.get("output", "").strip() or "⚠️ Impossible de générer le briefing matinal."
     await send_or_edit_telegram_response(waiting_msg, output, update.message)
+
+
+async def _process_prompt_and_reply(update: Update, prompt: str, waiting_msg) -> None:
+    """Envoie un prompt au runner et édite le message d'attente avec la réponse."""
+    result = await forward_to_runner(prompt, continue_session=True)
+
+    if result.get("success"):
+        response_text = result.get("output", "").strip() or "✅ Tâche terminée (pas de sortie)."
+    else:
+        error = result.get("error", "Erreur inconnue")
+        response_text = f"❌ Erreur : {error}"
+        logger.error("Erreur retournée par le runner: %s", error)
+
+    await send_or_edit_telegram_response(waiting_msg, response_text, update.message)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1269,17 +1308,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     waiting_msg = await update.message.reply_text("⏳ Traitement en cours...")
 
     # Exécution avec continuité de session activée (multi-turn)
-    result = await forward_to_runner(prompt, continue_session=True)
-
-    if result.get("success"):
-        response_text = result.get("output", "").strip() or "✅ Tâche terminée (pas de sortie)."
-    else:
-        error = result.get("error", "Erreur inconnue")
-        response_text = f"❌ Erreur : {error}"
-        logger.error("Erreur retournée par le runner: %s", error)
-
-    # Édite le message "en cours" avec la réponse magnifiquement formatée en HTML
-    await send_or_edit_telegram_response(waiting_msg, response_text, update.message)
+    await _process_prompt_and_reply(update, prompt, waiting_msg)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1334,6 +1363,57 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.error("Erreur traitement image Telegram: %s", exc)
         await waiting_msg.edit_text(f"❌ Erreur lors du traitement de l'image : {exc}")
 
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Transcrit un message vocal/audio Telegram puis le traite comme un texte."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        logger.warning("Message vocal refusé de l'utilisateur Telegram %d.", user.id)
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    chat_id = update.effective_chat.id
+    _save_chat_id(chat_id)
+    track_chat_message(chat_id, update.message.message_id)
+
+    media = update.message.voice or update.message.audio
+    if media is None:
+        return
+
+    waiting_msg = await update.message.reply_text("🎤 Transcription en cours...")
+    temp_path = Path(f"/tmp/telegram_voice_{secrets.token_hex(8)}.ogg")
+
+    try:
+        tg_file = await media.get_file()
+        await tg_file.download_to_drive(custom_path=str(temp_path))
+        text, engine = await transcribe_audio(temp_path)
+
+        if not text:
+            await waiting_msg.edit_text(
+                "❌ Je n'ai pas réussi à transcrire ce message vocal. "
+                "Réessayez ou envoyez-le en texte."
+            )
+            return
+
+        logger.info(
+            "Message vocal Telegram transcrit (%s) : '%s'", engine, text[:200]
+        )
+        await waiting_msg.edit_text(f"🎤 « {text} »\n\n⏳ Traitement en cours...")
+        await _process_prompt_and_reply(update, text, waiting_msg)
+
+    except Exception as exc:
+        logger.error("Erreur traitement vocal Telegram: %s", exc)
+        try:
+            await waiting_msg.edit_text(
+                f"❌ Erreur lors du traitement du message vocal : {exc}"
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 from telegram.request import HTTPXRequest
@@ -1425,6 +1505,9 @@ def get_application() -> Application:
     # Handler images et photos
     app.add_handler(MessageHandler(filters.PHOTO | (filters.Document.IMAGE), handle_photo))
 
+    # Handler messages vocaux et fichiers audio
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+
     _application = app
     logger.info("Application Telegram configurée avec l'ensemble des commandes et boutons interactifs.")
     return _application
@@ -1472,6 +1555,8 @@ def start_telegram_polling() -> None:
         app = get_application()
 
         async def _async_polling():
+            global _TELEGRAM_LOOP
+            _TELEGRAM_LOOP = asyncio.get_running_loop()
             await app.initialize()
             # Supprime le webhook existant pour permettre le polling
             await app.bot.delete_webhook(drop_pending_updates=True)

@@ -5,3 +5,4 @@ python-dotenv==1.0.1
 python-telegram-bot==21.6
 discord.py==2.4.0
 audioop-lts>=0.2.1; python_version >= '3.13'
+faster-whisper==1.2.1
