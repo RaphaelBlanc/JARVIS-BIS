@@ -10,6 +10,7 @@ Lance le gateway qui:
 
 import asyncio
 import datetime
+import hmac
 import logging
 import os
 import sys
@@ -17,7 +18,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 # Charge les variables d'environnement depuis .env (si présent)
@@ -92,6 +93,16 @@ def _check_env() -> None:
         )
     else:
         logger.info("Toutes les variables d'environnement critiques sont configurées.")
+
+
+def require_secret(
+    x_secret_key: Optional[str] = Header(default=None, alias="X-Secret-Key"),
+) -> None:
+    """Protège l'API des rappels par la clé partagée du gateway."""
+    if not SECRET_KEY or not x_secret_key or not hmac.compare_digest(
+        x_secret_key, SECRET_KEY
+    ):
+        raise HTTPException(status_code=401, detail="Clé API invalide")
 
 
 # ── Planificateur de briefing matinal ─────────────────────────────────────────
@@ -294,7 +305,12 @@ def _parse_iso_datetime(value: str) -> datetime.datetime:
     return parsed
 
 
-@app.post("/api/reminders", tags=["reminders"], summary="Créer un rappel")
+@app.post(
+    "/api/reminders",
+    tags=["reminders"],
+    summary="Créer un rappel",
+    dependencies=[Depends(require_secret)],
+)
 async def create_reminder(payload: ReminderCreateRequest) -> dict:
     """Crée un rappel persistant pour Telegram ou Discord."""
     platform = payload.platform.strip().lower()
@@ -330,7 +346,12 @@ async def create_reminder(payload: ReminderCreateRequest) -> dict:
     return {"success": True, "reminder": reminder}
 
 
-@app.get("/api/reminders", tags=["reminders"], summary="Lister les rappels actifs")
+@app.get(
+    "/api/reminders",
+    tags=["reminders"],
+    summary="Lister les rappels actifs",
+    dependencies=[Depends(require_secret)],
+)
 async def get_reminders(
     chat_id: Optional[str] = None,
     platform: Optional[str] = None,
@@ -343,7 +364,12 @@ async def get_reminders(
     return {"reminders": reminders, "count": len(reminders)}
 
 
-@app.delete("/api/reminders/{reminder_id}", tags=["reminders"], summary="Annuler un rappel")
+@app.delete(
+    "/api/reminders/{reminder_id}",
+    tags=["reminders"],
+    summary="Annuler un rappel",
+    dependencies=[Depends(require_secret)],
+)
 async def delete_reminder(
     reminder_id: int,
     chat_id: Optional[str] = None,
@@ -358,6 +384,7 @@ async def delete_reminder(
     "/api/reminders/{reminder_id}/cancel",
     tags=["reminders"],
     summary="Annuler un rappel (alias)",
+    dependencies=[Depends(require_secret)],
 )
 async def cancel_reminder_endpoint(
     reminder_id: int,
