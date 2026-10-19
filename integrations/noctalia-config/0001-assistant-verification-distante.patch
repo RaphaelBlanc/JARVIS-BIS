@@ -1,0 +1,589 @@
+From 16e596e9322786766cadb775fbb5e5a0011cd24e Mon Sep 17 00:00:00 2001
+From: RaphaelBlanc <raphael.blanc-alcaix@epita.fr>
+Date: Mon, 19 Oct 2026 17:15:11 +0200
+Subject: [PATCH] =?UTF-8?q?feat(assistant):=20diagnostique=20et=20configur?=
+ =?UTF-8?q?e=20l'acc=C3=A8s=20depuis=20un=20autre=20r=C3=A9seau?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- nc-assistant verifier (réseau, clé, TLS, runner) et --json
+- avertissement explicite pour les URL locales/privées
+- messages d'erreur distincts (401, 404, DNS, TLS, timeout)
+- entrée « Tester l'assistant distant » dans nc-reglages
+- documentation et tests
+---
+ README.md                    |   5 ++
+ docs/assistant-distant.md    |  34 ++++++++
+ home/.local/bin/nc-aide      |   6 +-
+ home/.local/bin/nc-assistant | 150 +++++++++++++++++++++++++++++++++--
+ home/.local/bin/nc-reglages  |  53 ++++++++++---
+ tests/test_assistant.py      |  82 +++++++++++++++++++
+ 6 files changed, 314 insertions(+), 16 deletions(-)
+
+diff --git a/README.md b/README.md
+index 5c09bb7..d881d6a 100644
+--- a/README.md
++++ b/README.md
+@@ -206,6 +206,11 @@ prises en charge (Arch et dérivées, Fedora/Nobara, Debian/Ubuntu, openSUSE). L
+ et la clé de ton serveur, puis ouvre le chat avec **Super + Alt + A**. Aucun modèle ne tourne sur le PC.
+ Il fonctionne aussi sans Quickshell ; l'île affiche son activité quand elle est disponible.
+ 
++Depuis un autre réseau que celui du serveur, une URL `192.168.x.x` ou `*.local` ne suffit pas : expose le gateway
++avec un tunnel HTTPS côté serveur (Cloudflare Tunnel, Tailscale ou Render), puis configure cette URL publique.
++`nc-assistant verifier` (ou **nc-reglages → Agents IA → Tester l'assistant distant**) diagnostique réseau, clé,
++certificat TLS et état du runner.
++
+ Ces fichiers sont à toi : `install.sh` ne les remplace jamais.
+ 
+ | Fichier | Pour |
+diff --git a/docs/assistant-distant.md b/docs/assistant-distant.md
+index c08bbcc..c1a2248 100644
+--- a/docs/assistant-distant.md
++++ b/docs/assistant-distant.md
+@@ -35,6 +35,39 @@ Ni `nc-assistant etat`, ni `etat --local` n'affichent la clé. `etat --local` co
+ Les redirections HTTP sont refusées pour éviter de transmettre la clé à une autre adresse : configurer l'URL finale.
+ Pour accéder au serveur à travers Internet, utiliser son accès HTTPS ; le certificat est vérifié par Python.
+ 
++## Depuis un autre réseau (Wi-Fi différent, Internet)
++
++Une URL du type `http://192.168.1.28:8000` ou `http://mon-pi.local:8000` est
++une adresse **privée** : elle ne fonctionne que sur le réseau local du serveur.
++Depuis un autre réseau, le client ne peut pas la joindre, même avec la bonne
++clé. Il faut exposer le gateway (port `8000`) avec un tunnel côté serveur :
++
++- **Cloudflare Tunnel** : URL HTTPS publique, aucun port à ouvrir ;
++- **Tailscale** : URL HTTPS privée, visible seulement par tes appareils ;
++- **Render** : gateway hébergé, relié au runner par un tunnel.
++
++Le dépôt du serveur fournit `scripts/expose-gateway.sh` et le guide
++`docs/ACCES_DISTANT.md`. Une fois l'URL HTTPS obtenue sur le serveur :
++
++```bash
++nc-assistant configurer
++# URL     : https://assistant.tondomaine.fr
++# Clé     : la SECRET_KEY du serveur
++# USER_ID : ton identifiant
++nc-assistant verifier
++nc-assistant demander "Bonjour"
++```
++
++`nc-assistant verifier` teste `/api/status` et distingue : URL privée, clé
++refusée (401/403), route introuvable (404), certificat TLS invalide, DNS
++introuvable, connexion refusée, délai dépassé, runner hors ligne. Il affiche
++aussi la latence et l'URL publique annoncée par le serveur. Aucune clé n'est
++affichée.
++
++`nc-settings` → **Agents IA (coucou)** contient désormais deux entrées :
++« Configurer l'assistant distant » et « Tester l'assistant distant ».
++En ligne de commande : `nc-settings assistant verifier`.
++
+ ## Utilisation
+ 
+ | Accès | Comportement |
+@@ -45,6 +78,7 @@ Pour accéder au serveur à travers Internet, utiliser son accès HTTPS ; le cer
+ | `nc-assistant ouvrir` | Même fenêtre, depuis une commande |
+ | `nc-assistant chat` | Chat dans le terminal courant ; `exit`, `Ctrl+C` ou fin d'entrée pour quitter |
+ | `nc-assistant demander "question"` | Réponse en texte ; code de sortie non nul en cas d'échec |
++| `nc-assistant verifier` | Teste URL, clé, TLS et runner ; `--json` pour un script |
+ | `nc-assistant briefing` | Texte du briefing et notification si disponible |
+ | `nc-reglages set SPOTLIGHT_IA assistant` | Sélection explicite pour les questions `?` dans Spotlight Quickshell |
+ | `nc-reglages set ASSISTANT_ILE non` | Désactive l'affichage de son activité dans Coucou |
+diff --git a/home/.local/bin/nc-aide b/home/.local/bin/nc-aide
+index fe3206d..d822c94 100755
+--- a/home/.local/bin/nc-aide
++++ b/home/.local/bin/nc-aide
+@@ -61,7 +61,8 @@ A_TAPER = [
+     ("nc-demander", "nc-demander \"comment voir la place libre\"", "Question rapide à une IA installée (Claude, opencode, Gemini, Qwen) ; "
+                                     "dans le Spotlight : « ? ta question »."),
+     ("nc-assistant", "nc-assistant configurer", "Assistant personnel distant : URL et clé du serveur, chat kitty "
+-                                           "(Super + Alt + A), questions, briefing ; aucun modèle local."),
++                                           "(Super + Alt + A), questions, briefing ; nc-assistant verifier teste la connexion "
++                                           "(réseau, clé, TLS, runner) ; aucun modèle local."),
+     ("nc-claude", "nc-claude etat", "Claude Code dans l'île (comme coucou) : ce qu'il fait, quand il a fini, ses "
+                                     "demandes, et lui écrire depuis l'île. Aussi opencode, Codex, Gemini CLI, Cursor, Copilot, Qwen, Kiro, Amp, "
+                                     "Antigravity : nc-claude installer IA (ou tout) ; nc-claude diag si rien ne s'affiche."),
+@@ -118,7 +119,8 @@ NOMS_ANGLAIS = {
+ # En anglais : (exemple, explication), par nom français
+ ANGLAIS = {
+     "nc-assistant": ("nc-assistant configurer", "Remote personal assistant: server URL and key, kitty chat "
+-                     "(Super + Alt + A), questions, daily briefing; no local model."),
++                     "(Super + Alt + A), questions, daily briefing; nc-assistant verifier tests the connection "
++                     "(network, key, TLS, runner); no local model."),
+     "nc-reglages": ("nc-settings", "Every setting, with the arrow keys: island, appearance, animations, power, keyboard, "
+                                    "sleep, terminal, shortcuts… Kept across updates."),
+     "nc-raccourci": ("nc-shortcut", "Your keyboard shortcuts: change keys, disable some, add new ones."),
+diff --git a/home/.local/bin/nc-assistant b/home/.local/bin/nc-assistant
+index ece3f20..b230a65 100755
+--- a/home/.local/bin/nc-assistant
++++ b/home/.local/bin/nc-assistant
+@@ -6,10 +6,13 @@
+   nc-assistant chat [question]      chat dans le terminal courant
+   nc-assistant demander "question"  une réponse ; --flux : lignes JSON pour Spotlight
+   nc-assistant briefing            briefing et notification
++  nc-assistant verifier            test réseau + diagnostic ; --json
+   nc-assistant etat                état JSON ; --local : configuration seule, sans réseau
+ 
+ Configuration personnelle : ~/.config/nc/assistant.conf (0600), jamais exportée.
+ Le serveur est installé séparément. Aucune connexion ni scrutation en arrière-plan.
++Une URL 192.168.x.x / 10.x / *.local ne fonctionne que sur le réseau local ;
++pour un autre réseau, configure l'URL HTTPS d'un tunnel côté serveur.
+ """
+ import argparse
+ import contextlib
+@@ -18,6 +21,7 @@ import getpass
+ import hashlib
+ import html
+ import http.client
++import ipaddress
+ import json
+ import math
+ import os
+@@ -25,9 +29,11 @@ from pathlib import Path
+ import re
+ import signal
+ import socket
++import ssl
+ import subprocess
+ import sys
+ import tempfile
++import time
+ import urllib.error
+ import urllib.parse
+ import urllib.request
+@@ -41,9 +47,12 @@ DOC_EN = """Remote assistant client (Python standard library only).
+   nc-assistant chat [question]      chat in the current terminal
+   nc-assistant demander "question"  print an answer; --flux: JSON lines for Spotlight
+   nc-assistant briefing            daily briefing and notification
++  nc-assistant verifier            network test + diagnostic; --json
+   nc-assistant etat                JSON status; --local: configuration only, no network
+ Personal configuration: ~/.config/nc/assistant.conf (0600), never exported.
+ The server is installed separately. No background polling or local model.
++A 192.168.x.x / 10.x / *.local URL only works on the server's local network;
++for any other network, configure the HTTPS URL of a tunnel on the server side.
+ """
+ 
+ 
+@@ -96,6 +105,20 @@ def valider(c):
+     return dict(URL=url, SECRET_KEY=c["SECRET_KEY"], USER_ID=ident, TIMEOUT=timeout)
+ 
+ 
++def hote_prive(url):
++    """Vrai si l'hôte n'est joignable que depuis le réseau local du serveur."""
++    h = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
++    if not h:
++        return False
++    if h == "localhost" or h.endswith(".local") or h.endswith(".lan") or h.endswith(".home.arpa"):
++        return True
++    try:
++        ip = ipaddress.ip_address(h)
++    except ValueError:
++        return False
++    return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved)
++
++
+ def configuration():
+     try:
+         if CONF.stat().st_mode & 0o077:
+@@ -158,6 +181,18 @@ def configurer():
+     sauvegarder(dict(URL=url or c.get("URL", ""), SECRET_KEY=cle or c.get("SECRET_KEY", ""),
+                      USER_ID=utilisateur, TIMEOUT=c.get("TIMEOUT", "180")))
+     print(T("Configuration enregistrée (0600).", "Configuration saved (0600)."))
++    finale = url or c.get("URL", "")
++    if hote_prive(finale):
++        print(T("Attention : cette URL est locale/privée. Elle ne fonctionnera que sur le même réseau "
++                "que le serveur. Depuis un autre réseau, utilise l'URL HTTPS d'un tunnel "
++                "(Cloudflare, Tailscale) exposée par le serveur.",
++                "Warning: this is a local/private URL. It only works on the same network as the server. "
++                "From another network, use the HTTPS URL of a tunnel (Cloudflare, Tailscale) exposed by the server."))
++    elif finale.startswith("http://"):
++        print(T("Attention : HTTP en clair. Hors du réseau local, utilise impérativement HTTPS.",
++                "Warning: plain HTTP. Outside the local network, HTTPS is required."))
++    print(T("Teste la connexion avec : nc-assistant verifier",
++            "Test the connection with: nc-assistant verifier"))
+ 
+ 
+ class SansRedirection(urllib.request.HTTPRedirectHandler):
+@@ -176,16 +211,51 @@ def api(c, endpoint, payload=None):
+             contenu = r.read(MAX_RESPONSE + 1)
+     except urllib.error.HTTPError as e:
+         if 300 <= e.code < 400:
+-            raise Erreur(T("Redirection refusée : configure l'URL finale du serveur.",
+-                           "Redirect refused: configure the server's final URL.")) from None
++            raise Erreur(T("Redirection refusée : configure directement l'URL finale, en HTTPS.",
++                           "Redirect refused: configure the final HTTPS URL directly.")) from None
++        if e.code in (401, 403):
++            raise Erreur(T(f"Clé refusée par le serveur (HTTP {e.code}) : vérifie SECRET_KEY.",
++                           f"Server rejected the key (HTTP {e.code}): check SECRET_KEY.")) from None
++        if e.code == 404:
++            raise Erreur(T("Route introuvable (HTTP 404) : vérifie l'URL et son préfixe de chemin.",
++                           "Route not found (HTTP 404): check the URL and its path prefix.")) from None
++        if e.code == 429:
++            raise Erreur(T("Trop de requêtes (HTTP 429) : réessaie dans une minute.",
++                           "Too many requests (HTTP 429): try again in a minute.")) from None
++        if 500 <= e.code < 600:
++            raise Erreur(T(f"Erreur interne du serveur (HTTP {e.code}) : consulte ses journaux.",
++                           f"Server internal error (HTTP {e.code}): check its logs.")) from None
+         raise Erreur(T(f"Erreur HTTP {e.code} du serveur.", f"Server HTTP error {e.code}.")) from None
+     except (TimeoutError, socket.timeout):
+-        raise Erreur(T("Le serveur n'a pas répondu à temps.", "The server did not respond in time.")) from None
+-    except (urllib.error.URLError, OSError):
++        raise Erreur(T("Le serveur n'a pas répondu à temps (réseau lent, tunnel arrêté ou requête trop longue).",
++                       "The server did not respond in time (slow network, stopped tunnel or long request).")) from None
++    except urllib.error.URLError as e:
++        raison = getattr(e, "reason", None)
++        if isinstance(raison, ssl.SSLCertVerificationError) or isinstance(raison, ssl.SSLError):
++            raise Erreur(T("Certificat TLS invalide : l'URL HTTPS ne correspond pas au certificat du serveur.",
++                           "Invalid TLS certificate: the HTTPS URL does not match the server certificate.")) from None
++        if isinstance(raison, socket.gaierror):
++            raise Erreur(T("Nom du serveur introuvable (DNS) : vérifie l'URL publique.",
++                           "Server name not found (DNS): check the public URL.")) from None
++        if isinstance(raison, ConnectionRefusedError):
++            raise Erreur(T("Connexion refusée : le service ou le tunnel n'écoute pas à cette adresse.",
++                           "Connection refused: the service or tunnel is not listening at this address.")) from None
++        if isinstance(raison, (ConnectionResetError, http.client.RemoteDisconnected)):
++            raise Erreur(T("Connexion interrompue par le serveur ou le tunnel.",
++                           "Connection closed by the server or tunnel.")) from None
+         raise Erreur(T("Serveur inaccessible (réseau, adresse ou certificat).",
+                        "Server unreachable (network, address or certificate).")) from None
++    except ssl.SSLError:
++        raise Erreur(T("Erreur TLS : vérifie le certificat et utilise l'URL HTTPS finale.",
++                       "TLS error: check the certificate and use the final HTTPS URL.")) from None
++    except ConnectionRefusedError:
++        raise Erreur(T("Connexion refusée : le service ou le tunnel n'écoute pas à cette adresse.",
++                       "Connection refused: the service or tunnel is not listening at this address.")) from None
+     except (http.client.HTTPException, UnicodeError, ValueError):
+         raise Erreur(T("Réponse ou adresse HTTP invalide.", "Invalid HTTP response or address.")) from None
++    except OSError:
++        raise Erreur(T("Serveur inaccessible (réseau, adresse ou certificat).",
++                       "Server unreachable (network, address or certificate).")) from None
+     if len(contenu) > MAX_RESPONSE:
+         raise Erreur(T("Réponse du serveur trop volumineuse.", "Server response is too large."))
+     try:
+@@ -211,6 +281,63 @@ def texte_sortie(resultat):
+     return "".join(x for x in t if x in "\n\t" or (ord(x) >= 32 and not 127 <= ord(x) <= 159))
+ 
+ 
++def verifier(c, json_out=False):
++    """Teste la connexion et explique précisément ce qui bloque."""
++    prive = hote_prive(c["URL"])
++    debut = time.monotonic()
++    try:
++        r = api(c, "/api/status")
++    except Erreur as e:
++        resultat = {"configured": True, "online": False, "url": c["URL"],
++                    "private": prive, "error": str(e)}
++        if json_out:
++            print(json.dumps(resultat, ensure_ascii=False))
++        else:
++            print(T("Connexion impossible : ", "Connection failed: ") + str(e), file=sys.stderr)
++            if prive:
++                print(T("Indice : cette URL est locale/privée ; elle ne fonctionne que sur le réseau du serveur. "
++                        "Depuis un autre réseau, utilise l'URL HTTPS d'un tunnel (Cloudflare, Tailscale).",
++                        "Hint: this is a local/private URL; it only works on the server's network. "
++                        "From another network, use the HTTPS URL of a tunnel (Cloudflare, Tailscale)."),
++                      file=sys.stderr)
++            elif c["URL"].startswith("http://"):
++                print(T("Indice : utilise HTTPS hors du réseau local.",
++                        "Hint: use HTTPS outside the local network."), file=sys.stderr)
++        return 1
++
++    latence = int((time.monotonic() - debut) * 1000)
++    runner = r.get("online") is not False and r.get("runner_alive") is not False
++    public_url = (r.get("gateway") or {}).get("public_url") if isinstance(r.get("gateway"), dict) else None
++    resultat = {
++        "configured": True,
++        "online": bool(runner),
++        "runner_alive": bool(runner),
++        "url": c["URL"],
++        "private": prive,
++        "latency_ms": latence,
++        "version": r.get("version"),
++        "public_url": public_url,
++        "error": None if runner else T("Le runner est hors ligne.", "The runner is offline."),
++    }
++    if json_out:
++        print(json.dumps(resultat, ensure_ascii=False))
++    else:
++        if runner:
++            version = f" v{r['version']}" if r.get("version") else ""
++            print(T(f"Connexion OK — gateway{version}, runner en ligne, {latence} ms.",
++                    f"Connection OK — gateway{version}, runner online, {latence} ms."))
++        else:
++            print(T("Gateway joignable, mais le runner est hors ligne.",
++                    "Gateway reachable, but the runner is offline."), file=sys.stderr)
++        if prive:
++            print(T("Attention : URL locale/privée, valable seulement sur le réseau du serveur.",
++                    "Warning: local/private URL, only valid on the server's network."))
++        if public_url and public_url != c["URL"].rstrip("/"):
++            print(T(f"URL publique annoncée par le serveur : {public_url}",
++                    f"Public URL announced by the server: {public_url}"))
++    return 0 if runner else 1
++
++
+ def runtime():
+     p = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/nc-{os.getuid()}") / "nc-assistant"
+     p.mkdir(parents=True, mode=0o700, exist_ok=True)
+@@ -339,6 +466,8 @@ def main():
+             p.add_argument("--flux", action="store_true")
+     sous.add_parser("briefing")
+     sous.add_parser("requete-ile", help=argparse.SUPPRESS)
++    p = sous.add_parser("verifier", aliases=["check", "diagnostic"])
++    p.add_argument("--json", action="store_true")
+     p = sous.add_parser("etat", aliases=["status"])
+     p.add_argument("--local", action="store_true")
+     a = parser.parse_args()
+@@ -355,6 +484,8 @@ def main():
+             if commande == "chat" and not CONF.exists() and sys.stdin.isatty():
+                 configurer()
+             c = configuration()
++            if commande in ("verifier", "check", "diagnostic"):
++                return verifier(c, getattr(a, "json", False))
+             if commande in ("etat", "status"):
+                 if a.local:
+                     print(json.dumps({"configured": True, "checked": False}))
+@@ -379,7 +510,16 @@ def main():
+         if commande == "requete-ile":
+             print(json.dumps({"ok": False, "error": message}, ensure_ascii=False), flush=True)
+         elif commande in ("etat", "status"):
+-            print(json.dumps({"online": False, "error": message}, ensure_ascii=False))
++            resultat = {"online": False, "error": message}
++            try:
++                if hote_prive(configuration()["URL"]):
++                    resultat["private"] = True
++                    resultat["hint"] = T(
++                        "URL locale/privée : utilise l'URL HTTPS d'un tunnel depuis un autre réseau.",
++                        "Local/private URL: use a tunnel's HTTPS URL from another network.")
++            except (Erreur, OSError):
++                pass
++            print(json.dumps(resultat, ensure_ascii=False))
+         elif flux:
+             print(json.dumps({"t": message}, ensure_ascii=False), flush=True)
+         else:
+diff --git a/home/.local/bin/nc-reglages b/home/.local/bin/nc-reglages
+index 2d50376..942b520 100755
+--- a/home/.local/bin/nc-reglages
++++ b/home/.local/bin/nc-reglages
+@@ -4,6 +4,7 @@
+   nc-reglages                     écran des réglages
+   nc-reglages raccourcis          directement les raccourcis clavier
+   nc-reglages assistant           configurer la connexion de l'assistant distant (URL et clé)
++  nc-reglages assistant verifier  tester la connexion distante (réseau, clé, TLS, runner)
+   nc-reglages liste               tous les réglages et leur valeur
+   nc-reglages get CLE             valeur d'un réglage
+   nc-reglages set CLE VALEUR      changer un réglage (ex. nc-reglages set HZ_ECO 60)
+@@ -70,6 +71,7 @@ USAGE_EN = """nc-settings: noctalia-config settings, in the terminal, with the a
+   nc-settings                     settings screen
+   nc-settings shortcuts           straight to keyboard shortcuts
+   nc-settings assistant           configure the remote assistant connection (URL and key)
++  nc-settings assistant verify    test the remote connection (network, key, TLS, runner)
+   nc-settings list                all settings and their values
+   nc-settings get KEY             a setting's value
+   nc-settings set KEY VALUE       change a setting (e.g. nc-settings set HZ_ECO 60)
+@@ -1388,6 +1390,19 @@ def configurer_assistant():
+         return 1
+ 
+ 
++def verifier_assistant():
++    """Teste la connexion distante sans afficher la clé ; retourne (code, message court)."""
++    try:
++        r = subprocess.run([sys.executable, os.path.join(BIN, "nc-assistant"), "verifier"],
++                           capture_output=True, text=True, timeout=30)
++    except (OSError, subprocess.TimeoutExpired):
++        return 1, T("Test impossible.", "Test impossible.")
++    lignes = (r.stdout if r.returncode == 0 else (r.stderr or r.stdout)).strip().splitlines()
++    if r.returncode == 0:
++        return 0, (lignes[0] if lignes else T("Connexion OK.", "Connection OK."))
++    return r.returncode, (lignes[-1] if lignes else T("Connexion impossible.", "Connection failed."))
++
++
+ class Ecran:
+     def __init__(self, ecran, section_depart=0):
+         self.e = ecran
+@@ -1430,9 +1445,14 @@ class Ecran:
+             return self.lignes_n
+         lignes = [r for r in VISIBLES if r.section == SECTIONS[self.sec]]
+         if SECTIONS[self.sec] == "Agents IA (coucou)":
+-            lignes.insert(0, {"genre": "assistant", "nom": T("Configurer l'assistant distant", "Configure remote assistant"),
+-                              "aide": T("URL du serveur, clé secrète (saisie masquée) et utilisateur ; conservés séparément dans assistant.conf.",
+-                                        "Server URL, secret key (hidden input) and user; kept separately in assistant.conf.")})
++            lignes.insert(0, {"genre": "assistant", "action": "verifier",
++                              "nom": T("Tester l'assistant distant", "Test remote assistant"),
++                              "aide": T("Teste l'URL, la clé, le certificat TLS et l'état du runner ; la clé n'est jamais affichée.",
++                                        "Tests the URL, key, TLS certificate and runner status; the key is never displayed.")})
++            lignes.insert(0, {"genre": "assistant", "action": "configurer",
++                              "nom": T("Configurer l'assistant distant", "Configure remote assistant"),
++                              "aide": T("URL du serveur, clé secrète (saisie masquée) et utilisateur ; conservés séparément dans assistant.conf. Pour un autre réseau, utilise l'URL HTTPS d'un tunnel.",
++                                        "Server URL, secret key (hidden input) and user; kept separately in assistant.conf. For another network, use the HTTPS URL of a tunnel.")})
+         return lignes
+ 
+     @staticmethod
+@@ -1513,7 +1533,8 @@ class Ecran:
+             elif it["genre"] == "titre":
+                 e.addstr(y, x0, couper(it["nom"], iw), curses.A_BOLD | self.ACC)
+             elif it["genre"] == "assistant":
+-                self.ligne(y, x0, iw, col, it["nom"], T("Ouvrir… ↵", "Open… ↵"), sel, False)
++                v = T("Tester… ↵", "Test… ↵") if it.get("action") == "verifier" else T("Ouvrir… ↵", "Open… ↵")
++                self.ligne(y, x0, iw, col, it["nom"], v, sel, False)
+             elif it["genre"] == "ajouter":
+                 self.ligne(y, x0, iw, col, "+ " + it["nom"], "", sel, False)
+             elif it["genre"] == "nouveaute":
+@@ -1576,8 +1597,12 @@ class Ecran:
+             bas = T("↑↓ choisir    Entrée : tout ce qu'elle apporte    Échap : sections    q : quitter",
+                     "↑↓ choose    Enter: everything it brings    Esc: sections    q: quit")
+         elif isinstance(cur, dict) and cur["genre"] == "assistant":
+-            bas = T("↑↓ choisir    Entrée : configurer la connexion    Échap : sections    q : quitter",
+-                    "↑↓ choose    Enter: configure connection    Esc: sections    q: quit")
++            if cur.get("action") == "verifier":
++                bas = T("↑↓ choisir    Entrée : tester la connexion    Échap : sections    q : quitter",
++                        "↑↓ choose    Enter: test connection    Esc: sections    q: quit")
++            else:
++                bas = T("↑↓ choisir    Entrée : configurer la connexion    Échap : sections    q : quitter",
++                        "↑↓ choose    Enter: configure connection    Esc: sections    q: quit")
+         else:
+             bas = T("↑↓ choisir    ← → changer    Entrée : choisir dans la liste    r : valeur de la config    Échap : sections    q : quitter",
+                     "↑↓ choose    ← → change    Enter: pick from the list    r: config value    Esc: sections    q: quit")
+@@ -1746,7 +1771,13 @@ class Ecran:
+         return capturer(self.e, self)
+ 
+     # ── Actions ──
+-    def assistant(self):
++    def assistant(self, it=None):
++        if isinstance(it, dict) and it.get("action") == "verifier":
++            self.statut(T("Test de la connexion…", "Testing connection…"))
++            self.dessiner()
++            code, message = verifier_assistant()
++            self.statut(message, erreur=code != 0)
++            return
+         # Le client récupère un terminal normal pour input/getpass, puis on retrouve l'écran des réglages.
+         curses.def_prog_mode()
+         curses.endwin()
+@@ -1959,7 +1990,7 @@ class Ecran:
+                     if isinstance(it, R):
+                         self.changer(it, 1) if it.genre in ("ouinon",) else self.entree(it)
+                     elif it["genre"] == "assistant":
+-                        self.assistant()
++                        self.assistant(it)
+                     else:
+                         self.action_raccourci(it)
+ 
+@@ -2022,7 +2053,7 @@ class Ecran:
+                     self.essayer(cur)
+             elif cur["genre"] == "assistant":
+                 if c in ("\n", "\r", " ", curses.KEY_ENTER, curses.KEY_RIGHT):
+-                    self.assistant()
++                    self.assistant(cur)
+                 elif c == curses.KEY_LEFT:
+                     self.focus = "sections"
+             elif cur["genre"] == "nouveaute":
+@@ -2055,6 +2086,10 @@ def tui(section=0):
+ # ── Ligne de commande ───────────────────────────────────────────────────────────────────────────────────────────
+ def cli(a):
+     vals = lire()
++    if a[0] == "assistant" and len(a) == 2 and a[1] in ("verifier", "verify", "test"):
++        code, message = verifier_assistant()
++        print(message, file=sys.stdout if code == 0 else sys.stderr)
++        sys.exit(code)
+     if a[0] == "assistant" and len(a) == 1:
+         sys.exit(configurer_assistant())
+     if a[0] in ("nouveautes", "nouveautés", "news"):
+diff --git a/tests/test_assistant.py b/tests/test_assistant.py
+index 1ed4fb4..564edb9 100644
+--- a/tests/test_assistant.py
++++ b/tests/test_assistant.py
+@@ -322,6 +322,64 @@ class Assistant(unittest.TestCase):
+         self.assertIn("private", json.loads(r.stdout)["t"])
+         self.assertEqual(self.server.recus, [])
+ 
++    def test_private_host_detection(self):
++        for url in ("http://localhost:8000", "http://192.168.1.28:8000",
++                    "http://10.0.0.5:8000", "http://172.16.4.2:8000",
++                    "https://assistant.local", "http://[::1]:8000"):
++            with self.subTest(url=url):
++                self.assertTrue(self.m.hote_prive(url))
++        for url in ("https://assistant.example.test", "https://trycloudflare.com",
++                    "https://100.64.0.1", "https://mon-pi.tailnet.ts.net"):
++            with self.subTest(url=url):
++                self.assertFalse(self.m.hote_prive(url))
++
++    def test_verifier_reports_online_private_url_without_key(self):
++        r = self.cli("verifier")
++        self.assertEqual(r.returncode, 0, r.stderr)
++        self.assertIn("Connection OK", r.stdout)
++        self.assertIn("local/private", r.stdout)
++        self.assertNotIn(self.c["SECRET_KEY"], r.stdout + r.stderr)
++
++        r = self.cli("verifier", "--json")
++        self.assertEqual(r.returncode, 0, r.stderr)
++        data = json.loads(r.stdout)
++        self.assertTrue(data["online"])
++        self.assertTrue(data["private"])
++        self.assertEqual(data["url"], self.c["URL"])
++        self.assertNotIn(self.c["SECRET_KEY"], r.stdout + r.stderr)
++
++    def test_verifier_explains_auth_and_missing_route(self):
++        self.server.reponse = (401, b"private error")
++        r = self.cli("verifier")
++        self.assertEqual(r.returncode, 1)
++        self.assertIn("rejected the key", r.stderr)
++        self.assertNotIn("private error", r.stdout + r.stderr)
++        self.assertNotIn(self.c["SECRET_KEY"], r.stdout + r.stderr)
++
++        self.server.reponse = (404, b"")
++        r = self.cli("verifier", "--json")
++        self.assertEqual(r.returncode, 1)
++        self.assertIn("404", json.loads(r.stdout)["error"])
++
++    def test_verifier_reports_offline_runner(self):
++        self.server.reponse = (200, b'{"online": false}')
++        r = self.cli("verifier", "--json")
++        self.assertEqual(r.returncode, 1)
++        data = json.loads(r.stdout)
++        self.assertFalse(data["online"])
++        self.assertTrue(data["runner_alive"] is False)
++
++    def test_status_error_explains_private_url_without_leaking_key(self):
++        self.server.reponse = (500, b"private backend detail")
++        r = self.cli("etat")
++        self.assertEqual(r.returncode, 1)
++        data = json.loads(r.stdout)
++        self.assertFalse(data["online"])
++        self.assertTrue(data["private"])
++        self.assertIn("tunnel", data["hint"])
++        self.assertNotIn(self.c["SECRET_KEY"], r.stdout + r.stderr)
++        self.assertNotIn("private backend detail", r.stdout + r.stderr)
++
+ 
+ class InstallationPortable(unittest.TestCase):
+     @unittest.skipUnless(shutil.which("lua"), "Lua requis pour le lanceur de repli")
+@@ -450,6 +508,30 @@ ShellRoot {
+ 
+ 
+ class ReglagesAssistant(unittest.TestCase):
++    def test_settings_exposes_remote_connection_test(self):
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore", ResourceWarning)
++            m = charger("nc-reglages")
++        e = m.Ecran.__new__(m.Ecran)
++        e.sec = m.SECTIONS.index("Agents IA (coucou)")
++        items = e.items()
++        self.assertEqual(items[0]["action"], "configurer")
++        self.assertEqual(items[1]["action"], "verifier")
++        with patch.object(m.subprocess, "run") as run:
++            run.return_value = unittest.mock.Mock(
++                returncode=0, stdout="Connection OK — gateway v1.0.0, 12 ms.\n", stderr="")
++            code, message = m.verifier_assistant()
++        self.assertEqual(code, 0)
++        self.assertIn("Connection OK", message)
++        self.assertEqual(run.call_args.args[0][-1], "verifier")
++
++        with patch.object(m.subprocess, "run") as run:
++            run.return_value = unittest.mock.Mock(
++                returncode=1, stdout="", stderr="detail\nServer rejected the key\n")
++            code, message = m.verifier_assistant()
++        self.assertEqual(code, 1)
++        self.assertEqual(message, "Server rejected the key")
++
+     def test_settings_action_available_and_terminal_restored_after_cancellation(self):
+         with warnings.catch_warnings():
+             warnings.simplefilter("ignore", ResourceWarning)  # lectures de matériel préexistantes dans nc-reglages
