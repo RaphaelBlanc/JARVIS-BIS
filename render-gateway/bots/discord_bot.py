@@ -1717,7 +1717,10 @@ async def stop_discord_bot() -> None:
         if loop is not None and loop.is_running() and loop is not current_loop:
             future = asyncio.run_coroutine_threadsafe(bot.close(), loop)
             try:
-                await asyncio.wait_for(asyncio.wrap_future(future), timeout=5.0)
+                # shield évite que l'expiration du timeout annule le future
+                # concurrent alors que la boucle Discord va se fermer.
+                wrapped = asyncio.wrap_future(future)
+                await asyncio.wait_for(asyncio.shield(wrapped), timeout=5.0)
                 closed_cleanly = True
             except asyncio.TimeoutError:
                 logger.warning(
