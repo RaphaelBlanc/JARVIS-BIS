@@ -1507,19 +1507,23 @@ async def stop_discord_bot() -> None:
     except RuntimeError:
         current_loop = None
 
+    closed_cleanly = False
     try:
         if loop is not None and loop.is_running() and loop is not current_loop:
             future = asyncio.run_coroutine_threadsafe(bot.close(), loop)
             try:
                 await asyncio.wait_for(asyncio.wrap_future(future), timeout=5.0)
+                closed_cleanly = True
             except asyncio.TimeoutError:
                 logger.warning(
                     "Arrêt Discord : fermeture non terminée en 5s, on continue."
                 )
-                future.cancel()
         else:
             await asyncio.wait_for(bot.close(), timeout=5.0)
-        logger.info("Bot Discord arrêté proprement.")
+            closed_cleanly = True
+
+        if closed_cleanly:
+            logger.info("Bot Discord arrêté proprement.")
     except asyncio.TimeoutError:
         logger.warning("Arrêt Discord : délai de fermeture dépassé.")
     except Exception as exc:
