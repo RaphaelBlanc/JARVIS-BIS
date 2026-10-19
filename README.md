@@ -27,22 +27,22 @@ Tout s'exécute directement sur votre PC personnel (Fedora / Arch Linux avec Hyp
 flowchart LR
     subgraph PC["💻 Votre PC Personnel (Linux / Noctalia)"]
         subgraph Clients["📱 Clients"]
-            D[Discord]
-            T[Telegram]
-            N[Noctalia / nc-assistant]
+            D["Discord"]
+            T["Telegram"]
+            N["Noctalia / nc-assistant"]
         end
 
         subgraph Assistant["🤖 Assistant Personnel (:8000)"]
-            APP[Passerelle API + Bots + Outils MCP]
-            AGY[Moteur Antigravity agy]
-            SYS[Contrôle Matériel Direct : grim, lock, cam]
+            APP["Passerelle API + Bots + Outils MCP"]
+            AGY["Moteur Antigravity agy"]
+            SYS["Contrôle Matériel Direct (grim, lock, cam)"]
             APP --> AGY
             APP --> SYS
         end
 
         D --> APP
         T --> APP
-        N -->|HTTP Local :8000| APP
+        N -->|"HTTP Local :8000"| APP
     end
 ```
 
@@ -56,20 +56,20 @@ L'assistant est installé sur un serveur permanent (VPS, Mini-PC, serveur Debian
 ```mermaid
 flowchart LR
     subgraph Clients["📱 Vos Appareils"]
-        D[Discord]
-        T[Telegram]
-        N[PC Noctalia / nc-assistant]
+        D["Discord"]
+        T["Telegram"]
+        N["PC Noctalia / nc-assistant"]
     end
 
     subgraph Serveur["🖥️ Serveur Distant Hébergé (24/7)"]
-        APP[Assistant Personnel :8000\n(Bots, API, Outils MCP)]
-        AGY[Moteur Antigravity agy]
+        APP["Assistant Personnel :8000 (Bots, API, Outils MCP)"]
+        AGY["Moteur Antigravity agy"]
         APP --> AGY
     end
 
-    D <-->|Internet| APP
-    T <-->|Internet| APP
-    N <-->|Tailscale ou HTTPS| APP
+    D -->|"Internet"| APP
+    T -->|"Internet"| APP
+    N -->|"Tailscale ou HTTPS"| APP
 ```
 
 ---
