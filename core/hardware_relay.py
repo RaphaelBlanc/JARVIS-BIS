@@ -1,57 +1,22 @@
 """
-core/hardware_relay.py — Passerelle matérielle hybride (Local vs Serveur + PC-Agent).
+core/hardware_relay.py — Exécution directe des outils matériels et système.
 
-Ce module permet d'exécuter des actions matérielles Linux/Wayland (capture d'écran,
-webcam, verrouillage de session, contrôle du son, presse-papier, etc.) :
-1. En mode LOCAL : exécution directe sur la machine via `core.tools.system_tools`.
-2. En mode SERVEUR : relais transparent vers un `pc-agent` connecté en WebSocket.
-   Si le PC est éteint ou non connecté, renvoie un message d'information gracieux.
+Exécute les commandes locales (screenshot grim, webcam ffmpeg, verrouillage de session,
+contrôle du son, fenêtres Hyprland, etc.).
+Si le bot est hébergé sur un serveur headless sans session graphique, renvoie un message
+d'information clair sans faire planter l'application.
 """
 
-import asyncio
 import logging
 import os
-import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger("core.hardware_relay")
 
 
 class HardwareRelay:
-    """Gestionnaire central des actions matérielles pour l'architecture hybride."""
-
-    def __init__(self) -> None:
-        self._connected_agents: Dict[str, Any] = {}  # {agent_id: websocket}
-        self._pending_requests: Dict[str, asyncio.Future] = {}
-
-    @property
-    def is_local_mode(self) -> bool:
-        """Indique si l'application tourne en mode local direct."""
-        mode = os.getenv("DEPLOY_MODE", "local").strip().lower()
-        return mode in ("local", "standalone", "direct")
-
-    @property
-    def is_agent_connected(self) -> bool:
-        """Indique si au moins un agent PC local est actuellement connecté."""
-        return len(self._connected_agents) > 0
-
-    def register_agent(self, agent_id: str, websocket: Any) -> None:
-        """Enregistre un nouvel agent PC connecté."""
-        self._connected_agents[agent_id] = websocket
-        logger.info(f"Agent PC connecté : {agent_id} (total connectés: {len(self._connected_agents)})")
-
-    def unregister_agent(self, agent_id: str) -> None:
-        """Déconnecte un agent PC."""
-        self._connected_agents.pop(agent_id, None)
-        logger.info(f"Agent PC déconnecté : {agent_id} (total connectés: {len(self._connected_agents)})")
-
-    def handle_agent_response(self, response_data: dict) -> None:
-        """Reçoit la réponse d'un agent pour une requête en attente."""
-        req_id = response_data.get("request_id")
-        if req_id and req_id in self._pending_requests:
-            future = self._pending_requests.pop(req_id)
-            if not future.done():
-                future.set_result(response_data)
+    """Gestionnaire des actions matérielles et système."""
 
     async def execute(
         self,
@@ -59,73 +24,34 @@ class HardwareRelay:
         params: Optional[Dict[str, Any]] = None,
         timeout: float = 20.0,
     ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
-        """Exécute une action matérielle (en local direct ou via le relais WebSocket).
-
-        Returns:
-            Tuple[bool, str, Optional[dict]] -> (succès, message, données_supplémentaires)
-        """
+        """Exécute une action matérielle directement sur le système hôte."""
         params = params or {}
 
-        # 1. Mode LOCAL direct
-        if self.is_local_mode:
-            return await self._execute_local(action, params)
-
-        # 2. Mode SERVEUR : vérifier si un agent PC est en ligne
-        if not self._connected_agents:
-            return (
-                False,
-                "⚠️ <b>PC local hors ligne</b>\n"
-                "Cette commande nécessite l'accès au matériel (Wayland/écran/audio/webcam), "
-                "mais aucun agent PC local n'est actuellement connecté au serveur distant.\n\n"
-                "💡 <i>Lancez l'agent local sur votre PC via <code>systemctl --user start assistant-pc-agent</code>.</i>",
-                None,
-            )
-
-        # Prendre le premier agent disponible
-        agent_id, ws = next(iter(self._connected_agents.items()))
-        req_id = uuid.uuid4().hex[:12]
-        payload = {
-            "request_id": req_id,
-            "action": action,
-            "params": params,
-        }
-
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        self._pending_requests[req_id] = future
-
-        try:
-            await ws.send_json(payload)
-            response = await asyncio.wait_for(future, timeout=timeout)
-            success = bool(response.get("success", False))
-            message = str(response.get("message", ""))
-            data = response.get("data")
-            return success, message, data
-        except asyncio.TimeoutError:
-            self._pending_requests.pop(req_id, None)
-            return False, f"⏱️ Délai d'attente dépassé ({timeout}s) pour l'action {action} sur le PC distant.", None
-        except Exception as exc:
-            self._pending_requests.pop(req_id, None)
-            logger.error(f"Erreur transmission agent PC ({action}): {exc}")
-            return False, f"❌ Erreur de communication avec le PC local : {exc}", None
-
-    async def _execute_local(self, action: str, params: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
-        """Exécution directe sur le système d'exploitation local."""
         try:
             from core.tools import system_tools
 
+            # Actions nécessitant un affichage graphique / Wayland
+            is_wayland = bool(os.getenv("WAYLAND_DISPLAY") or os.getenv("XDG_SESSION_TYPE") == "wayland")
+            has_display = bool(os.getenv("DISPLAY") or is_wayland)
+
+            if action in ("screenshot", "lock", "cam") and not has_display and not os.path.exists("/dev/video0"):
+                return (
+                    False,
+                    "⚠️ <b>Commande matérielle indisponible</b>\n"
+                    "L'assistant tourne actuellement sur un serveur distant sans session graphique ou sans webcam connectée.",
+                    None,
+                )
+
             if action == "screenshot":
-                from pathlib import Path
                 out_path = Path(params.get("output_path", "/tmp/screenshot.png"))
                 ok, msg = await system_tools.take_screenshot(out_path)
                 return ok, msg, {"file_path": str(out_path)} if ok else None
 
             elif action == "lock":
-                ok, msg = await system_tools.lock_session()
+                ok, msg = await system_tools.lock_desktop_session()
                 return ok, msg, None
 
             elif action == "cam":
-                from pathlib import Path
                 out_path = Path(params.get("output_path", "/tmp/cam_snapshot.jpg"))
                 ok, msg = await system_tools.capture_webcam(out_path)
                 return ok, msg, {"file_path": str(out_path)} if ok else None
@@ -182,8 +108,8 @@ class HardwareRelay:
                 return False, f"Action matérielle inconnue : {action}", None
 
         except Exception as exc:
-            logger.error(f"Erreur exécution locale {action}: {exc}", exc_info=True)
-            return False, f"Erreur locale : {exc}", None
+            logger.error(f"Erreur exécution matérielle {action}: {exc}", exc_info=True)
+            return False, f"Erreur système ({action}) : {exc}", None
 
 
 # Instance singleton globale

@@ -4,8 +4,7 @@ tests/test_unified_assistant.py — Tests unitaires pour l'Assistant Personnel U
 Valide :
 - L'enregistrement et la configuration des outils dans ToolRegistry
 - Le routeur NLP 0-token
-- Le dispatcher universel d'outils
-- Le HardwareRelay hybride (local vs pc-agent)
+- Le HardwareRelay (exécution directe des outils matériels)
 """
 
 import asyncio
@@ -77,37 +76,20 @@ class TestUnifiedAssistant(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(res.get("success"))
             self.assertIn("courses", res.get("message", "").lower())
 
-    async def test_hardware_relay_server_without_agent(self):
-        """Vérifie que le mode serveur sans agent PC connecté échoue proprement."""
+    async def test_hardware_relay_execution(self):
+        """Vérifie l'exécution d'une action via HardwareRelay."""
         relay = HardwareRelay()
-        with patch.dict(os.environ, {"DEPLOY_MODE": "server"}):
-            ok, msg, data = await relay.execute("screenshot")
-            self.assertFalse(ok)
-            self.assertIn("hors ligne", msg.lower())
-
-    async def test_hardware_relay_server_with_agent(self):
-        """Vérifie la transmission de requête à un agent PC connecté en mode serveur."""
-        relay = HardwareRelay()
-        mock_ws = AsyncMock()
-
-        # Simule l'envoi et la réponse immédiate de l'agent
-        async def fake_send_json(payload):
-            req_id = payload.get("request_id")
-            relay.handle_agent_response({
-                "request_id": req_id,
-                "success": True,
-                "message": "Capture réussie via l'agent.",
-                "data": {"image_base64": "fake_png_data"},
-            })
-
-        mock_ws.send_json = fake_send_json
-        relay.register_agent("test-agent-1", mock_ws)
-
-        with patch.dict(os.environ, {"DEPLOY_MODE": "server"}):
-            ok, msg, data = await relay.execute("screenshot", timeout=2.0)
+        with patch("core.tools.system_tools.lock_desktop_session", return_value=(True, "Session verrouillée")):
+            ok, msg, data = await relay.execute("lock")
             self.assertTrue(ok)
-            self.assertEqual(msg, "Capture réussie via l'agent.")
-            self.assertEqual(data.get("image_base64"), "fake_png_data")
+            self.assertEqual(msg, "Session verrouillée")
+
+    async def test_hardware_relay_unknown_action(self):
+        """Vérifie le comportement face à une action inconnue."""
+        relay = HardwareRelay()
+        ok, msg, data = await relay.execute("action_inconnue")
+        self.assertFalse(ok)
+        self.assertIn("inconnue", msg.lower())
 
 
 if __name__ == "__main__":

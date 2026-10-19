@@ -32,6 +32,9 @@ Thumbs.db
 logs/
 
 # Données locales (rappels)
+gateway/reminders.db
+gateway/reminders.db-shm
+gateway/reminders.db-wal
 render-gateway/reminders.db
 render-gateway/reminders.db-shm
 render-gateway/reminders.db-wal

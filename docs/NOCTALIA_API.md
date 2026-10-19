@@ -1,7 +1,7 @@
 # 📘 Spécification de l'API Assistant Personnel pour Noctalia
 
 > **Document de référence pour le mainteneur de Noctalia (`noctalia-config`)**  
-> Ce document décrit les points de terminaison HTTP (REST), Streaming (SSE) et WebSocket exposés par la passerelle de l'assistant (`render-gateway` sur le port `8000`).  
+> Ce document décrit les points de terminaison HTTP (REST) et Streaming (SSE) exposés par la passerelle de l'assistant (`gateway` sur le port `8000`).  
 > Il permet d'intégrer le bureau Noctalia (barre, île dynamique Quickshell, Spotlight `Super+R`, CLI `nc-assistant`) aussi bien en **accès local direct** qu'en **accès distant hébergé** (Tailscale ou Cloudflare Tunnel).
 
 ---
@@ -24,7 +24,7 @@ flowchart TD
     end
 
     subgraph Assistant["🤖 Assistant Personnel"]
-        GW["render-gateway :8000"]
+        GW["gateway :8000 (Passerelle API)"]
         HR["home-runner :8080 (Moteur IA Antigravity)"]
         MOD["Modules Outils (Moodle, Budget, Courses, Obsidian, PC)"]
         GW --> HR

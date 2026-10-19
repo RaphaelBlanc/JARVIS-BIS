@@ -1,5 +1,5 @@
 """
-main.py — Serveur FastAPI principal du render-gateway.
+main.py — Serveur FastAPI principal de la passerelle Gateway.
 
 Lance le gateway qui:
   - Expose les routes de santé (/ping, /health)
@@ -339,13 +339,13 @@ async def lifespan(app: FastAPI):
     Arrêt:
         - Ferme proprement les bots Discord et Telegram
     """
-    logger.info("=== Démarrage du render-gateway v%s ===", VERSION)
+    logger.info("=== Démarrage de la Gateway v%s ===", VERSION)
     _check_env()
 
     # Démarre le bot Discord dans un thread daemon
     start_discord_bot()
 
-    # Configure Telegram (Webhook si en prod sur Render, ou Polling si en local)
+    # Configure Telegram (Webhook si en prod avec URL publique, ou Polling si en local)
     if TELEGRAM_TOKEN and TELEGRAM_WEBHOOK_URL:
         try:
             tg_app = get_telegram_app()
@@ -364,12 +364,12 @@ async def lifespan(app: FastAPI):
     reminder_task = asyncio.create_task(reminder_scheduler())
     warmup_task = asyncio.create_task(warmup_stt())
 
-    logger.info("render-gateway prêt à recevoir des requêtes.")
+    logger.info("Gateway prête à recevoir des requêtes.")
 
     yield  # L'application tourne
 
     # Arrêt
-    logger.info("=== Arrêt du render-gateway ===")
+    logger.info("=== Arrêt de la Gateway ===")
     for task in (scheduler_task, reminder_task, warmup_task):
         task.cancel()
         try:
@@ -539,7 +539,6 @@ async def api_status() -> dict:
         "online": runner_alive,
         "version": VERSION,
         "deploy_mode": os.getenv("DEPLOY_MODE", "local"),
-        "pc_agent_connected": HARDWARE_RELAY.is_agent_connected,
         "runner": runner_health,
         "session": session_info if not session_info.get("error") else None,
         "tools": tools_list,
@@ -641,35 +640,6 @@ async def api_apple_pay(request: Request) -> dict:
         {"amount": amount, "description": merchant, "category": category},
         platform="apple-pay",
     )
-
-
-@app.websocket("/ws/pc-agent")
-async def websocket_pc_agent(websocket: WebSocket):
-    """Canal WebSocket sécurisé reliant un agent PC local au serveur distant.
-    
-    Permet au serveur d'exécuter des actions matérielles sur le PC de l'utilisateur
-    (grim screenshot, ffmpeg webcam, hyprctl, loginctl lock, audio, etc.).
-    """
-    auth = websocket.headers.get("X-Secret-Key") or websocket.query_params.get("secret_key")
-    if not SECRET_KEY or not auth or not hmac.compare_digest(auth, SECRET_KEY):
-        await websocket.close(code=4001, reason="Clé secrète invalide")
-        return
-
-    await websocket.accept()
-    agent_id = f"pc-{uuid.uuid4().hex[:6]}"
-    HARDWARE_RELAY.register_agent(agent_id, websocket)
-    logger.info("Agent PC connecté avec succès via WebSocket : %s", agent_id)
-
-    try:
-        while True:
-            msg = await websocket.receive_json()
-            HARDWARE_RELAY.handle_agent_response(msg)
-    except WebSocketDisconnect:
-        logger.info("Agent PC déconnecté : %s", agent_id)
-    except Exception as exc:
-        logger.warning("Erreur WebSocket PC-Agent (%s) : %s", agent_id, exc)
-    finally:
-        HARDWARE_RELAY.unregister_agent(agent_id)
 
 
 
