@@ -11,6 +11,8 @@
 
 > **Un assistant personnel IA autonome, ultra-rapide et connecté à votre quotidien.**  
 > Pilotez votre machine, vos e-mails, votre agenda, vos tâches et le web directement depuis **Discord** et **Telegram**, propulsé par **Antigravity CLI** et les modèles de raisonnement Google Gemini.
+>
+> Le projet s'intègre aussi à un **bureau Linux Hyprland / Noctalia** : widget et panneau dans la barre, notifications dans l'île dynamique, briefing et rappels sur le poste. Voir le [rapport d'intégration Noctalia](INTEGRATION_NOCTALIA.md).
 
 ---
 
@@ -26,8 +28,22 @@
   - **Telegram** : Menus interactifs, boutons inline, mode webhook ou polling automatique sans configuration réseau.
 - **🧠 Gestion de Contexte & Mémoire** :
   - Mémoire de conversation persistante avec suivi des tours de discussion.
+  - **Mémoire durable** (`/souviens`, `/profil`) stockée localement, injectée dans les prompts seulement quand elle change, avec compaction automatique au-delà de `AUTO_COMPACT_TURNS`.
   - Commutation de session ou de modèle à la volée sans redémarrer le serveur.
   - Possibilité de reprendre d'anciennes conversations passées ou de purger le chat.
+- **⏰ Rappels persistants & récurrents** :
+  - Rappels ponctuels ou récurrents (`chaque jour`, `en semaine`, `chaque lundi`, `chaque mois`) stockés en SQLite.
+  - Détection en langage naturel, y compris depuis les messages vocaux.
+  - Snooze, clôture et reprogrammation automatique de l'occurrence suivante.
+- **🎙️ Messages vocaux (STT)** :
+  - Transcription automatique des vocaux Telegram et Discord (Groq Whisper, OpenAI Whisper ou `faster-whisper` en local).
+  - Les rappels et questions dictés sont traités comme du texte.
+- **📊 Suivi des tokens & cache du briefing** :
+  - Compteurs locaux de requêtes, tokens d'entrée/sortie et de caractères, exposés par `/usage`.
+  - Briefing mis en cache (`BRIEFING_CACHE_TTL_MINUTES`) pour éviter les appels redondants au modèle.
+- **🖥️ Intégration bureau (Noctalia / Hyprland)** :
+  - Cible : passerelle locale `nc-assistant`, widget et panneau Noctalia, notifications dans l'île Quickshell.
+  - Voir [INTEGRATION_NOCTALIA.md](INTEGRATION_NOCTALIA.md) pour l'architecture recommandée, le contrat du CLI et la compatibilité Noctalia 5.3.
 - **📐 Support LaTeX & Formules Mathématiques** :
   - Rendu graphique automatique des équations de bloc (`$$...$$`) en images PNG nettes adaptées au mode sombre.
   - Conversion automatique des formules en ligne (`$...$`) en symboles mathématiques Unicode clairs (ex: `α`, `β`, `π`, `x²`, `√`, `∫`, `∈`, `ℝ`).
@@ -49,7 +65,7 @@
 
 ## 🏗️ Architecture & Déploiement
 
-Le projet supporte **deux modes de déploiement** selon vos besoins :
+Le projet supporte **plusieurs modes de déploiement** selon vos besoins :
 
 ### Mode 1 : Serveur Autonome Tout-en-un (Recommandé) ⭐
 Idéal sur un serveur personnel (mini-PC, Raspberry Pi, serveur Debian/Ubuntu) allumé 24/7.
@@ -95,27 +111,59 @@ flowchart LR
 
 ---
 
+### Mode 3 : Client bureau Noctalia / Hyprland (optionnel)
+
+Le projet peut être piloté depuis le bureau, sans passer par Discord ou Telegram.
+La cible est une fine passerelle locale (`nc-assistant`) qui appelle le gateway et affiche
+le résultat dans la barre Noctalia, le panneau ou une notification de l'île dynamique :
+
+```mermaid
+flowchart LR
+    W[Widget / panneau Noctalia] --> CLI[nc-assistant]
+    S[Spotlight Super + R] --> CLI
+    CLI -->|HTTP local + X-Secret-Key| GW[render-gateway]
+    CLI -->|notify-send| N[Notifications de l'île]
+    GW --> HR[home-runner]
+    HR --> AGY[agy]
+```
+
+> [!NOTE]
+> Le bureau ne lance jamais `agy` directement : il passe par le gateway pour conserver
+> la mémoire, les sessions, les rappels et la journalisation. Le détail (contrat du CLI,
+> plugin Noctalia, notifications, sécurité) est dans [INTEGRATION_NOCTALIA.md](INTEGRATION_NOCTALIA.md).
+
+---
+
 ## 📂 Structure du Répertoire
 
 ```text
 assistant-perso/
 ├── deploy.sh                  # 🚀 Script de déploiement automatique en 1 commande
 ├── GEMINI.md                  # 🎯 Directives système pour l'assistant IA
+├── NEXT_TASKS.md              # 🗺️ Backlog de passation et priorités
+├── INTEGRATION_NOCTALIA.md    # 🖥️ Rapport d'intégration au rice Noctalia/Hyprland
 ├── .env.example               # ⚙️ Modèle de configuration globale
 ├── systemd/                   # 🐧 Units systemd pour lancement en tâche de fond
 │   ├── assistant-runner.service
 │   └── assistant-gateway.service
 ├── home-runner/               # 🏠 Moteur local & Bridge Antigravity CLI
-│   ├── agy_bridge.py          # Gestionnaire de sessions, parsing et subprocess
-│   ├── main.py                # API FastAPI privée (/run, /session, /models)
+│   ├── agy_bridge.py          # Sessions, worker stream-json, tokens, compaction
+│   ├── main.py                # API FastAPI privée (/run, /session, /models, /memory)
+│   ├── memory.py              # Mémoire durable (faits + profil)
+│   ├── tests/                 # Tests unitaires du runner
 │   ├── requirements.txt
 │   └── setup.sh
-├── render-gateway/            # 🌐 Passerelle bots Discord & Telegram
+├── render-gateway/            # 🌐 Passerelle bots, bureau, briefing et rappels
 │   ├── bots/
 │   │   ├── discord_bot.py     # Bot Discord (commandes slash, gestion des flux)
-│   │   └── telegram_bot.py    # Bot Telegram (polling/webhook, briefing)
+│   │   └── telegram_bot.py    # Bot Telegram (polling/webhook, briefing, STT)
 │   ├── gateway.py             # Client HTTP asynchrone vers le runner
-│   ├── main.py                # Serveur FastAPI & planificateur matinal
+│   ├── main.py                # Serveur FastAPI, planificateurs et API rappels
+│   ├── briefing.py            # Configuration, cache et état du briefing matinal
+│   ├── reminders.py           # Rappels SQLite, récurrences, snooze et reprise
+│   ├── stt.py                 # Transcription des messages vocaux
+│   ├── formatters/            # Rendu LaTeX/Unicode et découpage des messages
+│   ├── tests/                 # Tests unitaires du gateway
 │   ├── Dockerfile
 │   └── render.yaml
 └── integrations/              # 🔌 Connecteurs & Authentification
@@ -267,9 +315,53 @@ Toutes les fonctionnalités sont disponibles sur **Discord** (commandes slash na
 
 ---
 
+## 🖥️ Intégration bureau (Noctalia / Hyprland)
+
+Le projet est prévu pour rester un service : le bureau ne fait que l'appeler.
+L'intégration recommandée avec le rice [`noctalia-config`](https://github.com/abcdef123456-wq/noctalia-config)
+repose sur une passerelle locale `nc-assistant`, un plugin Noctalia `nc/assistant`
+et les notifications freedesktop de l'île Quickshell.
+
+| Élément | État constaté | Action |
+|---|---|---|
+| Noctalia | 5.3.0 (Fedora 44) | Compatible, API plugin 34 supportée |
+| Rice `noctalia-config` | commit `d6259a2` | Un plugin à corriger (`nc/fenetres`) |
+| Île dynamique | Quickshell (`nc-ile.service`) | Les notifications passent par `notify-send` |
+| `assistant-perso` | `main` (`e498e85`) | Services à démarrer sur le poste ou sur le Pi |
+
+> [!IMPORTANT]
+> Sur Noctalia 5.3, le plugin `nc/fenetres` du rice est ignoré s'il déclare
+> `plugin_api = 32` tout en utilisant `hover_highlight` (API 34). Corrige-le avec
+> `plugin_api = 34`, puis vérifie avec `noctalia plugins lint`.
+> Détails, architecture, contrat du CLI et feuille de route : [INTEGRATION_NOCTALIA.md](INTEGRATION_NOCTALIA.md).
+
+---
+
+## 🧪 Développement & tests
+
+```bash
+# Tests du gateway
+cd render-gateway
+.venv/bin/python -m unittest discover -s tests -q
+
+# Tests du runner
+cd ../home-runner
+.venv/bin/python -m unittest discover -s tests -q
+
+# Vérification rapide des services
+curl -sS http://127.0.0.1:8000/health
+curl -sS http://127.0.0.1:8080/ping
+```
+
+Le backlog des prochains lots (sécurité, réduction des tokens, multi-utilisateur,
+CI, produits) est maintenu dans [NEXT_TASKS.md](NEXT_TASKS.md).
+
+---
+
 ## 🔒 Sécurité & Confidentialité
 
-- **Authentification forte** : Chaque échange entre la passerelle (`render-gateway`) et le moteur local (`home-runner`) est protégé par une clé `X-Secret-Key` de 256 bits.
+- **Authentification forte** : Chaque échange entre la passerelle (`render-gateway`) et le moteur local (`home-runner`) est protégé par une clé `X-Secret-Key` de 256 bits. Le client bureau prévu (`nc-assistant`) réutilisera cette clé, stockée dans un fichier `600`, jamais dans le QML ou la ligne de commande.
+- **Écoute locale par défaut** : en mode tout-en-un, fais écouter le gateway et le runner sur `127.0.0.1`. N'ouvre `0.0.0.0` que si un accès LAN ou un tunnel est nécessaire, avec pare-feu et HTTPS.
 - **Accès restreint (Whitelist)** : Définissez `DISCORD_ALLOWED_USER_IDS` et `TELEGRAM_ALLOWED_USER_IDS` afin que personne d'autre ne puisse interagir avec votre assistant. Par défaut (**fail-closed**), une whitelist vide refuse tout le monde ; pour ouvrir l'accès sans whitelist, définissez explicitement `ALLOW_ALL_USERS=1` (non recommandé).
 - **Webhook Telegram authentifié** : En mode webhook, chaque requête est validée via le header `X-Telegram-Bot-Api-Secret-Token`. Le secret est dérivé automatiquement de `SECRET_KEY`, ou peut être fixé via `TELEGRAM_WEBHOOK_SECRET`.
 - **Sandbox d'exécution** : `agy` est lancé avec `--sandbox` par défaut (`AGY_SANDBOX=1`), ce qui limite les actions terminal. Les prompts sont aussi bornés (`MAX_PROMPT_CHARS`) et les images limitées (`MAX_IMAGE_MB`).

@@ -217,6 +217,10 @@ async def distribute_reminder(reminder: dict) -> None:
         await send_discord_reminder(int(chat_id), reminder)
         return
 
+    if platform == "desktop":
+        logger.info("Rappel bureau #%s traité pour %s : %s", reminder.get("id"), chat_id, message)
+        return
+
     raise ValueError(f"Plateforme de rappel inconnue : {platform!r}")
 
 
@@ -357,14 +361,139 @@ app = FastAPI(
 app.include_router(telegram_router)
 
 
+# ── API Desktop / Client générique (Noctalia, scripts, etc.) ─────────────────
+
+
+class AskRequest(BaseModel):
+    """Corps d'une requête de question depuis un client externe."""
+
+    prompt: str = Field(..., min_length=1, description="La question ou commande")
+    platform: str = Field(default="desktop", description="Plateforme d'origine")
+    user_id: str = Field(default="desktop", description="Identifiant utilisateur")
+    timeout: int = Field(default=180, ge=5, le=600, description="Timeout en secondes")
+    continue_session: bool = Field(
+        default=True, description="Reprendre la session en cours"
+    )
+    reset_session: bool = Field(
+        default=False, description="Réinitialiser la session avant la requête"
+    )
+    model: Optional[str] = Field(default=None, description="Modèle à utiliser")
+    effort: Optional[str] = Field(default=None, description="Niveau d'effort")
+
+
+class BriefingRequest(BaseModel):
+    """Corps d'une requête de briefing."""
+
+    force_refresh: bool = Field(
+        default=False, description="Ignorer le cache et régénérer"
+    )
+
+
+@app.post(
+    "/api/ask",
+    tags=["desktop"],
+    summary="Poser une question à l'assistant (client générique)",
+    dependencies=[Depends(require_secret)],
+)
+async def api_ask(payload: AskRequest) -> dict:
+    """Endpoint universel pour interroger l'assistant depuis n'importe quel
+    client HTTP authentifié (bureau Noctalia, scripts, applications tierces).
+
+    Réutilise ``forward_to_runner()`` — même logique que les bots Telegram et
+    Discord — mais sans passer par un bot. La session est partagée avec les
+    autres plateformes (même ``home-runner``).
+    """
+    from gateway import forward_to_runner
+
+    logger.info(
+        "API /api/ask — platform=%s user=%s prompt=%.60s…",
+        payload.platform,
+        payload.user_id,
+        payload.prompt,
+    )
+
+    result = await forward_to_runner(
+        prompt=payload.prompt,
+        timeout=payload.timeout,
+        model=payload.model,
+        effort=payload.effort,
+        continue_session=payload.continue_session,
+        reset_session=payload.reset_session,
+    )
+
+    return {
+        "success": result.get("success", False),
+        "output": result.get("output", ""),
+        "error": result.get("error"),
+    }
+
+
+@app.get(
+    "/api/status",
+    tags=["desktop"],
+    summary="État complet du gateway et du runner (pour les clients bureau)",
+    dependencies=[Depends(require_secret)],
+)
+async def api_status() -> dict:
+    """Agrège l'état du gateway et du home-runner en un seul appel.
+
+    Utilisé par ``nc-assistant etat`` pour afficher l'indicateur en ligne /
+    hors ligne dans l'île Quickshell.
+    """
+    from gateway import fetch_health, fetch_session
+
+    runner_health = await fetch_health()
+    session_info = await fetch_session()
+
+    runner_alive = runner_health.get("status") == "ok"
+    discord_token = os.getenv("DISCORD_TOKEN", "")
+
+    return {
+        "online": runner_alive,
+        "version": VERSION,
+        "runner": runner_health,
+        "session": session_info if not session_info.get("error") else None,
+        "gateway": {
+            "home_server_configured": bool(HOME_SERVER_URL),
+            "telegram_configured": bool(TELEGRAM_TOKEN),
+            "discord_configured": bool(discord_token),
+        },
+    }
+
+
+@app.post(
+    "/api/briefing",
+    tags=["desktop"],
+    summary="Générer ou récupérer le briefing matinal",
+    dependencies=[Depends(require_secret)],
+)
+async def api_briefing(payload: BriefingRequest) -> dict:
+    """Retourne le briefing matinal (depuis le cache ou régénéré).
+
+    Utilisé par ``nc-assistant briefing`` pour afficher un résumé quotidien
+    dans une notification ou dans le chat bureau.
+    """
+    result = await get_briefing_text(
+        force_refresh=payload.force_refresh, timeout=240
+    )
+    return {
+        "success": result.get("success", False),
+        "output": result.get("output", ""),
+        "cached": result.get("cached", False),
+        "error": result.get("error"),
+    }
+
+
 # ── API de gestion des rappels ────────────────────────────────────────────────
 
 
 class ReminderCreateRequest(BaseModel):
     """Corps de création d'un rappel (utilisé par l'API et les intégrations)."""
 
-    platform: str = Field(default="telegram", description="telegram ou discord")
-    chat_id: str = Field(..., description="ID du chat Telegram ou du salon Discord")
+    platform: str = Field(
+        default="telegram", description="telegram, discord ou desktop"
+    )
+    chat_id: str = Field(..., description="ID du chat Telegram, salon Discord ou identifiant desktop")
     target_id: Optional[str] = Field(default=None, description="ID de l'utilisateur")
     target_name: str = Field(default="", description="Nom de l'utilisateur")
     message: str = Field(..., min_length=1, description="Texte du rappel")
@@ -398,10 +527,13 @@ def _parse_iso_datetime(value: str) -> datetime.datetime:
     dependencies=[Depends(require_secret)],
 )
 async def create_reminder(payload: ReminderCreateRequest) -> dict:
-    """Crée un rappel persistant pour Telegram ou Discord."""
+    """Crée un rappel persistant pour Telegram, Discord ou Desktop."""
     platform = payload.platform.strip().lower()
-    if platform not in {"telegram", "discord"}:
-        raise HTTPException(status_code=400, detail="platform doit être telegram ou discord")
+    if platform not in {"telegram", "discord", "desktop"}:
+        raise HTTPException(
+            status_code=400,
+            detail="platform doit être telegram, discord ou desktop",
+        )
 
     if payload.delay:
         # Un champ "delay" est par définition une durée relative : "1h30"
