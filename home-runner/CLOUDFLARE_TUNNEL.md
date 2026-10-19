@@ -1,128 +1,76 @@
-# Guide : Cloudflare Tunnel (PC Maison)
+# Cloudflare Tunnel — quel port exposer ?
 
-Cloudflare Tunnel expose ton PC maison sur Internet **sans IP fixe, sans ouvrir de ports**.
+> Guide mis à jour. La procédure complète (Cloudflare, Tailscale, Render) est
+> dans [`docs/ACCES_DISTANT.md`](../docs/ACCES_DISTANT.md).
 
----
+Il y a **deux cas différents**, et confondre les deux est la cause la plus
+fréquente d'un client Noctalia qui ne fonctionne que sur le réseau local.
 
-## 1. Installer `cloudflared`
+## Cas 1 — Le gateway et le runner tournent sur la même machine (recommandé)
 
-```bash
-# Sur Debian/Ubuntu/Linux Mint
-curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
-sudo dpkg -i cloudflared.deb
-rm cloudflared.deb
-
-# Vérifier
-cloudflared --version
-```
-
----
-
-## 2. Authentification Cloudflare
-
-```bash
-cloudflared tunnel login
-# Ouvre un navigateur → connecte-toi à ton compte Cloudflare
-# Un fichier ~/.cloudflared/cert.pem est créé
-```
-
-> ⚠️ Si tu n'as pas de compte Cloudflare, crée-en un gratuit sur https://cloudflare.com
-
----
-
-## 3. Créer le tunnel
-
-```bash
-cloudflared tunnel create assistant-home
-# Retourne un UUID, ex: 550e8400-e29b-41d4-a716-446655440000
-# Fichier de credentials créé dans ~/.cloudflared/
-```
-
----
-
-## 4. Configurer le tunnel
-
-Crée le fichier `~/.cloudflared/config.yml` :
+C'est le mode tout-en-un. Le PC Noctalia doit joindre le **gateway** :
 
 ```yaml
-tunnel: <TON_UUID_ICI>
-credentials-file: /home/xenospacex/.cloudflared/<TON_UUID_ICI>.json
+# ~/.cloudflared/config.yml
+tunnel: <UUID>
+credentials-file: /home/<user>/.cloudflared/<UUID>.json
 
 ingress:
-  - service: http://localhost:8080
-```
-
-> Sans domaine personnalisé, tu peux utiliser un tunnel temporaire gratuit (voir étape 6).
-
----
-
-## 5. (Optionnel) Lier à un domaine Cloudflare
-
-Si tu as un domaine géré par Cloudflare :
-
-```bash
-cloudflared tunnel route dns assistant-home assistant.tondomaine.com
-```
-
-Puis dans `config.yml`, ajoute le hostname :
-
-```yaml
-ingress:
-  - hostname: assistant.tondomaine.com
-    service: http://localhost:8080
+  - hostname: assistant.tondomaine.fr
+    service: http://127.0.0.1:8000
   - service: http_status:404
 ```
 
----
-
-## 6. Tunnel temporaire (sans domaine, pour tester)
+Puis, sur le PC Noctalia :
 
 ```bash
-# Lance un tunnel rapide sans config → génère une URL aléatoire
-cloudflared tunnel --url http://localhost:8080
-# Ex: https://random-name.trycloudflare.com
+nc-assistant configurer
+# URL : https://assistant.tondomaine.fr
 ```
 
-> Utile pour tester. L'URL change à chaque redémarrage.
-
----
-
-## 7. Lancer le tunnel en service systemd (permanent)
+Le plus simple est d'utiliser le script fourni :
 
 ```bash
-# Installe le service cloudflared
-sudo cloudflared service install
-
-# Démarre
-sudo systemctl start cloudflared
-sudo systemctl enable cloudflared
-
-# Vérifie
-sudo systemctl status cloudflared
+./scripts/expose-gateway.sh cloudflare --hostname assistant.tondomaine.fr
+# ou, pour un test sans compte :
+./scripts/expose-gateway.sh quick
 ```
 
----
+**N'expose pas `8080`** : le runner est l'API privée qui exécute `agy`. Il ne
+fournit ni `/api/ask`, ni `/api/status`, ni `/api/briefing`.
 
-## 8. Trouver ton URL publique
+## Cas 2 — Le gateway est sur Render, le runner reste à la maison
 
-```bash
-# Si tunnel temporaire
-cloudflared tunnel --url http://localhost:8080
-# → copie l'URL affichée
+Dans ce cas seulement, le tunnel relie Render au **runner** local :
 
-# Si tunnel nommé avec domaine
-# → c'est ton hostname configuré
+```yaml
+ingress:
+  - hostname: runner.tondomaine.fr
+    service: http://127.0.0.1:8080
 ```
 
-**Cette URL = `HOME_SERVER_URL` dans le `.env` de render-gateway.**
+Puis dans les variables d'environnement Render :
 
----
+```dotenv
+HOME_SERVER_URL=https://runner.tondomaine.fr
+```
 
-## Récapitulatif des commandes utiles
+Le client Noctalia, lui, utilise l'URL HTTPS de Render — pas celle du tunnel.
+
+## Rappel sécurité
+
+- HTTPS obligatoire hors du réseau local.
+- La clé `X-Secret-Key` reste requise dans les deux cas.
+- `TRUST_PROXY_HEADERS=1` derrière Cloudflare, `0` si le gateway est joignable
+  directement.
+- `DESKTOP_RATE_LIMIT_PER_MINUTE` limite les appels à l'API publique.
+
+## Commandes utiles
 
 ```bash
-cloudflared tunnel list           # Liste tes tunnels
-cloudflared tunnel info assistant-home  # Détails du tunnel
-cloudflared tunnel delete assistant-home # Supprimer
-sudo journalctl -u cloudflared -f  # Logs en temps réel
+cloudflared tunnel list
+cloudflared tunnel info assistant
+sudo journalctl -u cloudflared -f
+systemctl --user status assistant-tunnel
+./scripts/expose-gateway.sh status
 ```

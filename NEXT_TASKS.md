@@ -134,6 +134,14 @@ Problème : `SESSION_CONFIG` est global dans `home-runner/agy_bridge.py`. Tous l
 - Sauvegarder modèle, effort, mode et permission dans un fichier/SQLite.
 - Recharger au démarrage du runner.
 
+### 3.4 Accès distant (livré)
+
+- `scripts/expose-gateway.sh` expose le gateway `8000` via Cloudflare Tunnel (temporaire ou nommé) ou Tailscale Serve.
+- Guide `docs/ACCES_DISTANT.md` : ne jamais exposer le runner `8080`.
+- `GATEWAY_PUBLIC_URL` dans `/api/status`, `DESKTOP_RATE_LIMIT_PER_MINUTE` et `TRUST_PROXY_HEADERS`.
+- Client Noctalia : `nc-assistant verifier` (réseau, clé, TLS, runner) et entrée « Tester l'assistant distant » dans `nc-reglages`.
+- Reste à faire : notifications `desktop` réellement poussées vers l'île (le gateway journalise seulement les rappels desktop).
+
 ---
 
 ## Lot 4 — CI et qualité (moyen)

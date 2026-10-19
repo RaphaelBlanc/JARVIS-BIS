@@ -132,6 +132,32 @@ flowchart LR
 > la mémoire, les sessions, les rappels et la journalisation. Le détail (contrat du CLI,
 > plugin Noctalia, notifications, sécurité) est dans [INTEGRATION_NOCTALIA.md](INTEGRATION_NOCTALIA.md).
 
+#### Utilisation depuis un autre réseau
+
+Une URL `http://192.168.x.x:8000` ne fonctionne que sur le réseau local du
+serveur. Pour utiliser l'assistant depuis un autre Wi-Fi ou Internet, expose le
+**gateway** (port `8000`, jamais le runner `8080`) avec un tunnel :
+
+```bash
+# Test immédiat, sans compte (URL temporaire)
+./scripts/expose-gateway.sh quick
+
+# Durable avec un domaine Cloudflare
+./scripts/expose-gateway.sh cloudflare --hostname assistant.tondomaine.fr
+
+# Ou réseau privé Tailscale
+./scripts/expose-gateway.sh tailscale
+```
+
+Puis, sur le PC Noctalia :
+
+```bash
+nc-assistant configurer   # URL HTTPS affichée par le script
+nc-assistant verifier    # diagnostic réseau, clé, certificat, runner
+```
+
+Guide complet : [docs/ACCES_DISTANT.md](docs/ACCES_DISTANT.md).
+
 ---
 
 ## 📂 Structure du Répertoire
@@ -143,6 +169,10 @@ assistant-perso/
 ├── NEXT_TASKS.md              # 🗺️ Backlog de passation et priorités
 ├── INTEGRATION_NOCTALIA.md    # 🖥️ Rapport d'intégration au rice Noctalia/Hyprland
 ├── .env.example               # ⚙️ Modèle de configuration globale
+├── docs/
+│   └── ACCES_DISTANT.md       # 🌍 Tunnel Cloudflare, Tailscale, accès hors LAN
+├── scripts/
+│   └── expose-gateway.sh      # 🔌 Expose le gateway (8000) sans ouvrir de port
 ├── systemd/                   # 🐧 Units systemd pour lancement en tâche de fond
 │   ├── assistant-runner.service
 │   └── assistant-gateway.service
@@ -362,6 +392,8 @@ CI, produits) est maintenu dans [NEXT_TASKS.md](NEXT_TASKS.md).
 
 - **Authentification forte** : Chaque échange entre la passerelle (`render-gateway`) et le moteur local (`home-runner`) est protégé par une clé `X-Secret-Key` de 256 bits. Le client bureau prévu (`nc-assistant`) réutilisera cette clé, stockée dans un fichier `600`, jamais dans le QML ou la ligne de commande.
 - **Écoute locale par défaut** : en mode tout-en-un, fais écouter le gateway et le runner sur `127.0.0.1`. N'ouvre `0.0.0.0` que si un accès LAN ou un tunnel est nécessaire, avec pare-feu et HTTPS.
+- **Accès distant par tunnel** : `scripts/expose-gateway.sh` expose uniquement le gateway (`8000`) via Cloudflare Tunnel ou Tailscale. Le runner (`8080`) ne doit jamais être exposé directement. Voir [docs/ACCES_DISTANT.md](docs/ACCES_DISTANT.md).
+- **Limitation de débit** : `DESKTOP_RATE_LIMIT_PER_MINUTE` (60 par défaut) protège `/api/*` contre le brute force et les abus lorsque le gateway est public. Derrière un tunnel, active `TRUST_PROXY_HEADERS=1` pour compter la vraie IP.
 - **Accès restreint (Whitelist)** : Définissez `DISCORD_ALLOWED_USER_IDS` et `TELEGRAM_ALLOWED_USER_IDS` afin que personne d'autre ne puisse interagir avec votre assistant. Par défaut (**fail-closed**), une whitelist vide refuse tout le monde ; pour ouvrir l'accès sans whitelist, définissez explicitement `ALLOW_ALL_USERS=1` (non recommandé).
 - **Webhook Telegram authentifié** : En mode webhook, chaque requête est validée via le header `X-Telegram-Bot-Api-Secret-Token`. Le secret est dérivé automatiquement de `SECRET_KEY`, ou peut être fixé via `TELEGRAM_WEBHOOK_SECRET`.
 - **Sandbox d'exécution** : `agy` est lancé avec `--sandbox` par défaut (`AGY_SANDBOX=1`), ce qui limite les actions terminal. Les prompts sont aussi bornés (`MAX_PROMPT_CHARS`) et les images limitées (`MAX_IMAGE_MB`).

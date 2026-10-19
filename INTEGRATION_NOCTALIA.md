@@ -171,6 +171,24 @@ flowchart LR
 
 Dans les deux cas, **le bureau ne parle jamais directement à `agy`**. Il passe par le gateway, ce qui garantit la mémoire, les sessions, les rappels et la journalisation.
 
+### 4.3 Exposition du gateway hors du réseau local
+
+Une URL `http://192.168.1.28:8000` n'est joignable que sur le LAN. Pour un
+usage depuis un autre réseau, le dépôt fournit :
+
+```bash
+./scripts/expose-gateway.sh quick       # Cloudflare Tunnel temporaire
+./scripts/expose-gateway.sh cloudflare --hostname assistant.tondomaine.fr
+./scripts/expose-gateway.sh tailscale   # réseau privé Tailscale
+```
+
+Le script expose le **gateway `8000`**, pas le runner `8080`. Le client Noctalia
+reçoit ensuite l'URL HTTPS dans `nc-assistant configurer`, puis la vérifie avec
+`nc-assistant verifier`. Guide complet : [`docs/ACCES_DISTANT.md`](docs/ACCES_DISTANT.md).
+
+Côté gateway, `DESKTOP_RATE_LIMIT_PER_MINUTE` limite `/api/*` et
+`TRUST_PROXY_HEADERS=1` permet de compter la vraie IP derrière Cloudflare.
+
 ---
 
 ## 5. Intégration P0 — compatibilité et hygiène (30 min)
@@ -224,7 +242,9 @@ Le CLI lit la configuration dans `~/.config/nc/assistant.conf` :
 
 ```ini
 # ~/.config/nc/assistant.conf — chmod 600
-URL=http://127.0.0.1:8000
+# LAN : http://127.0.0.1:8000 ou http://192.168.1.28:8000
+# Autre réseau : URL HTTPS du tunnel (Cloudflare/Tailscale/Render)
+URL=https://assistant.tondomaine.fr
 SECRET_KEY=...
 PLATFORM=desktop
 USER_ID=noctalia
@@ -420,6 +440,8 @@ Pour les missions longues (recherche, analyse de documents), ajouter une file c�
 |---|---|
 | Clé exposée dans le QML ou la ligne de commande | CLI uniquement, fichier `600`, jamais d’argument `--secret`. |
 | Gateway accessible depuis le réseau | Bind `127.0.0.1` par défaut ; si LAN, firewall + `X-Secret-Key` ; si Internet, HTTPS/Tunnel. |
+| Abus / brute force sur l'API publique | `DESKTOP_RATE_LIMIT_PER_MINUTE` (60/min par IP), `TRUST_PROXY_HEADERS=1` derrière Cloudflare. |
+| Runner exposé par erreur | N'exposer que le gateway `8000` ; le runner `8080` reste privé. |
 | Fuite de contenu dans les notifications | Option de mode discret ; ne pas afficher le texte complet sur l’écran verrouillé. |
 | Injection de prompt via e-mails/web | Déjà couverte par `GEMINI.md` ; le bureau doit envoyer le même préambule de sécurité. |
 | Actions destructrices depuis le panneau | Le panneau ne doit exposer que des actions réversibles ; les actions `agy` restent en `request-review` si tu veux confirmer. |

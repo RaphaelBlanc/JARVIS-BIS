@@ -14,11 +14,14 @@ import hmac
 import logging
 import os
 import sys
+import time
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 # Charge les variables d'environnement depuis .env (si présent)
@@ -78,7 +81,42 @@ from briefing import (  # noqa: E402
 TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_TOKEN", "")
 SECRET_KEY: str = os.getenv("SECRET_KEY", "")
 HOME_SERVER_URL: str = os.getenv("HOME_SERVER_URL", "")
+GATEWAY_PUBLIC_URL: str = os.getenv("GATEWAY_PUBLIC_URL", "").rstrip("/")
 VERSION: str = "1.0.0"
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("Valeur invalide pour %s ; valeur par défaut %s.", name, default)
+        return default
+
+
+# Protection de l'API publique (client Noctalia, scripts, etc.).
+# 0 désactive la limite. La limite est appliquée par adresse IP sur /api/*.
+DESKTOP_RATE_LIMIT: int = _env_int("DESKTOP_RATE_LIMIT_PER_MINUTE", 60)
+DESKTOP_RATE_WINDOW: float = 60.0
+# Derrière un tunnel (Cloudflare, reverse proxy), l'IP réelle est dans un
+# en-tête. Ne l'activer que si le gateway n'est joignable qu'à travers ce proxy.
+TRUST_PROXY_HEADERS: bool = os.getenv("TRUST_PROXY_HEADERS", "0").strip() == "1"
+
+_RATE_HITS: dict[str, deque[float]] = defaultdict(deque)
+
+
+def _client_ip(request: Request) -> str:
+    """Retourne l'adresse du client, en tenant compte d'un proxy de confiance."""
+    if TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("cf-connecting-ip") or request.headers.get(
+            "x-forwarded-for", ""
+        )
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()[:64]
+    return (request.client.host if request.client else "unknown")[:64]
+
+
+def reset_rate_limit() -> None:
+    """Vide le compteur (utile pour les tests et après un redémarrage)."""
+    _RATE_HITS.clear()
 
 # ── Validation au démarrage ───────────────────────────────────────────────────
 
@@ -361,6 +399,38 @@ app = FastAPI(
 app.include_router(telegram_router)
 
 
+@app.middleware("http")
+async def limit_desktop_api(request: Request, call_next):
+    """Limite les appels à l'API publique pour résister à une exposition Internet.
+
+    Les routes de santé et le webhook Telegram ne sont pas concernés.
+    """
+    if (
+        DESKTOP_RATE_LIMIT > 0
+        and request.url.path.startswith("/api/")
+        and request.url.path not in {"/api/health"}
+    ):
+        ip = _client_ip(request)
+        now = time.monotonic()
+        if len(_RATE_HITS) > 10_000:
+            cutoff = now - DESKTOP_RATE_WINDOW
+            for ancien in [k for k, v in _RATE_HITS.items() if not v or v[-1] <= cutoff]:
+                _RATE_HITS.pop(ancien, None)
+        hits = _RATE_HITS[ip]
+        while hits and hits[0] <= now - DESKTOP_RATE_WINDOW:
+            hits.popleft()
+        if len(hits) >= DESKTOP_RATE_LIMIT:
+            retry_after = max(1, int(DESKTOP_RATE_WINDOW - (now - hits[0])))
+            logger.warning("Limite API atteinte pour %s.", ip)
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Trop de requêtes. Réessaie dans un instant."},
+                headers={"Retry-After": str(retry_after)},
+            )
+        hits.append(now)
+    return await call_next(request)
+
+
 # ── API Desktop / Client générique (Noctalia, scripts, etc.) ─────────────────
 
 
@@ -457,6 +527,7 @@ async def api_status() -> dict:
             "home_server_configured": bool(HOME_SERVER_URL),
             "telegram_configured": bool(TELEGRAM_TOKEN),
             "discord_configured": bool(discord_token),
+            "public_url": GATEWAY_PUBLIC_URL or None,
         },
     }
 
@@ -644,4 +715,5 @@ async def health() -> dict:
         "telegram_configured": bool(TELEGRAM_TOKEN),
         "discord_configured": bool(discord_token),
         "secret_key_configured": bool(SECRET_KEY),
+        "public_url_configured": bool(GATEWAY_PUBLIC_URL),
     }

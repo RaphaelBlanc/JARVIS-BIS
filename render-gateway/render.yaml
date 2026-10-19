@@ -9,6 +9,12 @@ services:
         sync: false
       - key: SECRET_KEY
         sync: false
+      - key: GATEWAY_PUBLIC_URL
+        sync: false
+      - key: DESKTOP_RATE_LIMIT_PER_MINUTE
+        sync: false
+      - key: TRUST_PROXY_HEADERS
+        sync: false
       - key: TELEGRAM_TOKEN
         sync: false
       - key: TELEGRAM_WEBHOOK_URL
