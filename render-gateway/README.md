@@ -61,6 +61,9 @@ Copiez `.env.example` en `.env` et renseignez les valeurs.
 | `/meteo [ville]` | `/weather` | Météo mondiale en direct (ex: `/meteo Paris`) |
 | `/search [requete]` | `/recherche` | Recherche sur le web avec DuckDuckGo |
 | `/summarize [url]` | — | Résume un article ou une page web |
+| `/rappel [delai] [message]` | `/reminder` | Programme un rappel (15m, 1h30, 14h30) |
+| `/rappels` | `/reminders` | Liste les rappels actifs |
+| `/annuler_rappel [id]` | `/delrappel` | Annule un rappel |
 | `/models` | `/model` | Menu interactif de sélection des modèles |
 | `/setmodel [id]` | — | Change le modèle actif directement |
 | `/effort [level]` | — | Règle l'effort de réflexion (`low`, `medium`, `high`) |
@@ -100,6 +103,9 @@ Toutes les commandes sont utilisables en **slash command native** (`/...`) ou en
 | `/meteo [ville]` | `!meteo [ville]` (alias `!weather`) | Météo mondiale en temps réel |
 | `/search [requete]` | `!search [requete]` (alias `!recherche`) | Recherche sur le web avec DuckDuckGo |
 | `/summarize [url]` | `!summarize [url]` | Résumé intelligent d'une URL |
+| `/rappel [delai] [message]` | `!rappel [delai] [message]` (alias `!reminder`) | Programme un rappel persistant |
+| `/rappels` | `!rappels` (alias `!reminders`) | Liste les rappels actifs |
+| `/annuler_rappel [id]` | `!annuler_rappel [id]` (alias `!annuler-rappel`) | Annule un rappel |
 | `/models` | `!models` | Liste les modèles Antigravity disponibles |
 | `/setmodel [model]` | `!setmodel [id]` | Change le modèle IA actif |
 | `/effort [level]` | `!effort [level]` | Ajuste l'effort de réflexion (`low`, `medium`, `high`) |

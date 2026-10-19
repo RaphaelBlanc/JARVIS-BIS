@@ -26,6 +26,15 @@ from formatters import (
     latex_to_unicode,
 )
 from stt import transcribe_audio
+from reminders import (
+    add_reminder,
+    cancel_reminder,
+    detect_natural_reminder_datetime,
+    format_remaining_time,
+    format_reminder_confirmation,
+    list_active_reminders,
+    split_time_and_message,
+)
 
 
 from fastapi import APIRouter, Request, Response
@@ -405,11 +414,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/meteo [ville]` — Météo en direct (Open-Meteo mondiale)\n"
         "• `/search <requête>` — Recherche web DuckDuckGo\n"
         "• `/summarize <url>` — Résumer une page web ou un article\n"
+        "• `/rappel <durée> <message>` — Programmer un rappel (15m, 1h30, 14h30)\n"
+        "• `/rappels` — Lister vos rappels actifs\n"
+        "• `/annuler_rappel <id>` — Annuler un rappel\n"
         "• `/status` — État complet du système et des services\n\n"
         "💬 *Discussion & Mémoire*\n"
         "• Écrivez simplement votre message pour échanger naturellement.\n"
         "• 🎤 Envoyez un message vocal : il est transcrit puis traité automatiquement.\n"
         "• 👁️ Envoyez une photo : elle est analysée directement.\n"
+        "• ⏰ « Rappelle-moi dans 15 min de... » crée un rappel automatiquement.\n"
         "• Vos messages s'enchaînent avec mémoire du contexte !\n"
         "• `/new` — Démarre une nouvelle conversation vierge\n"
         "• `/compact` — Compacte la mémoire de la conversation en cours\n"
@@ -1258,6 +1271,121 @@ async def send_broadcast_message(text: str) -> None:
     await _send_broadcast_message_impl(text)
 
 
+async def _send_telegram_message_impl(chat_id: str, text: str) -> None:
+    """Envoie un message à un chat Telegram précis, dans la boucle du bot."""
+    app = get_application()
+    await app.bot.send_message(chat_id=int(chat_id), text=text)
+
+
+async def send_telegram_message(chat_id: str, text: str) -> None:
+    """Envoie un message Telegram en respectant la boucle asyncio du bot."""
+    loop = _TELEGRAM_LOOP
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if loop is not None and loop.is_running() and loop is not current_loop:
+        future = asyncio.run_coroutine_threadsafe(
+            _send_telegram_message_impl(chat_id, text), loop
+        )
+        await asyncio.wrap_future(future)
+        return
+
+    await _send_telegram_message_impl(chat_id, text)
+
+
+async def cmd_rappel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Crée un rappel : /rappel <durée> <message>."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    _save_chat_id(update.effective_chat.id)
+    raw = " ".join(context.args or []).strip()
+    if not raw:
+        await update.message.reply_text(
+            "⏰ Utilisation : `/rappel <durée> <message>`\n"
+            "Exemples : `/rappel 15m Sortir le pain` ou `/rappel 14h30 Appeler le médecin`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    remind_at, message, error = split_time_and_message(raw)
+    if remind_at is None or not message:
+        await update.message.reply_text(f"❌ {error}")
+        return
+
+    reminder = add_reminder(
+        platform="telegram",
+        chat_id=update.effective_chat.id,
+        target_id=user.id,
+        message=message,
+        remind_at=remind_at,
+        target_name=getattr(user, "full_name", "") or "",
+    )
+    logger.info(
+        "Rappel #%s créé via /rappel (telegram -> %s) : %s",
+        reminder["id"],
+        update.effective_chat.id,
+        message,
+    )
+    await update.message.reply_text(format_reminder_confirmation(reminder))
+
+
+async def cmd_rappels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Liste les rappels actifs du chat Telegram."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    reminders = list_active_reminders(update.effective_chat.id)
+    if not reminders:
+        await update.message.reply_text("⏰ Aucun rappel actif.")
+        return
+
+    lines = ["⏰ Rappels actifs :"]
+    for reminder in reminders:
+        lines.append(
+            f"• #{reminder['id']} — {reminder['message']} — "
+            f"{format_remaining_time(reminder['remind_at'])}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_annuler_rappel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Annule un rappel : /annuler_rappel <id>."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Utilisation : `/annuler_rappel <id>`. Utilisez `/rappels` pour voir les IDs.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        reminder_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ L'ID doit être un nombre.")
+        return
+
+    if cancel_reminder(reminder_id, update.effective_chat.id):
+        logger.info("Rappel #%s annulé (telegram).", reminder_id)
+        await update.message.reply_text(f"✅ Rappel #{reminder_id} annulé.")
+    else:
+        await update.message.reply_text(
+            f"❌ Aucun rappel actif #{reminder_id} dans ce chat."
+        )
+
+
 async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Génère le briefing matinal complet (tri des e-mails, agenda, météo)."""
     user = update.effective_user
@@ -1272,8 +1400,48 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await send_or_edit_telegram_response(waiting_msg, output, update.message)
 
 
+async def _try_create_natural_reminder(
+    update: Update, prompt: str, waiting_msg
+) -> bool:
+    """Crée un rappel si le message contient une formulation naturelle.
+
+    Retourne True si un rappel a été créé (le message ne doit alors pas être
+    transmis à agy).
+    """
+    detected = detect_natural_reminder_datetime(prompt)
+    if not detected:
+        return False
+
+    remind_at, message = detected
+    try:
+        reminder = add_reminder(
+            platform="telegram",
+            chat_id=update.effective_chat.id,
+            target_id=update.effective_user.id,
+            message=message,
+            remind_at=remind_at,
+            target_name=getattr(update.effective_user, "full_name", "") or "",
+        )
+    except Exception as exc:
+        logger.error("Erreur création rappel naturel Telegram: %s", exc)
+        return False
+
+    logger.info(
+        "Rappel #%s créé (telegram -> %s) pour %s : %s",
+        reminder["id"],
+        update.effective_chat.id,
+        reminder["remind_at"],
+        message,
+    )
+    await waiting_msg.edit_text(format_reminder_confirmation(reminder))
+    return True
+
+
 async def _process_prompt_and_reply(update: Update, prompt: str, waiting_msg) -> None:
     """Envoie un prompt au runner et édite le message d'attente avec la réponse."""
+    if await _try_create_natural_reminder(update, prompt, waiting_msg):
+        return
+
     result = await forward_to_runner(prompt, continue_session=True)
 
     if result.get("success"):
@@ -1422,6 +1590,9 @@ from telegram.request import HTTPXRequest
 
 BOT_COMMANDS = [
     BotCommand("briefing", "Briefing matinal (mails triés, agenda, météo)"),
+    BotCommand("rappel", "Programmer un rappel (ex: 15m Sortir le pain)"),
+    BotCommand("rappels", "Lister vos rappels actifs"),
+    BotCommand("annuler_rappel", "Annuler un rappel par son numéro"),
     BotCommand("resume", "Reprendre une discussion précédente"),
     BotCommand("delete", "Supprimer des discussions passées"),
     BotCommand("agenda", "Consulter Google Agenda (aujourd'hui, semaine)"),
@@ -1467,6 +1638,12 @@ def get_application() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("briefing", cmd_briefing))
     app.add_handler(CommandHandler("brief", cmd_briefing))
+    app.add_handler(CommandHandler("rappel", cmd_rappel))
+    app.add_handler(CommandHandler("reminder", cmd_rappel))
+    app.add_handler(CommandHandler("rappels", cmd_rappels))
+    app.add_handler(CommandHandler("reminders", cmd_rappels))
+    app.add_handler(CommandHandler("annuler_rappel", cmd_annuler_rappel))
+    app.add_handler(CommandHandler("delrappel", cmd_annuler_rappel))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("del", cmd_delete))

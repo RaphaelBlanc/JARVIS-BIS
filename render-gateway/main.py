@@ -14,10 +14,11 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
-
+from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
 # Charge les variables d'environnement depuis .env (si présent)
 load_dotenv()
@@ -48,6 +49,16 @@ from bots.telegram_bot import (  # noqa: E402
     TELEGRAM_WEBHOOK_URL,
 )
 from bots.discord_bot import start_discord_bot, stop_discord_bot  # noqa: E402
+from reminders import (  # noqa: E402
+    TIMEZONE,
+    add_reminder,
+    cancel_reminder,
+    get_due_reminders,
+    init_db,
+    list_active_reminders,
+    mark_reminder_sent,
+    parse_delay_or_time,
+)
 
 # ── Variables d'environnement ─────────────────────────────────────────────────
 
@@ -116,6 +127,62 @@ async def morning_briefing_scheduler() -> None:
         await asyncio.sleep(60)
 
 
+# ── Planificateur de rappels ──────────────────────────────────────────────────
+
+async def distribute_reminder(reminder: dict) -> None:
+    """Envoie un rappel sur sa plateforme d'origine (Telegram ou Discord)."""
+    platform = (reminder.get("platform") or "").lower()
+    chat_id = str(reminder.get("chat_id") or "")
+    message = str(reminder.get("message") or "").strip()
+    text = f"⏰ Rappel : {message}"
+
+    logger.info(
+        "Distribution du rappel #%s (%s -> %s) : %s",
+        reminder.get("id"),
+        platform,
+        chat_id,
+        message,
+    )
+
+    if platform == "telegram":
+        from bots.telegram_bot import send_telegram_message
+
+        await send_telegram_message(chat_id, text)
+        return
+
+    if platform == "discord":
+        from bots.discord_bot import send_discord_message_to_channel
+
+        await send_discord_message_to_channel(int(chat_id), text)
+        return
+
+    raise ValueError(f"Plateforme de rappel inconnue : {platform!r}")
+
+
+async def reminder_scheduler() -> None:
+    """Tâche de fond qui distribue les rappels arrivés à échéance."""
+    init_db()
+    logger.info("Planificateur de rappels actif (vérification toutes les 5s).")
+    while True:
+        try:
+            for reminder in get_due_reminders():
+                try:
+                    await distribute_reminder(reminder)
+                    mark_reminder_sent(reminder["id"])
+                except Exception as exc:
+                    logger.error(
+                        "Erreur distribution rappel #%s: %s",
+                        reminder.get("id"),
+                        exc,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Erreur dans le planificateur de rappels: %s", exc)
+
+        await asyncio.sleep(5)
+
+
 # ── Lifespan FastAPI ──────────────────────────────────────────────────────────
 
 
@@ -152,8 +219,9 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("TELEGRAM_TOKEN manquant — bot Telegram inactif.")
 
-    # Démarre la tâche de fond du briefing matinal
+    # Démarre les tâches de fond (briefing + rappels)
     scheduler_task = asyncio.create_task(morning_briefing_scheduler())
+    reminder_task = asyncio.create_task(reminder_scheduler())
 
     logger.info("render-gateway prêt à recevoir des requêtes.")
 
@@ -161,7 +229,14 @@ async def lifespan(app: FastAPI):
 
     # Arrêt
     logger.info("=== Arrêt du render-gateway ===")
-    scheduler_task.cancel()
+    for task in (scheduler_task, reminder_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error("Erreur lors de l'arrêt d'une tâche de fond: %s", exc)
     try:
         stop_telegram_polling()
     except Exception as exc:
@@ -187,6 +262,109 @@ app = FastAPI(
 
 # Monte le router Telegram
 app.include_router(telegram_router)
+
+
+# ── API de gestion des rappels ────────────────────────────────────────────────
+
+
+class ReminderCreateRequest(BaseModel):
+    """Corps de création d'un rappel (utilisé par l'API et les intégrations)."""
+
+    platform: str = Field(default="telegram", description="telegram ou discord")
+    chat_id: str = Field(..., description="ID du chat Telegram ou du salon Discord")
+    target_id: Optional[str] = Field(default=None, description="ID de l'utilisateur")
+    target_name: str = Field(default="", description="Nom de l'utilisateur")
+    message: str = Field(..., min_length=1, description="Texte du rappel")
+    remind_at: Optional[str] = Field(
+        default=None,
+        description="Date/heure ISO 8601. Ex: 2026-10-19T18:30:00+02:00",
+    )
+    delay: Optional[str] = Field(
+        default=None,
+        description="Durée relative. Ex: 15m, 1h30, 2h",
+    )
+
+
+def _parse_iso_datetime(value: str) -> datetime.datetime:
+    """Parse une date ISO en ajoutant le fuseau Europe/Paris si nécessaire."""
+    normalized = value.strip().replace("Z", "+00:00")
+    parsed = datetime.datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=TIMEZONE)
+    return parsed
+
+
+@app.post("/api/reminders", tags=["reminders"], summary="Créer un rappel")
+async def create_reminder(payload: ReminderCreateRequest) -> dict:
+    """Crée un rappel persistant pour Telegram ou Discord."""
+    platform = payload.platform.strip().lower()
+    if platform not in {"telegram", "discord"}:
+        raise HTTPException(status_code=400, detail="platform doit être telegram ou discord")
+
+    if payload.delay:
+        # Un champ "delay" est par définition une durée relative : "1h30"
+        # doit signifier 1h30 plus tard, pas 01h30 du matin.
+        remind_at, error = parse_delay_or_time(payload.delay, force_relative=True)
+        if remind_at is None:
+            raise HTTPException(status_code=400, detail=error or "Durée invalide")
+    elif payload.remind_at:
+        try:
+            remind_at = _parse_iso_datetime(payload.remind_at)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"remind_at invalide : {exc}"
+            ) from exc
+    else:
+        raise HTTPException(
+            status_code=400, detail="Fournissez delay ou remind_at"
+        )
+
+    reminder = add_reminder(
+        platform=platform,
+        chat_id=payload.chat_id,
+        target_id=payload.target_id,
+        message=payload.message,
+        remind_at=remind_at,
+        target_name=payload.target_name,
+    )
+    return {"success": True, "reminder": reminder}
+
+
+@app.get("/api/reminders", tags=["reminders"], summary="Lister les rappels actifs")
+async def get_reminders(
+    chat_id: Optional[str] = None,
+    platform: Optional[str] = None,
+) -> dict:
+    """Liste les rappels en attente, éventuellement filtrés."""
+    reminders = list_active_reminders(chat_id)
+    if platform:
+        wanted = platform.strip().lower()
+        reminders = [r for r in reminders if r["platform"] == wanted]
+    return {"reminders": reminders, "count": len(reminders)}
+
+
+@app.delete("/api/reminders/{reminder_id}", tags=["reminders"], summary="Annuler un rappel")
+async def delete_reminder(
+    reminder_id: int,
+    chat_id: Optional[str] = None,
+) -> dict:
+    """Annule un rappel en attente."""
+    if not cancel_reminder(reminder_id, chat_id):
+        raise HTTPException(status_code=404, detail="Rappel introuvable ou déjà traité")
+    return {"success": True, "cancelled_id": reminder_id}
+
+
+@app.post(
+    "/api/reminders/{reminder_id}/cancel",
+    tags=["reminders"],
+    summary="Annuler un rappel (alias)",
+)
+async def cancel_reminder_endpoint(
+    reminder_id: int,
+    chat_id: Optional[str] = None,
+) -> dict:
+    """Alias POST pour annuler un rappel."""
+    return await delete_reminder(reminder_id, chat_id)
 
 
 # ── Routes de santé ───────────────────────────────────────────────────────────

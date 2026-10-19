@@ -206,6 +206,11 @@ Toutes les fonctionnalités sont disponibles sur **Discord** (commandes slash na
 | `/meteo [ville]` | `/meteo [ville]` | `/weather`, `!meteo` | Prévisions météo mondiales en temps réel (ex: `/meteo Lyon`) |
 | `/search [requete]` | `/search [requete]` | `/recherche`, `!search` | Recherche sur le web via DuckDuckGo avec synthèse IA |
 | `/summarize [url]` | `/summarize [url]` | `!summarize` | Extrait et résume le contenu d'un article ou d'une page web |
+| `/rappel [delai] [message]` | `/rappel [delai] [message]` | `/reminder`, `!rappel` | Programme un rappel persistant (ex: `/rappel 15m Sortir le pain`) |
+| `/rappels` | `/rappels` | `/reminders`, `!rappels` | Liste les rappels actifs |
+| `/annuler_rappel [id]` | `/annuler_rappel [id]` | `!annuler_rappel` | Annule un rappel par son numéro |
+
+> Les rappels fonctionnent aussi en langage naturel, y compris via les messages vocaux : « Rappelle-moi dans 15 min de sortir le pain » ou « Je veux un rappel dans 3 minutes pour... ».
 
 ### 2. 🧠 Conversation, Sessions & Mémoire
 
