@@ -8,9 +8,11 @@ Expose une API HTTP privée qui reçoit des requêtes depuis le serveur Render
 
 import base64
 import hmac
+import json
 import logging
 import os
 import re
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -116,6 +118,15 @@ def _format_token_usage() -> str:
         f"• Réponses : {stats['output_chars']} caractères\n"
         "• Tokens : non exposés par agy"
     )
+
+
+# ---------------------------------------------------------------------------
+# Moteurs d'exécution IA (Antigravity agy, Codex, Claude Code, OpenCode)
+# ---------------------------------------------------------------------------
+
+from nc_engines import install as install_engines, executable as engine_executable
+
+engines = install_engines(sys.modules[__name__])
 
 
 # ---------------------------------------------------------------------------
@@ -296,27 +307,59 @@ async def ping():
 @app.get("/health", summary="État de santé détaillé")
 async def health():
     """
-    Vérifie que le service est opérationnel et qu'agy est accessible.
+    Vérifie que le service est opérationnel et que le moteur actif est accessible.
     Pas d'authentification requise.
     """
+    engine = engines.session().get("engine", "agy")
+    available = bool(engine_executable(engine))
+
     agy_path = find_agy()
     agy_available = agy_path is not None
 
     payload = {
-        "status": "ok" if agy_available else "degraded",
+        "status": "ok" if available else "degraded",
         "version": "1.0.0",
+        "engine": engine,
+        "engine_available": available,
         "agy_available": agy_available,
         "agy_path": agy_path,
         "agy_timeout_default": AGY_TIMEOUT,
-        "session": get_session_info(),
-        "agy_worker": get_worker_info(),
+        "session": engines.session(),
+        "runner_alive": True,
     }
+    if engine == "agy":
+        payload["agy_worker"] = get_worker_info()
 
-    if not agy_available:
-        logger.warning("/health : agy introuvable, statut dégradé.")
+    if not available:
+        logger.warning("/health : moteur %s introuvable, statut dégradé.", engine)
         return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=payload)
 
     return payload
+
+
+@app.get("/nc/engines", summary="Réglages et moteurs IA pour Noctalia")
+async def nc_get_engines(request: Request):
+    _check_secret(request)
+    return engines.snapshot()
+
+
+@app.post("/nc/engine", summary="Changer le moteur ou modèle IA")
+async def nc_post_engine(request: Request):
+    _check_secret(request)
+    raw = await request.body()
+    if len(raw) > 4096:
+        raise HTTPException(status_code=413, detail="Payload too large")
+    try:
+        values = json.loads(raw)
+        if not isinstance(values, dict) or any(not isinstance(v, str) or len(v) > 200 for v in values.values()):
+            raise ValueError
+        return {"status": "updated", "session": engines.choose(**values)}
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Réglages moteur invalides, CLI absent ou requête en cours."
+        ) from None
+
 
 
 @app.get("/usage/stats", summary="Suivi local des tokens")

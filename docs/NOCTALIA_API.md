@@ -166,13 +166,15 @@ Permet à `nc-assistant verifier` ou à l'icône de la barre Noctalia d'afficher
   {
     "online": true,
     "version": "1.0.0",
-    "deploy_mode": "server",
-    "pc_agent_connected": true,
+    "deploy_mode": "local",
     "runner": {
       "status": "ok",
+      "engine": "agy",
+      "engine_available": true,
       "agy_available": true
     },
     "session": {
+      "engine": "agy",
       "model": "gemini-3.8-flash-low",
       "turns": 4
     },
@@ -186,9 +188,6 @@ Permet à `nc-assistant verifier` ou à l'icône de la barre Noctalia d'afficher
     }
   }
   ```
-
-> [!TIP]
-> Le champ `pc_agent_connected` indique si le PC portable de l'utilisateur est actuellement connecté en WebSocket au serveur distant. Si `false`, les commandes matérielles locales (`system_pc`) sont indisponibles.
 
 ---
 
@@ -210,6 +209,33 @@ Permet à `nc-assistant verifier` ou à l'icône de la barre Noctalia d'afficher
     "error": null
   }
   ```
+
+---
+
+### 3.6 Cockpit d'administration Noctalia (`POST /api/nc/manage`)
+
+Point d'entrée du protocole de gestion et du tableau de bord complet Noctalia (**Super + Alt + A** / `nc-jarvis`).
+
+- **Méthode** : `POST /api/nc/manage`
+- **Headers** : `X-Secret-Key: <SECRET_KEY>`
+- **Corps de la requête (JSON)** :
+  ```json
+  {
+    "op": "<opération>",
+    "params": {},
+    "confirmed": false
+  }
+  ```
+
+#### Opérations prises en charge (`op`) :
+* **`capabilities`** : Retourne la liste des modules, les champs de configuration `.env`, et la version du protocole (`protocol: 1`).
+* **`quick-settings`** : Retourne les moteurs IA disponibles (`agy`, `codex`, `claude`, `opencode`) et le moteur actif.
+* **`session.update`** : Change dynamiquement de moteur, modèle ou niveau d'effort de réflexion (`low`, `high`, `ultra`).
+* **`session.reset`** : Réinitialise la conversation en cours.
+* **`memory`**, **`memory.add`**, **`memory.delete`** : Lecture et gestion des faits en mémoire durable.
+* **`conversations`**, **`conversation.history`**, **`conversation.resume`** : Historique et reprise de sessions passées.
+* **`config.update`** : Enregistrement atomique des jetons et variables `.env`.
+* **`services`**, **`service.restart`**, **`logs`** : État des services systemd et journaux filtrés.
 
 ---
 

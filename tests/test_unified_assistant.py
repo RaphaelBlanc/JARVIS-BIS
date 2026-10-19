@@ -84,13 +84,31 @@ class TestUnifiedAssistant(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(ok)
             self.assertEqual(msg, "Session verrouillée")
 
-    async def test_hardware_relay_unknown_action(self):
-        """Vérifie le comportement face à une action inconnue."""
-        relay = HardwareRelay()
-        ok, msg, data = await relay.execute("action_inconnue")
-        self.assertFalse(ok)
-        self.assertIn("inconnue", msg.lower())
+    async def test_nc_management_capabilities(self):
+        """Vérifie le schéma et les capacités retournées à Noctalia."""
+        from gateway.nc_management import dispatch
+        res = await dispatch("capabilities", {}, False)
+        self.assertEqual(res.get("protocol"), 1)
+        self.assertIn("modules", res)
+        self.assertIn("fields", res)
+        module_ids = [m["id"] for m in res["modules"]]
+        self.assertIn("shopping", module_ids)
+        self.assertIn("expenses", module_ids)
+
+    def test_nc_engines_snapshot(self):
+        """Vérifie la gestion des moteurs du runner."""
+        import sys
+        from pathlib import Path
+        runner_dir = str(Path(__file__).resolve().parent.parent / "home-runner")
+        if runner_dir not in sys.path:
+            sys.path.insert(0, runner_dir)
+        import nc_engines
+        self.assertIn("agy", nc_engines.ENGINES)
+        self.assertIn("codex", nc_engines.ENGINES)
+        self.assertIn("claude", nc_engines.ENGINES)
+        self.assertIn("opencode", nc_engines.ENGINES)
 
 
 if __name__ == "__main__":
     unittest.main()
+

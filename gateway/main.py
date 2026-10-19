@@ -828,3 +828,30 @@ async def health() -> dict:
         "secret_key_configured": bool(SECRET_KEY),
         "public_url_configured": bool(GATEWAY_PUBLIC_URL),
     }
+
+
+# ── API Noctalia Management ───────────────────────────────────────────────────
+
+@app.post(
+    "/api/nc/manage",
+    tags=["desktop"],
+    summary="Adaptateur d'administration et de gestion pour Noctalia (Cockpit Super+Alt+A)",
+    dependencies=[Depends(require_secret)],
+)
+async def nc_manage(request: Request):
+    """Point d'entrée du protocole de gestion Noctalia (Jarvis Cockpit)."""
+    raw = await request.body()
+    if len(raw) > 65536:
+        raise HTTPException(status_code=413, detail="Requête trop volumineuse")
+    try:
+        body = json.loads(raw)
+        if not isinstance(body, dict) or not isinstance(body.get("params", {}), dict):
+            raise ValueError
+        try:
+            from gateway.nc_management import dispatch
+        except ImportError:
+            from nc_management import dispatch
+        return await dispatch(body.get("op"), body.get("params", {}), body.get("confirmed") is True)
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(status_code=400, detail="Paramètres invalides") from None
+
