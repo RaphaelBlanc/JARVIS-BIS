@@ -182,6 +182,9 @@ class AssistantBot(commands.Bot):
         self._guild_obj: Optional[discord.Object] = (
             discord.Object(id=DISCORD_GUILD_ID) if DISCORD_GUILD_ID else None
         )
+        # L'aide par défaut liste chaque alias comme une commande séparée, ce
+        # qui donne une impression de doublons. On la remplace plus bas.
+        self.remove_command("help")
 
     async def setup_hook(self) -> None:
         """Enregistre l'ensemble des commandes slash avec autocomplétion."""
@@ -198,6 +201,7 @@ class AssistantBot(commands.Bot):
             remember_slash,
             forget_slash,
             profile_slash,
+            help_slash,
             ask_slash,
             resume_slash,
             delete_slash,
@@ -222,8 +226,36 @@ class AssistantBot(commands.Bot):
 
         logger.info("Commandes slash enregistrées dans le command tree.")
 
+    async def _remove_stale_global_commands(self) -> None:
+        """Supprime les commandes globales qui doublonnent les commandes serveur.
+
+        Les commandes de ce bot sont volontairement synchronisées au niveau du
+        serveur (propagation immédiate). Une ancienne version avait laissé une
+        commande globale ``/ask``, visible en plus de ``/ask`` serveur.
+        """
+        try:
+            commands = await self.http.get_global_commands(self.application_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Impossible de lister les commandes globales : %s", exc)
+            return
+
+        for command in commands:
+            name = command.get("name", "?")
+            try:
+                await self.http.delete_global_command(
+                    self.application_id, int(command["id"])
+                )
+                logger.info("Commande globale obsolète supprimée : /%s", name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Impossible de supprimer la commande globale /%s : %s",
+                    name,
+                    exc,
+                )
+
     async def on_ready(self) -> None:
         logger.info("Bot Discord connecté en tant que %s (ID: %d).", self.user, self.user.id)
+        await self._remove_stale_global_commands()
         if not self.guilds:
             invite_url = (
                 f"https://discord.com/oauth2/authorize?client_id={self.user.id}"
@@ -671,6 +703,46 @@ _MEMORY_CAPTURE_RE = re.compile(
     r"(?:\s+que|\s+qu['’]|\s*:)\s+(.+)",
     re.IGNORECASE,
 )
+
+
+def _build_discord_help() -> str:
+    """Aide compacte : commandes canoniques uniquement, alias en note."""
+    return "\n".join(
+        [
+            "🤖 **Assistant Personnel — commandes**",
+            "",
+            "**📅 Quotidien**",
+            "`/briefing` · `/agenda` · `/tasks` · `/meteo` · `/search` · `/summarize`",
+            "",
+            "**⏰ Rappels**",
+            "`/rappel` · `/rappels` · `/snooze` · `/rappel_termine` · `/annuler_rappel`",
+            "",
+            "**🧠 Mémoire**",
+            "`/souviens` · `/oublie` · `/profil`",
+            "",
+            "**💬 Conversation**",
+            "`/ask` · `/new` · `/resume` · `/delete` · `/compact` · `/session`",
+            "",
+            "**⚙️ Moteur**",
+            "`/models` · `/setmodel` · `/effort` · `/mode` · `/permissions`",
+            "",
+            "**📊 Diagnostic**",
+            "`/status` · `/usage` · `/skills`",
+            "",
+            "Préfixe `!` : les mêmes commandes existent (`!briefing`, `!rappel`, etc.).",
+            "Les variantes comme `!brief`, `!weather`, `!recherche` ou `!reminder` "
+            "sont des **alias**, pas des commandes supplémentaires.",
+        ]
+    )
+
+
+@app_commands.command(name="help", description="Afficher l'aide des commandes")
+async def help_slash(interaction: discord.Interaction) -> None:
+    """Handler de la commande slash /help."""
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    await interaction.response.send_message(_build_discord_help(), ephemeral=True)
 
 
 @app_commands.command(name="ask", description="Pose une question à l'assistant personnel (supporte texte, image et audio)")
@@ -1212,6 +1284,13 @@ async def skills_slash(interaction: discord.Interaction) -> None:
 
 def _register_prefix_commands(bot: AssistantBot) -> None:
     """Enregistre les commandes préfixées (!) sur l'instance bot."""
+
+    @bot.command(name="help", help="Affiche l'aide des commandes")
+    async def help_prefix(ctx: commands.Context) -> None:
+        """Aide dédupliquée : seules les commandes canoniques sont listées."""
+        if not _is_allowed(ctx.author.id):
+            return
+        await ctx.send(_build_discord_help())
 
     @bot.command(name="ask", help="Pose une question à l'assistant. Ex: !ask Quelle heure est-il ?")
     async def ask_prefix(ctx: commands.Context, *, question: str) -> None:
