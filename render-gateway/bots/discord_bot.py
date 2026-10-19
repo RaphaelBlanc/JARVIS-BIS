@@ -1498,6 +1498,21 @@ async def stop_discord_bot() -> None:
     """Ferme proprement la connexion du bot Discord."""
     _discord_stop_event.set()
     bot = _get_bot()
-    if not bot.is_closed():
-        await bot.close()
+    if bot.is_closed():
+        return
+
+    loop = _DISCORD_LOOP
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    try:
+        if loop is not None and loop.is_running() and loop is not current_loop:
+            future = asyncio.run_coroutine_threadsafe(bot.close(), loop)
+            await asyncio.wrap_future(future)
+        else:
+            await bot.close()
         logger.info("Bot Discord arrêté proprement.")
+    except Exception as exc:
+        logger.warning("Erreur lors de l'arrêt du bot Discord: %s", exc)
