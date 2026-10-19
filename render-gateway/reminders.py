@@ -876,12 +876,16 @@ def get_due_reminders(now: Optional[datetime.datetime] = None) -> List[Dict[str,
 
 
 def mark_reminder_sent(reminder_id: int) -> None:
-    """Marque un rappel ponctuel comme envoyé."""
+    """Marque un rappel ponctuel comme livré.
+
+    Le statut ``delivered`` (et non ``completed``) permet aux boutons
+    Snooze/Terminé de fonctionner après l'envoi du message.
+    """
     with _db() as conn:
         conn.execute(
             """
             UPDATE reminders
-            SET status = 'completed', next_attempt_at = NULL
+            SET status = 'delivered', next_attempt_at = NULL
             WHERE id = ?;
             """,
             (reminder_id,),
@@ -966,7 +970,7 @@ def snooze_reminder(
 ) -> Optional[Dict[str, Any]]:
     """Reporte un rappel actif de la durée demandée."""
     reminder = get_reminder(reminder_id, chat_id)
-    if not reminder or reminder["status"] != "pending":
+    if not reminder or reminder["status"] not in {"pending", "delivered"}:
         return None
 
     if now is None:
@@ -981,6 +985,7 @@ def snooze_reminder(
             """
             UPDATE reminders
             SET remind_at = ?,
+                status = 'pending',
                 attempts = 0,
                 last_attempt_at = NULL,
                 next_attempt_at = NULL,
@@ -1003,7 +1008,7 @@ def complete_reminder(
     suivante est programmée automatiquement.
     """
     reminder = get_reminder(reminder_id, chat_id)
-    if not reminder or reminder["status"] != "pending":
+    if not reminder or reminder["status"] not in {"pending", "delivered"}:
         return None
 
     if now is None:
@@ -1080,7 +1085,7 @@ def cleanup_old_reminders(max_age_days: int = 90) -> int:
         cursor = conn.execute(
             """
             DELETE FROM reminders
-            WHERE status IN ('completed', 'cancelled')
+            WHERE status IN ('completed', 'cancelled', 'delivered')
               AND created_at < ?;
             """,
             (cutoff,),

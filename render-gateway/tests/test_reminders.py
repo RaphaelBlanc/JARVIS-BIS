@@ -316,6 +316,23 @@ class TestReminderActions(unittest.TestCase):
         self.assertEqual(updated["status"], "completed")
         self.assertEqual(reminders.list_active_reminders("123"), [])
 
+    def test_snooze_delivered_one_shot(self):
+        reminder = self._add()
+        reminders.mark_reminder_sent(reminder["id"])
+        self.assertEqual(reminders.get_reminder(reminder["id"])["status"], "delivered")
+        updated = reminders.snooze_reminder(
+            reminder["id"], "10m", "123"
+        )
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated["status"], "pending")
+        self.assertEqual(reminders.list_active_reminders("123")[0]["id"], reminder["id"])
+
+    def test_complete_delivered_one_shot(self):
+        reminder = self._add()
+        reminders.mark_reminder_sent(reminder["id"])
+        updated = reminders.complete_reminder(reminder["id"], "123")
+        self.assertEqual(updated["status"], "completed")
+
     def test_recurrent_reschedule_keeps_recurrence(self):
         now = datetime.datetime.now(reminders.TIMEZONE)
         reminder = self._add(
