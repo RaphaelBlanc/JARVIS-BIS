@@ -43,6 +43,8 @@ home-runner/memory.json.tmp
 # État du briefing
 render-gateway/briefing_state.json
 render-gateway/briefing_state.json.tmp
+render-gateway/briefing_cache.json
+render-gateway/briefing_cache.json.tmp
 
 # Render
 .render/

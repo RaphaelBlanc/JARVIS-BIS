@@ -29,7 +29,7 @@ from formatters import (
     smart_split_discord,
 )
 from stt import MAX_AUDIO_BYTES, transcribe_audio
-from briefing import build_briefing_prompt
+from briefing import get_briefing_text
 from reminders import (
     add_reminder,
     cancel_reminder,
@@ -396,7 +396,7 @@ async def briefing_slash(interaction: discord.Interaction) -> None:
 
     logger.info("Commande /briefing de %d", interaction.user.id)
     await _fast_ack(interaction, "⏳ Préparation de votre briefing matinal (tri des e-mails, agenda, météo)...")
-    result = await forward_to_runner(build_briefing_prompt(), continue_session=False, timeout=240)
+    result = await get_briefing_text(timeout=240)
 
     if result.get("success"):
         response_text = result.get("output", "").strip() or "✅ Briefing terminé."
@@ -1629,7 +1629,7 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         if not _is_allowed(ctx.author.id):
             return
         waiting = await ctx.send("⏳ Préparation de votre briefing matinal (tri des e-mails, agenda, météo)...")
-        res = await forward_to_runner(build_briefing_prompt(), continue_session=False, timeout=120)
+        res = await get_briefing_text(timeout=120)
         output = res.get("output", "").strip() or "⚠️ Impossible de générer le briefing."
         if len(output) > 2000:
             output = output[:1990] + "..."

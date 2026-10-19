@@ -30,6 +30,16 @@ STATE_FILE = Path(
     )
 )
 
+CACHE_FILE = Path(
+    os.getenv(
+        "BRIEFING_CACHE_FILE",
+        str(Path(__file__).resolve().parent / "briefing_cache.json"),
+    )
+)
+BRIEFING_CACHE_TTL_MINUTES = int(
+    os.getenv("BRIEFING_CACHE_TTL_MINUTES", "120")
+)
+
 DAY_ALIASES = {
     "mon": 0,
     "monday": 0,
@@ -237,6 +247,101 @@ def pending_platforms(date_key: str) -> List[str]:
         for platform in BRIEFING_PLATFORMS
         if not is_platform_sent(date_key, platform)
     ]
+
+
+def _load_cache() -> dict:
+    if not CACHE_FILE.exists():
+        return {}
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Lecture cache briefing impossible : %s", exc)
+        return {}
+
+
+def _save_cache(text: str) -> None:
+    """Écrit le cache du briefing de façon atomique."""
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = CACHE_FILE.with_suffix(CACHE_FILE.suffix + ".tmp")
+        payload = {
+            "generated_at": datetime.datetime.now(
+                datetime.timezone.utc
+            ).timestamp(),
+            "text": text,
+        }
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, CACHE_FILE)
+        try:
+            os.chmod(CACHE_FILE, 0o600)
+        except OSError:
+            pass
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Écriture cache briefing impossible : %s", exc)
+
+
+def get_cached_briefing() -> Optional[str]:
+    """Retourne le briefing en cache s'il est encore valide."""
+    if BRIEFING_CACHE_TTL_MINUTES <= 0:
+        return None
+    data = _load_cache()
+    text = data.get("text")
+    generated_at = data.get("generated_at")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        age_seconds = datetime.datetime.now(
+            datetime.timezone.utc
+        ).timestamp() - float(generated_at)
+    except (TypeError, ValueError):
+        return None
+    if age_seconds < 0 or age_seconds > BRIEFING_CACHE_TTL_MINUTES * 60:
+        return None
+    return text
+
+
+def clear_briefing_cache() -> None:
+    """Supprime le cache du briefing."""
+    try:
+        CACHE_FILE.unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Suppression cache briefing impossible : %s", exc)
+
+
+async def get_briefing_text(
+    force_refresh: bool = False,
+    timeout: int = 240,
+) -> dict:
+    """Retourne le briefing depuis le cache ou le génère via le runner.
+
+    Args:
+        force_refresh: ignore le cache (utilisé par le scheduler).
+        timeout: délai maximal de génération.
+    """
+    if not force_refresh:
+        cached = get_cached_briefing()
+        if cached:
+            logger.info("Briefing servi depuis le cache (TTL %d min).", BRIEFING_CACHE_TTL_MINUTES)
+            return {"success": True, "output": cached, "cached": True}
+
+    from gateway import forward_to_runner
+
+    result = await forward_to_runner(
+        build_briefing_prompt(),
+        continue_session=False,
+        timeout=timeout,
+    )
+    output = result.get("output", "")
+    if result.get("success") and output.strip():
+        _save_cache(output.strip())
+        logger.info("Briefing généré et mis en cache pour %d min.", BRIEFING_CACHE_TTL_MINUTES)
+    result["cached"] = False
+    return result
 
 
 def build_briefing_prompt(

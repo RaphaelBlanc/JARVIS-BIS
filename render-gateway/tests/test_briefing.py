@@ -1,6 +1,7 @@
 """Tests de la configuration et de l'état du briefing matinal."""
 
 import datetime
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -85,6 +86,38 @@ class TestBriefingState(unittest.TestCase):
         briefing.mark_platform_sent(date_key, "discord")
         self.assertEqual(briefing.pending_platforms(date_key), [])
         self.assertTrue(self.path.exists())
+
+
+class TestBriefingCache(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "briefing_cache.json"
+        self.patch_file = patch.object(briefing, "CACHE_FILE", self.path)
+        self.patch_ttl = patch.object(briefing, "BRIEFING_CACHE_TTL_MINUTES", 120)
+        self.patch_file.start()
+        self.patch_ttl.start()
+
+    def tearDown(self):
+        self.patch_file.stop()
+        self.patch_ttl.stop()
+        self.temp_dir.cleanup()
+
+    def test_cache_round_trip(self):
+        self.assertIsNone(briefing.get_cached_briefing())
+        briefing._save_cache("Briefing du jour")
+        self.assertEqual(briefing.get_cached_briefing(), "Briefing du jour")
+
+    def test_expired_cache_is_ignored(self):
+        briefing._save_cache("Vieux briefing")
+        data = briefing._load_cache()
+        data["generated_at"] -= 121 * 60
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertIsNone(briefing.get_cached_briefing())
+
+    def test_ttl_zero_disables_cache(self):
+        briefing._save_cache("Briefing du jour")
+        with patch.object(briefing, "BRIEFING_CACHE_TTL_MINUTES", 0):
+            self.assertIsNone(briefing.get_cached_briefing())
 
 
 if __name__ == "__main__":

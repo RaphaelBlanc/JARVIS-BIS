@@ -26,7 +26,7 @@ from formatters import (
     latex_to_unicode,
 )
 from stt import MAX_AUDIO_BYTES, transcribe_audio
-from briefing import build_briefing_prompt
+from briefing import get_briefing_text
 from reminders import (
     add_reminder,
     cancel_reminder,
@@ -1741,9 +1741,7 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     _save_chat_id(update.effective_chat.id)
     waiting_msg = await update.message.reply_text("⏳ Préparation de votre briefing matinal (analyse e-mails, agenda, météo)...")
-    res = await forward_to_runner(
-        build_briefing_prompt(), continue_session=False, timeout=240
-    )
+    res = await get_briefing_text(timeout=240)
     output = res.get("output", "").strip() or "⚠️ Impossible de générer le briefing matinal."
     await send_or_edit_telegram_response(waiting_msg, output, update.message)
 

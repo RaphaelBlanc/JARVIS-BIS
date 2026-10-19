@@ -66,7 +66,7 @@ from reminders import (  # noqa: E402
 from stt import warmup_stt  # noqa: E402
 from briefing import (  # noqa: E402
     BRIEFING_TIMEZONE,
-    build_briefing_prompt,
+    get_briefing_text,
     mark_platform_sent,
     pending_platforms,
     schedule_description,
@@ -143,13 +143,10 @@ async def morning_briefing_scheduler() -> None:
                     )
                     from bots.telegram_bot import send_broadcast_message
                     from bots.discord_bot import broadcast_discord_message
-                    from gateway import forward_to_runner
 
-                    res = await forward_to_runner(
-                        build_briefing_prompt(),
-                        continue_session=False,
-                        timeout=240,
-                    )
+                    # Le scheduler force un rafraîchissement : le cache sert
+                    # aux commandes /briefing manuelles rapprochées.
+                    res = await get_briefing_text(force_refresh=True, timeout=240)
                     briefing_text = res.get("output", "").strip()
                     if not res.get("success") or not briefing_text:
                         last_failed_attempt = now
