@@ -161,6 +161,11 @@ nc-assistant verifier    # diagnostic réseau, clé, certificat, runner
 
 Guide complet : [docs/ACCES_DISTANT.md](docs/ACCES_DISTANT.md).
 
+Depuis Discord, la commande `/server` exécute des actions whitelistées sur le
+serveur (`status`, `restart-runner`, `restart-gateway`, `tunnel-status`,
+`logs-gateway`, `logs-runner`), sans passer par `agy` ni par un shell
+arbitraire. Installation et sécurité : [docs/SERVER_COMMANDS.md](docs/SERVER_COMMANDS.md).
+
 ---
 
 ## 📂 Structure du Répertoire

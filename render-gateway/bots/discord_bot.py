@@ -107,6 +107,80 @@ if not ALLOWED_USER_IDS and not ALLOW_ALL_USERS:
     )
 
 
+# ── Actions serveur whitelistées ─────────────────────────────────────────────
+
+SERVER_ACTIONS: tuple[str, ...] = (
+    "status",
+    "restart-runner",
+    "restart-gateway",
+    "tunnel-status",
+    "logs-gateway",
+    "logs-runner",
+)
+SERVER_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "server-control.sh"
+SERVER_CONTROL_INSTALLED = Path("/usr/local/sbin/assistant-server-control")
+SERVER_PRIVILEGED_ACTIONS = frozenset(
+    {"restart-runner", "restart-gateway", "logs-gateway", "logs-runner"}
+)
+SERVER_ACTION_CHOICES = [
+    app_commands.Choice(name="État des services", value="status"),
+    app_commands.Choice(name="Redémarrer le runner", value="restart-runner"),
+    app_commands.Choice(name="Redémarrer le gateway (différé)", value="restart-gateway"),
+    app_commands.Choice(name="État du tunnel", value="tunnel-status"),
+    app_commands.Choice(name="40 dernières lignes du gateway", value="logs-gateway"),
+    app_commands.Choice(name="40 dernières lignes du runner", value="logs-runner"),
+]
+
+
+async def _run_server_action(action: str) -> tuple[bool, str]:
+    """Exécute une action whitelistée sans passer par agy ni par un shell."""
+    if action not in SERVER_ACTIONS:
+        return False, "Action inconnue."
+    if not SERVER_SCRIPT.is_file():
+        return False, f"Script introuvable : {SERVER_SCRIPT}"
+
+    # Si le script privilégié est installé en root, on l'appelle via sudo -n.
+    # Sinon, le script source utilise lui-même sudo -n pour les commandes
+    # concernées (et affiche une erreur claire si sudo n'est pas configuré).
+    if action in SERVER_PRIVILEGED_ACTIONS and SERVER_CONTROL_INSTALLED.is_file():
+        if os.geteuid() == 0:
+            commande = [str(SERVER_CONTROL_INSTALLED), action]
+        else:
+            commande = ["sudo", "-n", str(SERVER_CONTROL_INSTALLED), action]
+    else:
+        commande = ["bash", str(SERVER_SCRIPT), action]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *commande,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=40)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return False, "Délai dépassé (40 s)."
+    except OSError as exc:
+        return False, f"Impossible d'exécuter le script : {exc}"
+
+    morceaux = [
+        bloc.decode(errors="replace").strip()
+        for bloc in (stdout, stderr)
+        if bloc and bloc.strip()
+    ]
+    texte = "\n".join(morceaux).strip() or "(aucune sortie)"
+    if len(texte) > 1800:
+        texte = texte[:1800] + "\n…"
+    return proc.returncode == 0, texte
+
+
+def _server_reply(action: str, success: bool) -> str:
+    symbole = "✅" if success else "❌"
+    return f"{symbole} **Action serveur : `{action}`**"
+
+
 SAVED_DISCORD_CHANNELS_FILE = (
     Path(__file__).resolve().parent.parent / "saved_discord_channels.json"
 )
@@ -729,6 +803,10 @@ def _build_discord_help() -> str:
             "**📊 Diagnostic**",
             "`/status` · `/usage` · `/skills`",
             "",
+            "**🖥️ Serveur**",
+            "`/server status` · `/server restart-runner` · `/server restart-gateway` "
+            "· `/server tunnel-status` · `/server logs-gateway` · `/server logs-runner`",
+            "",
             "Préfixe `!` : les mêmes commandes existent (`!briefing`, `!rappel`, etc.).",
             "Les variantes comme `!brief`, `!weather`, `!recherche` ou `!reminder` "
             "sont des **alias**, pas des commandes supplémentaires.",
@@ -1130,6 +1208,27 @@ async def status_slash(interaction: discord.Interaction) -> None:
         "\n💡 *Pour changer de modèle, utilisez `/setmodel`.*",
     ]
     await interaction.followup.send("\n".join(status_lines))
+
+
+@app_commands.command(name="server", description="Actions serveur whitelistées (services, tunnel, journaux)")
+@app_commands.describe(action="Action serveur à exécuter")
+@app_commands.choices(action=SERVER_ACTION_CHOICES)
+async def server_slash(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+) -> None:
+    """Exécute une action fixe sur le serveur, sans commande arbitraire."""
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    ok, texte = await _run_server_action(action.value)
+    texte = texte.replace("```", "'''")
+    await interaction.followup.send(
+        f"{_server_reply(action.value, ok)}\n```\n{texte}\n```",
+        ephemeral=True,
+    )
 
 
 @app_commands.command(name="compact", description="Compacter la mémoire de la conversation")
@@ -1854,6 +1953,22 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             "• 📄 Lecteur Web (Fetch)",
         ]
         await waiting.edit(content="\n".join(status_lines))
+
+    @bot.command(name="server", help="Actions serveur whitelistées : status, restart-runner, restart-gateway, tunnel-status, logs-gateway, logs-runner")
+    async def server_cmd(ctx: commands.Context, action: str = "status") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        if action not in SERVER_ACTIONS:
+            await ctx.reply(
+                "Action inconnue. Actions : " + ", ".join(SERVER_ACTIONS)
+            )
+            return
+        waiting = await ctx.send("⏳ Exécution de l'action serveur…")
+        ok, texte = await _run_server_action(action)
+        texte = texte.replace("```", "'''")
+        await waiting.edit(
+            content=f"{_server_reply(action, ok)}\n```\n{texte}\n```"
+        )
 
     @bot.command(name="compact", help="Compacter la mémoire de contexte")
     async def compact_cmd(ctx: commands.Context) -> None:
