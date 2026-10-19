@@ -1821,6 +1821,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info("Message Telegram reçu de %d: '%s'", user.id, prompt[:80])
 
+    # Routeur NLP local 0-token (<5ms) pour intents natifs (courses, budget, obsidian, pc, focus)
+    from core.tools.bot_telegram_handlers import try_nlp_route
+    if await try_nlp_route(update, context, prompt):
+        return
+
     # Envoie un message temporaire "en cours de traitement"
     waiting_msg = await update.message.reply_text("⏳ Traitement en cours...")
 
@@ -2056,6 +2061,10 @@ def get_application() -> Application:
 
     # Handler messages vocaux et fichiers audio
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+
+    # Handlers modulaires (Moodle, Budget, Courses, Obsidian, PC, etc.)
+    from core.tools.bot_telegram_handlers import register_modular_telegram_commands
+    register_modular_telegram_commands(app)
 
     _application = app
     logger.info("Application Telegram configurée avec l'ensemble des commandes et boutons interactifs.")

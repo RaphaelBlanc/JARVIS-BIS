@@ -40,11 +40,9 @@ render-gateway/reminders.db-wal
 home-runner/memory.json
 home-runner/memory.json.tmp
 
-# État du briefing
-render-gateway/briefing_state.json
-render-gateway/briefing_state.json.tmp
-render-gateway/briefing_cache.json
-render-gateway/briefing_cache.json.tmp
+# Données locales des modules
+data/*
+!data/.gitkeep
 
 # Render
 .render/

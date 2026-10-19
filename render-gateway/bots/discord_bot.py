@@ -299,6 +299,10 @@ class AssistantBot(commands.Bot):
         ]:
             self.tree.add_command(cmd)
 
+        # Enregistre les commandes modulaires (Moodle, Budget, Courses, Obsidian, Focus, etc.)
+        from core.tools.bot_discord_handlers import register_modular_discord_commands
+        register_modular_discord_commands(self.tree)
+
         logger.info("Commandes slash enregistrées dans le command tree.")
 
     async def _remove_stale_global_commands(self) -> None:

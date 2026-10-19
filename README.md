@@ -54,12 +54,23 @@
   - Coloration syntaxique complète avec activation du bouton de copie natif Telegram et Discord.
   - Découpage intelligent (`smart_split`) évitant toute troncature au milieu d'un bloc de code.
   - Envoi automatique des extraits de code volumineux sous forme de fichiers téléchargeables (`.py`, `.js`, `.sh`, etc.).
-- **🔌 Connecteurs MCP (Model Context Protocol)** :
-  - 📅 **Google Agenda** : Lecture et création d'événements.
-  - ✉️ **Gmail** : Tri et résumé intelligent des e-mails prioritaires.
-  - 📋 **Google Tasks** : Gestion et suivi des listes de tâches.
-  - 📁 **Google Drive** : Recherche et consultation de documents.
-  - 🌤️ **Météo** & 🌐 **Recherche Web DuckDuckGo**.
+- **🧩 Modules & Outils Métiers (Plugins style MCP)** :
+  - 🎓 **Moodle EPITA** (`/devoirs`) : Échéances, devoirs et TPs académiques.
+  - 💰 **Finances & Budget** (`/depense`, `/budget`) : Suivi des dépenses, budget mensuel, analyse OCR de tickets de caisse et webhook Apple Pay.
+  - 🛒 **Courses interactives** (`/courses`) : Liste de courses dynamique avec boutons interactifs cocher/décocher.
+  - 🧠 **Second Cerveau Obsidian** (`/kb`, `/note`) : Recherche instantanée et création de notes classées par thématique.
+  - 🎯 **Focus & Deep Work** (`/focus`, `/stats`) : Minuteur Pomodoro et suivi de productivité.
+  - 💡 **Incubateur d'Idées** (`/idea`, `/ideas`) : Pitch, stack technique, plan MVP et scoring de viabilité.
+  - 📁 **Cockpit Projets & Dev Agent** (`/proj`, `/dev`) : Supervision Git et agent développeur autonome.
+  - 🌐 **Boîte de Réception & Radar Tech** (`/radar`) : Capture de liens et veille technologique (GitHub & HackerNews).
+  - 💻 **Contrôle PC & Système** (`/pc`, `/screenshot`, `/cam`, `/lock`, `/git`, `/say`, `/copy`, `/paste`) : Pilotage matériel direct ou relayé via `pc-agent`.
+  - 🔒 **Code PIN de Sécurité** : Clavier virtuel 4x3 protégeant les opérations sensibles.
+  - ⚡ **Routeur NLP 0-token** : Réponse instantanée (<5ms) pour toutes les intentions du quotidien sans surcoût IA.
+  - 🔌 **Connecteurs MCP Google** : Google Agenda, Gmail prioritaire, Google Tasks, Météo locale.
+
+- **🖥️ Intégration Noctalia (Hyprland / Quickshell)** :
+  - Spécification complète et script client dans [docs/NOCTALIA_API.md](docs/NOCTALIA_API.md).
+  - Support de l'accès local direct, réseau privé Tailscale ou Cloudflare Tunnel.
 
 ---
 

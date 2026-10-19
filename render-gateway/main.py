@@ -18,11 +18,17 @@ import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from typing import Optional
+import uuid
+import json
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+from core.hardware_relay import HARDWARE_RELAY
+from core.tools.base import ToolRegistry
+from core.tools.dispatcher import execute_tool_action
 
 # Charge les variables d'environnement depuis .env (si présent)
 load_dotenv()
@@ -518,11 +524,25 @@ async def api_status() -> dict:
     runner_alive = runner_health.get("status") == "ok"
     discord_token = os.getenv("DISCORD_TOKEN", "")
 
+    tools_list = [
+        {
+            "id": t.id,
+            "name": t.name,
+            "icon": t.icon,
+            "enabled": t.is_enabled,
+            "requires_local_hardware": t.requires_local_hardware,
+        }
+        for t in ToolRegistry.list_tools()
+    ]
+
     return {
         "online": runner_alive,
         "version": VERSION,
+        "deploy_mode": os.getenv("DEPLOY_MODE", "local"),
+        "pc_agent_connected": HARDWARE_RELAY.is_agent_connected,
         "runner": runner_health,
         "session": session_info if not session_info.get("error") else None,
+        "tools": tools_list,
         "gateway": {
             "home_server_configured": bool(HOME_SERVER_URL),
             "telegram_configured": bool(TELEGRAM_TOKEN),
@@ -530,6 +550,127 @@ async def api_status() -> dict:
             "public_url": GATEWAY_PUBLIC_URL or None,
         },
     }
+
+
+class ActionRequest(BaseModel):
+    """Corps d'une requête pour exécuter une action de module/tool."""
+
+    tool: str = Field(..., description="ID de l'outil (ex: shopping, moodle, expenses, system_pc, obsidian)")
+    action: str = Field(..., description="Action à exécuter (ex: list, devoirs, add, screenshot, kb)")
+    params: Optional[dict] = Field(default_factory=dict, description="Paramètres spécifiques à l'action")
+    platform: str = Field(default="desktop", description="Plateforme appelante (desktop, telegram, discord, noctalia)")
+
+
+@app.post(
+    "/api/action",
+    tags=["desktop"],
+    summary="Exécuter une action d'un module modulaire (style MCP)",
+    dependencies=[Depends(require_secret)],
+)
+async def api_action(payload: ActionRequest) -> dict:
+    """Permet au bureau Noctalia ou à des scripts d'exécuter directement
+    n'importe quelle action de module (courses, devoirs Moodle, finances, capture d'écran, etc.).
+    """
+    return await execute_tool_action(
+        tool_id=payload.tool,
+        action=payload.action,
+        params=payload.params,
+        platform=payload.platform,
+    )
+
+
+@app.get(
+    "/api/stream",
+    tags=["desktop"],
+    summary="Streaming SSE pour réponses en temps réel dans Noctalia / Bureau",
+)
+async def api_stream(
+    prompt: str,
+    secret_key: Optional[str] = None,
+    x_secret_key: Optional[str] = Header(default=None, alias="X-Secret-Key"),
+):
+    """Fournit un flux Server-Sent Events (SSE) pour afficher les réponses en temps réel."""
+    auth_key = x_secret_key or secret_key
+    if not SECRET_KEY or not auth_key or not hmac.compare_digest(auth_key, SECRET_KEY):
+        raise HTTPException(status_code=401, detail="Clé API invalide")
+
+    async def event_generator():
+        from gateway import forward_to_runner
+        res = await forward_to_runner(prompt=prompt, continue_session=True)
+        output = res.get("output", "")
+        # Envoi progressif par blocs pour l'effet temps réel
+        words = output.split(" ")
+        for i in range(0, len(words), 4):
+            chunk = " ".join(words[i:i + 4]) + " "
+            yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+            await asyncio.sleep(0.01)
+        yield f"data: {json.dumps({'done': True, 'output': output})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.post(
+    "/api/apple-pay",
+    tags=["integrations"],
+    summary="Webhook pour enregistrement direct Apple Pay / Raccourcis iOS",
+)
+async def api_apple_pay(request: Request) -> dict:
+    """Webhook pour recevoir les dépenses Apple Pay depuis Raccourcis iOS."""
+    webhook_secret = os.getenv("JARVIS_WEBHOOK_SECRET", "")
+    token = request.headers.get("X-Jarvis-Token") or request.query_params.get("token")
+    if not webhook_secret or not token or not hmac.compare_digest(token, webhook_secret):
+        raise HTTPException(status_code=401, detail="Token webhook invalide ou manquant")
+
+    try:
+        data = await request.json()
+    except Exception:
+        form = await request.form()
+        data = dict(form)
+
+    raw_amt = str(data.get("amount", "")).replace("€", "").replace(",", ".").strip()
+    if not raw_amt:
+        raise HTTPException(status_code=400, detail="Montant manquant")
+
+    amount = float(raw_amt)
+    merchant = str(data.get("merchant", data.get("description", "Achat Apple Pay"))).strip()
+    category = data.get("category")
+
+    return await execute_tool_action(
+        "expenses",
+        "add",
+        {"amount": amount, "description": merchant, "category": category},
+        platform="apple-pay",
+    )
+
+
+@app.websocket("/ws/pc-agent")
+async def websocket_pc_agent(websocket: WebSocket):
+    """Canal WebSocket sécurisé reliant un agent PC local au serveur distant.
+    
+    Permet au serveur d'exécuter des actions matérielles sur le PC de l'utilisateur
+    (grim screenshot, ffmpeg webcam, hyprctl, loginctl lock, audio, etc.).
+    """
+    auth = websocket.headers.get("X-Secret-Key") or websocket.query_params.get("secret_key")
+    if not SECRET_KEY or not auth or not hmac.compare_digest(auth, SECRET_KEY):
+        await websocket.close(code=4001, reason="Clé secrète invalide")
+        return
+
+    await websocket.accept()
+    agent_id = f"pc-{uuid.uuid4().hex[:6]}"
+    HARDWARE_RELAY.register_agent(agent_id, websocket)
+    logger.info("Agent PC connecté avec succès via WebSocket : %s", agent_id)
+
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            HARDWARE_RELAY.handle_agent_response(msg)
+    except WebSocketDisconnect:
+        logger.info("Agent PC déconnecté : %s", agent_id)
+    except Exception as exc:
+        logger.warning("Erreur WebSocket PC-Agent (%s) : %s", agent_id, exc)
+    finally:
+        HARDWARE_RELAY.unregister_agent(agent_id)
+
 
 
 @app.post(
