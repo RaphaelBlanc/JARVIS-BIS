@@ -7,7 +7,11 @@
 #
 #   scripts/expose-gateway.sh quick
 #       Tunnel Cloudflare temporaire, sans compte. URL aléatoire, change au
-#       redémarrage. Parfait pour valider depuis un autre réseau.
+#       redémarrage. Reste au premier plan (Ctrl+C pour arrêter).
+#
+#   scripts/expose-gateway.sh quick-service
+#       Même tunnel temporaire, mais en service systemd utilisateur : la
+#       commande rend la main et affiche l'URL. Recommandé via Discord/SSH.
 #
 #   scripts/expose-gateway.sh cloudflare --hostname assistant.example.com
 #       Tunnel Cloudflare nommé + DNS + service systemd utilisateur (durable).
@@ -24,7 +28,9 @@ set -euo pipefail
 GATEWAY_PORT="${GATEWAY_PORT:-8000}"
 LOCAL_URL="http://127.0.0.1:${GATEWAY_PORT}"
 SERVICE="assistant-tunnel"
+QUICK_SERVICE="assistant-tunnel-quick"
 UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/${SERVICE}.service"
+QUICK_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/${QUICK_SERVICE}.service"
 
 info() { printf '\033[1;34m→\033[0m %s\n' "$*"; }
 ok() { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
@@ -52,6 +58,64 @@ cloudflare_quick() {
   warn "Pour un usage durable, utilise : $0 cloudflare --hostname assistant.tondomaine.fr"
   info "Copie l'URL https://…trycloudflare.com affichée ci-dessous dans nc-assistant."
   exec cloudflared tunnel --no-autoupdate --url "${LOCAL_URL}"
+}
+
+cloudflare_quick_service() {
+  need cloudflared
+  need systemctl
+  verifier_gateway_local
+
+  local bin
+  bin="$(command -v cloudflared)"
+  mkdir -p "$(dirname "$QUICK_UNIT")"
+  cat >"$QUICK_UNIT" <<EOF
+[Unit]
+Description=Assistant personnel — tunnel Cloudflare temporaire vers le gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${bin} --no-autoupdate --url ${LOCAL_URL}
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user disable --now "${QUICK_SERVICE}.service" >/dev/null 2>&1 || true
+  systemctl --user reset-failed "${QUICK_SERVICE}.service" >/dev/null 2>&1 || true
+  local since
+  since="$(date -d '2 seconds ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')"
+  systemctl --user enable --now "${QUICK_SERVICE}.service" >/dev/null
+
+  local url=""
+  local i
+  for i in $(seq 1 30); do
+    url="$(journalctl --user -u "${QUICK_SERVICE}.service" --since "$since" -n 100 --no-pager 2>/dev/null |
+      grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n 1 || true)"
+    [ -n "$url" ] && break
+    sleep 1
+  done
+
+  if [ -z "$url" ]; then
+    warn "URL trycloudflare.com introuvable après 30 s."
+    systemctl --user status "${QUICK_SERVICE}.service" --no-pager 2>&1 | tail -n 20 || true
+    die "Vérifie les journaux : journalctl --user -u ${QUICK_SERVICE}.service -n 80 --no-pager"
+  fi
+
+  ok "Tunnel temporaire actif. URL publique : ${url}"
+  echo
+  echo "Sur le PC Noctalia :"
+  echo "  nc-assistant configurer"
+  echo "    URL     : ${url}"
+  echo "    USER_ID : $(whoami)"
+  echo "  nc-assistant verifier"
+  echo
+  warn "URL temporaire : elle change si le service redémarre. Pour l'arrêter : $0 stop"
 }
 
 tunnel_id() {
@@ -172,8 +236,15 @@ statut() {
     echo
   fi
   echo
-  echo "Service ${SERVICE} :"
+  echo "Service ${SERVICE} (tunnel nommé) :"
   systemctl --user is-active "${SERVICE}.service" 2>/dev/null || echo "inactif"
+  echo "Service ${QUICK_SERVICE} (tunnel temporaire) :"
+  systemctl --user is-active "${QUICK_SERVICE}.service" 2>/dev/null || echo "inactif"
+  if systemctl --user is-active --quiet "${QUICK_SERVICE}.service" 2>/dev/null; then
+    echo "URL temporaire :"
+    journalctl --user -u "${QUICK_SERVICE}.service" -n 100 --no-pager 2>/dev/null |
+      grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n 1 || true
+  fi
   if command -v tailscale >/dev/null 2>&1; then
     echo
     echo "Tailscale Serve :"
@@ -183,6 +254,7 @@ statut() {
 
 arreter() {
   systemctl --user disable --now "${SERVICE}.service" 2>/dev/null || true
+  systemctl --user disable --now "${QUICK_SERVICE}.service" 2>/dev/null || true
   if command -v tailscale >/dev/null 2>&1; then
     tailscale serve reset >/dev/null 2>&1 || true
   fi
@@ -191,12 +263,13 @@ arreter() {
 
 case "${1:-}" in
   quick) cloudflare_quick ;;
+  quick-service|quick-service-start) cloudflare_quick_service ;;
   cloudflare) shift; cloudflare_named "$@" ;;
   tailscale) tailscale_access ;;
   status) statut ;;
   stop) arreter ;;
   ""|-h|--help|help)
-    sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'
     ;;
-  *) die "Commande inconnue : $1 (quick, cloudflare, tailscale, status, stop)" ;;
+  *) die "Commande inconnue : $1 (quick, quick-service, cloudflare, tailscale, status, stop)" ;;
 esac

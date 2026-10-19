@@ -40,6 +40,33 @@ nc-assistant verifier
 > L'URL `trycloudflare.com` change à chaque redémarrage. Elle convient pour
 > valider, pas pour un usage quotidien.
 
+### Depuis Discord ou sans terminal
+
+La commande `quick` reste au premier plan : le bot Discord va dépasser son
+timeout. Utilise le mode service, qui démarre le tunnel en arrière-plan et
+rend la main avec l'URL :
+
+```bash
+cd ~/assistant-perso
+./scripts/expose-gateway.sh quick-service
+```
+
+Depuis Discord, avec le chemin absolu (le répertoire courant du bot est
+`home-runner`, pas la racine du dépôt) :
+
+```text
+/ask Exécute exactement cette commande et renvoie toute la sortie :
+bash /home/pi/assistant-perso/scripts/expose-gateway.sh quick-service
+```
+
+Le service s'appelle `assistant-tunnel-quick.service`. Pour l'arrêter :
+
+```bash
+./scripts/expose-gateway.sh stop
+# ou
+systemctl --user disable --now assistant-tunnel-quick.service
+```
+
 ### Installation durable avec un domaine
 
 Prérequis : un domaine géré par Cloudflare, `cloudflared` installé et

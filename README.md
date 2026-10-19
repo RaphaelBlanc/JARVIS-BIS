@@ -139,8 +139,11 @@ serveur. Pour utiliser l'assistant depuis un autre Wi-Fi ou Internet, expose le
 **gateway** (port `8000`, jamais le runner `8080`) avec un tunnel :
 
 ```bash
-# Test immédiat, sans compte (URL temporaire)
+# Test immédiat, sans compte (URL temporaire, reste au premier plan)
 ./scripts/expose-gateway.sh quick
+
+# Même test en service systemd (recommandé via Discord/SSH)
+./scripts/expose-gateway.sh quick-service
 
 # Durable avec un domaine Cloudflare
 ./scripts/expose-gateway.sh cloudflare --hostname assistant.tondomaine.fr
