@@ -161,10 +161,32 @@ def identifier(value):
 
 
 async def dispatch(op, p, confirmed=False):
-    read = {'capabilities','models','session','memory','conversations','usage','conversation.history','services','logs','quick-settings'}
-    write = {'session.update','session.reset','conversation.resume','conversation.delete','memory.add','memory.delete','profile.set','profile.delete','config.update','config.clear','service.restart'}
+    read = {'capabilities','models','session','memory','conversations','usage','conversation.history','services','logs','quick-settings','google.status','google.calendar'}
+    write = {'session.update','session.reset','conversation.resume','conversation.delete','memory.add','memory.delete','profile.set','profile.delete','config.update','config.clear','service.restart','notify','noctalia'}
     if op not in read|write: raise ValueError
+    if op in ('google.status','google.calendar'):
+        try:
+            from gateway import nc_google
+        except ImportError:
+            import nc_google
+        return await nc_google.dispatch(op, p)
+    if op=='noctalia':
+        try:
+            from gateway import nc_noctalia
+        except ImportError:
+            import nc_noctalia
+        action=p.get('action'); params=p.get('params',{})
+        if action not in nc_noctalia.ACTIONS or not isinstance(params,dict): raise ValueError
+        if not nc_noctalia.ACTIONS[action]['readonly'] and not confirmed: return dict(error='Confirmation explicite requise')
+        arguments=[str(params[f['key']])[:200] for f in nc_noctalia.ACTIONS[action]['fields'] if params.get(f['key'])]
+        return await nc_noctalia.agir(action, arguments, confirme=confirmed)
     if op in write and not confirmed: return dict(error='Confirmation explicite requise')
+    if op=='notify':
+        try:
+            from gateway import nc_telegram
+        except ImportError:
+            import nc_telegram
+        return await nc_telegram.diffuser(p.get('text'))
     if op=='capabilities': return schema()
     paths={'models':'/models','session':'/session','memory':'/memory','conversations':'/conversations?limit=25','usage':'/usage/stats'}
     if op in paths: return await runner('GET',paths[op])

@@ -49,6 +49,19 @@ En cas de conflit :
 git am --3way /chemin/vers/0001-assistant-verification-distante.patch
 ```
 
+### Correctif séparé — dictée vocale
+
+La dictée du client (`bouton micro`) est traitée à part dans
+[`04-dictee-vocale.md`](04-dictee-vocale.md), avec le patch
+[`0002-dictee-vocale.patch`](0002-dictee-vocale.patch) et le script
+[`files/nc-dictee`](files/nc-dictee). Elle nécessite l’endpoint serveur
+`POST /api/transcribe` du gateway `assistant-unifie`.
+
+```bash
+git apply /chemin/vers/0002-dictee-vocale.patch
+install -m 755 /chemin/vers/files/nc-dictee home/.local/bin/nc-dictee
+```
+
 ### Option 2 — suivre les fiches
 
 Les fiches détaillent les mêmes changements fichier par fichier :
@@ -58,6 +71,7 @@ Les fiches détaillent les mêmes changements fichier par fichier :
 | [`01-nc-assistant.md`](01-nc-assistant.md) | `home/.local/bin/nc-assistant` |
 | [`02-nc-reglages.md`](02-nc-reglages.md) | `home/.local/bin/nc-reglages` |
 | [`03-documentation-tests.md`](03-documentation-tests.md) | docs, aide et tests |
+| [`04-dictee-vocale.md`](04-dictee-vocale.md) | `home/.config/quickshell/nc-ile/Assistant.qml`, nouveau `home/.local/bin/nc-dictee` |
 
 Vue d’ensemble et critères d’acceptation :
 [`00-FICHE-COLLEGUE.md`](00-FICHE-COLLEGUE.md).

@@ -1,17 +1,19 @@
 [Unit]
 Description=Assistant Personnel — Gateway (Discord + Telegram Bots)
-After=network.target assistant-runner.service
-Wants=network.target
+After=network.target network-online.target assistant-runner.service
+Wants=network-online.target assistant-runner.service
 
 [Service]
 Type=simple
 # Remplacez par votre utilisateur Linux
-User=%I
-WorkingDirectory=%h/JARVIS-BIS/gateway
-EnvironmentFile=%h/JARVIS-BIS/gateway/.env
-ExecStart=%h/JARVIS-BIS/gateway/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/assistant-unifie/gateway
+Environment=PYTHONPATH=/home/pi/assistant-unifie
+EnvironmentFile=/home/pi/assistant-unifie/gateway/.env
+ExecStart=/home/pi/assistant-unifie/gateway/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info
 
-Restart=on-failure
+Restart=always
 RestartSec=5s
 NoNewPrivileges=true
 PrivateTmp=true
@@ -21,4 +23,4 @@ StandardError=journal
 SyslogIdentifier=assistant-gateway
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

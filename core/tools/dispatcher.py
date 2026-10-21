@@ -98,8 +98,8 @@ async def execute_tool_action(
                 if sub == "status":
                     cfg = expense_tracker.load_budget()
                     monthly = expense_tracker.get_monthly_summary()
-                    cap = cfg.get("monthly_cap", 0.0)
-                    if not cfg.get("enabled") or cap <= 0:
+                    cap = float(cfg.get("limit") or cfg.get("monthly_cap") or 0)
+                    if cap <= 0:
                         return {"success": True, "message": "ℹ️ Aucun plafond de budget mensuel configuré."}
                     spent = monthly["total"]
                     pct = min(100.0, (spent / cap) * 100) if cap > 0 else 0

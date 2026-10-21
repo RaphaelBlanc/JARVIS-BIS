@@ -7,6 +7,7 @@ with automatic category detection and formatted monthly summaries.
 from datetime import datetime
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import uuid
@@ -211,15 +212,28 @@ BUDGET_FILE = DATA_DIR / "budget.json"
 
 
 def load_budget() -> dict:
-    """Loads budget configuration from disk."""
+    """Loads budget configuration from disk, with MONTHLY_BUDGET as default."""
+    try:
+        default_limit = float(os.getenv("MONTHLY_BUDGET", "") or 0) or None
+    except ValueError:
+        default_limit = None
+    default = {
+        "limit": default_limit,
+        "warning_pct": 80,
+        "notified_warning": None,
+        "notified_exceeded": None,
+    }
     if not BUDGET_FILE.exists():
-        return {"limit": None, "warning_pct": 80, "notified_warning": None, "notified_exceeded": None}
+        return default
     try:
         with open(BUDGET_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
+        if cfg.get("limit") is None and default_limit:
+            cfg["limit"] = default_limit
+        return cfg
     except Exception as e:
         logging.warning(f"Failed to load budget file: {e}")
-        return {"limit": None, "warning_pct": 80, "notified_warning": None, "notified_exceeded": None}
+        return default
 
 
 def save_budget(cfg: dict) -> bool:

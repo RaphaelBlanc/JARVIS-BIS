@@ -14,9 +14,11 @@ import hmac
 import logging
 import os
 import sys
+import tempfile
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 import uuid
 import json
@@ -72,7 +74,7 @@ from reminders import (  # noqa: E402
     parse_delay_or_time,
     reschedule_reminder,
 )
-from stt import warmup_stt  # noqa: E402
+from stt import MAX_AUDIO_BYTES, transcribe_audio, warmup_stt  # noqa: E402
 from briefing import (  # noqa: E402
     BRIEFING_TIMEZONE,
     get_briefing_text,
@@ -502,6 +504,55 @@ async def api_ask(payload: AskRequest) -> dict:
         "output": result.get("output", ""),
         "error": result.get("error"),
     }
+
+
+@app.post(
+    "/api/transcribe",
+    tags=["desktop"],
+    summary="Transcrire un enregistrement audio (dictée Noctalia)",
+    dependencies=[Depends(require_secret)],
+)
+async def api_transcribe(request: Request, language: Optional[str] = None) -> dict:
+    """Reçoit un fichier audio brut (WAV/OGG/MP3/M4A) et renvoie sa transcription.
+
+    Utilisé par la dictée du client Noctalia. Le corps de la requête est l'audio
+    lui-même, avec son type MIME dans ``Content-Type``. Aucun multipart n'est
+    nécessaire, ce qui évite une dépendance supplémentaire.
+    """
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Enregistrement audio vide")
+    if len(data) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="Enregistrement audio trop volumineux")
+
+    content_type = (request.headers.get("content-type") or "audio/wav").split(";", 1)[0].strip().lower()
+    suffixes = {
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/wave": ".wav",
+        "audio/ogg": ".ogg",
+        "audio/opus": ".ogg",
+        "audio/mpeg": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/x-m4a": ".m4a",
+        "audio/webm": ".webm",
+    }
+    suffix = suffixes.get(content_type, ".wav")
+
+    fd, temp_name = tempfile.mkstemp(prefix="nc-dictee-", suffix=suffix, dir="/tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        text, engine = await transcribe_audio(Path(temp_name), language=language)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+
+    if not text:
+        return {"success": False, "text": "", "engine": engine, "error": engine}
+    return {"success": True, "text": text, "engine": engine, "error": None}
 
 
 @app.get(

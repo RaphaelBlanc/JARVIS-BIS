@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""nc-dictee — dictée vocale pour le client Noctalia/JARVIS.
+
+  nc-dictee start   démarre l'enregistrement du micro
+  nc-dictee stop    arrête, transcrit via le gateway et affiche le texte
+  nc-dictee cancel  arrête et supprime l'enregistrement
+  nc-dictee status  indique si un enregistrement est en cours
+
+La configuration serveur est lue dans ~/.config/nc/assistant.conf, comme
+nc-assistant. Aucun secret n'est écrit ailleurs.
+"""
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+CONF = Path.home() / ".config/nc/assistant.conf"
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
+STATE = RUNTIME / "nc-dictee.json"
+AUDIO = RUNTIME / "nc-dictee.wav"
+LOG = RUNTIME / "nc-dictee.log"
+
+
+def sortie(**kwargs):
+    print(json.dumps(kwargs, ensure_ascii=False), flush=True)
+
+
+def configuration():
+    try:
+        if CONF.stat().st_mode & 0o077:
+            raise RuntimeError("Protège ~/.config/nc/assistant.conf : chmod 600")
+        lignes = CONF.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        raise RuntimeError("Assistant non configuré : lance nc-assistant configurer.")
+    c = {}
+    for ligne in lignes:
+        if "=" not in ligne or ligne.lstrip().startswith("#"):
+            continue
+        k, v = ligne.split("=", 1)
+        v = v.strip()
+        if v.startswith('"'):
+            try:
+                v = json.loads(v)
+            except ValueError:
+                raise RuntimeError("Configuration de l'assistant invalide.")
+        c[k.strip()] = v
+    if not c.get("URL") or not c.get("SECRET_KEY"):
+        raise RuntimeError("URL ou SECRET_KEY manquante dans assistant.conf.")
+    return c
+
+
+def lire_etat():
+    try:
+        data = json.loads(STATE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def pid_actif(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def enregistreur():
+    if shutil_which("parec"):
+        return ["parec", "--format=s16le", "--rate=16000", "--channels=1",
+                "--file-format=wav", str(AUDIO)]
+    if shutil_which("pw-record"):
+        return ["pw-record", "--format", "s16", "--rate", "16000", "--channels", "1", str(AUDIO)]
+    if shutil_which("arecord"):
+        return ["arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", str(AUDIO)]
+    raise RuntimeError("Aucun enregistreur audio trouvé (parec, pw-record ou arecord).")
+
+
+def shutil_which(nom):
+    for dossier in os.environ.get("PATH", "").split(os.pathsep):
+        chemin = Path(dossier) / nom
+        if chemin.is_file() and os.access(chemin, os.X_OK):
+            return str(chemin)
+    return None
+
+
+def arreter():
+    etat = lire_etat()
+    if not etat:
+        return None
+    pid = etat.get("pid")
+    if pid_actif(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(30):
+            if not pid_actif(pid):
+                break
+            time.sleep(0.1)
+        if pid_actif(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    try:
+        STATE.unlink()
+    except OSError:
+        pass
+    return etat
+
+
+def demarrer():
+    etat = lire_etat()
+    if etat and pid_actif(etat.get("pid")):
+        sortie(ok=True, recording=True, message="Enregistrement déjà en cours")
+        return 0
+    try:
+        AUDIO.unlink()
+    except OSError:
+        pass
+    cmd = enregistreur()
+    with open(LOG, "ab") as log:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                start_new_session=True)
+    time.sleep(0.25)
+    if proc.poll() is not None:
+        sortie(ok=False, error="L'enregistrement n'a pas démarré. Vérifie le micro.")
+        return 1
+    STATE.write_text(json.dumps({"pid": proc.pid, "audio": str(AUDIO)}), encoding="utf-8")
+    sortie(ok=True, recording=True)
+    return 0
+
+
+def transcrire():
+    etat = arreter()
+    if not etat:
+        sortie(ok=False, error="Aucun enregistrement en cours.")
+        return 1
+    if not AUDIO.is_file() or AUDIO.stat().st_size < 1000:
+        sortie(ok=False, error="Enregistrement vide ou micro coupé.")
+        return 1
+    try:
+        c = configuration()
+        data = AUDIO.read_bytes()
+        req = urllib.request.Request(
+            c["URL"].rstrip("/") + "/api/transcribe",
+            data=data,
+            headers={
+                "Content-Type": "audio/wav",
+                "X-Secret-Key": c["SECRET_KEY"],
+            },
+            method="POST",
+        )
+        timeout = float(c.get("TIMEOUT", "180"))
+        with urllib.request.build_opener().open(req, timeout=min(max(timeout, 30), 300)) as r:
+            resultat = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        sortie(ok=False, error=f"Erreur HTTP {e.code} du serveur.")
+        return 1
+    except Exception as e:
+        sortie(ok=False, error=f"Transcription impossible : {e}")
+        return 1
+    finally:
+        try:
+            AUDIO.unlink()
+        except OSError:
+            pass
+    if not resultat.get("success") or not resultat.get("text"):
+        sortie(ok=False, error=resultat.get("error") or "Transcription vide.")
+        return 1
+    sortie(ok=True, text=resultat["text"], engine=resultat.get("engine", ""))
+    return 0
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else "status"
+    try:
+        if action == "start":
+            return demarrer()
+        if action == "stop":
+            return transcrire()
+        if action == "cancel":
+            arreter()
+            try:
+                AUDIO.unlink()
+            except OSError:
+                pass
+            sortie(ok=True, recording=False)
+            return 0
+        if action == "status":
+            etat = lire_etat()
+            sortie(ok=True, recording=bool(etat and pid_actif(etat.get("pid"))))
+            return 0
+        sortie(ok=False, error="Action inconnue (start, stop, cancel, status).")
+        return 1
+    except (RuntimeError, OSError) as e:
+        sortie(ok=False, error=str(e))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

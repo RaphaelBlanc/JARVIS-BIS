@@ -18,6 +18,10 @@ ACTION="${1:-install}"
 case "$ACTION" in
     setup|wizard|config)
         python3 "$ROOT_DIR/setup_wizard.py"
+        if [ -f "$ROOT_DIR/.env" ]; then
+            cp "$ROOT_DIR/.env" "$HOME_RUNNER_DIR/.env" 2>/dev/null || true
+            cp "$ROOT_DIR/.env" "$GATEWAY_DIR/.env" 2>/dev/null || true
+        fi
         exit 0
         ;;
 
@@ -72,6 +76,16 @@ fi
 "$GATEWAY_DIR/.venv/bin/pip" install --quiet --upgrade pip
 "$GATEWAY_DIR/.venv/bin/pip" install --quiet -r "$GATEWAY_DIR/requirements.txt"
 "$GATEWAY_DIR/.venv/bin/pip" install --quiet -r "$ROOT_DIR/requirements.txt" || true
+
+# Serveur MCP Google Tasks : venv séparé pour éviter le conflit
+# mcp/starlette avec FastAPI dans l'environnement du runner.
+GOOGLE_MCP_DIR="$ROOT_DIR/integrations/google-workspace"
+if [ ! -d "$GOOGLE_MCP_DIR/.venv" ]; then
+    echo -e "Création du venv pour le MCP Google Tasks..."
+    python3 -m venv "$GOOGLE_MCP_DIR/.venv"
+fi
+"$GOOGLE_MCP_DIR/.venv/bin/pip" install --quiet --upgrade pip
+"$GOOGLE_MCP_DIR/.venv/bin/pip" install --quiet -r "$GOOGLE_MCP_DIR/requirements.txt"
 echo -e "${GREEN}✓ Dépendances installées.${NC}"
 
 # 3. Configuration (.env)

@@ -1,0 +1,82 @@
+--- a/home/.config/quickshell/nc-ile/Assistant.qml
++++ b/home/.config/quickshell/nc-ile/Assistant.qml
+@@ -1,4 +1,5 @@
+ import QtQuick
++import Quickshell.Io
+ 
+ Item {
+     id: page
+@@ -60,9 +61,23 @@
+     onVisibleChanged: if (visible) { bas(); Qt.callLater(chargerReglagesRapides) }
+     onAnimationsActivesChanged: if (animationsActives) bas()
+     function reglages() { information = ""; ecouteVocale = false; AssistantEtat.ouvrirReglages() }
+-    function voix() {
++    function sortieVocale() {
+         ecouteVocale = false
+-        information = Reglages.t("Dictée et sortie vocale non configurées sur ce client.", "Dictation and voice output are not configured on this client.")
++        information = Reglages.t("Sortie vocale non configurée sur ce client.", "Voice output is not configured on this client.")
++    }
++    function voix() {
++        if (AssistantEtat.enCours || dictee.running) return
++        if (ecouteVocale) {
++            ecouteVocale = false
++            information = Reglages.t("Transcription…", "Transcribing…")
++            dictee.commande = "stop"
++            dictee.running = true
++        } else {
++            information = Reglages.t("Écoute vocale…", "Listening…")
++            dictee.commande = "start"
++            dictee.running = true
++            ecouteVocale = true
++        }
+     }
+     Component.onCompleted: { bas(); Qt.callLater(chargerReglagesRapides) }
+     onDansDashboardChanged: if (dansDashboard) historiqueOuvert = true
+@@ -132,7 +147,7 @@
+                     visible: !page.dansDashboard
+                     rond: true; width: 32; height: 32; icone: "volume_off"
+                     aide: Reglages.t("Sortie vocale désactivée", "Voice output disabled")
+-                    onClic: page.voix()
++                    onClic: page.sortieVocale()
+                 }
+                 AssistantCommande {
+                     rond: true; width: 32; height: 32; icone: "restart_alt"
+@@ -526,4 +541,38 @@
+         }
+     }
+ 
++    Process {
++        id: dictee
++        property string commande: "start"
++        command: [AssistantEtat.bin + "nc-dictee", dictee.commande]
++        stdout: StdioCollector {
++            onStreamFinished: {
++                var r = null
++                try { r = JSON.parse(text) } catch (_) {}
++                if (dictee.commande === "start") {
++                    if (!r || r.ok !== true) {
++                        page.ecouteVocale = false
++                        page.information = (r && r.error) ? String(r.error).slice(0, 300)
++                            : Reglages.t("Micro indisponible.", "Microphone unavailable.")
++                    }
++                } else {
++                    page.ecouteVocale = false
++                    if (r && r.ok === true && typeof r.text === "string" && r.text.trim().length) {
++                        var t = r.text.trim()
++                        AssistantEtat.brouillon = AssistantEtat.brouillon.trim().length
++                            ? AssistantEtat.brouillon.trim() + " " + t : t
++                        page.information = ""
++                        Qt.callLater(function() {
++                            entree.forceActiveFocus()
++                            entree.cursorPosition = entree.text.length
++                        })
++                    } else {
++                        page.information = (r && r.error) ? String(r.error).slice(0, 300)
++                            : Reglages.t("Transcription vide.", "Empty transcription.")
++                    }
++                }
++            }
++        }
++        stderr: StdioCollector {}
++    }
+ }
