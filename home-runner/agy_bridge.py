@@ -91,13 +91,16 @@ _FLASH_EFFORTS = {"low", "medium", "high"}
 def _normalize_model_effort(
     model: Optional[str], effort: Optional[str]
 ) -> tuple[Optional[str], Optional[str]]:
-    """Aligne le modèle Flash et l'effort pour éviter le conflit CLI.
+    """Aligne le modèle et l'effort pour éviter les conflits CLI.
 
-    Les modèles ``gemini-3.8-flash-*`` encodent déjà l'effort dans leur nom :
-    ``agy`` refuse par exemple ``--model gemini-3.8-flash-low --effort medium``.
-    On choisit donc le modèle Flash correspondant à l'effort demandé, et on
-    retombe sur l'effort du modèle pour les niveaux non disponibles en Flash.
+    - Les modèles ``gemini-3.8-flash-*`` encodent déjà l'effort dans leur nom :
+      ``agy`` refuse par exemple ``--model gemini-3.8-flash-low --effort medium``.
+    - Les modèles Opus comme ``claude-opus-4-6-thinking`` intègrent déjà la réflexion
+      et refusent l'option ``--effort``.
     """
+    if model and (model == "claude-opus-4-6-thinking" or ("opus" in model and "thinking" in model)):
+        return model, None
+
     if model and model.startswith(_FLASH_MODEL_PREFIX):
         suffix = model[len(_FLASH_MODEL_PREFIX):]
         if suffix in _FLASH_EFFORTS:
@@ -131,16 +134,12 @@ def update_session(
     """Met à jour les paramètres de session."""
     if model:
         SESSION_CONFIG["model"] = model.strip()
-        # Un modèle Flash impose son propre niveau d'effort.
-        if model.startswith(_FLASH_MODEL_PREFIX):
-            suffix = model[len(_FLASH_MODEL_PREFIX):]
-            if suffix in _FLASH_EFFORTS:
-                SESSION_CONFIG["effort"] = suffix
+        SESSION_CONFIG["model"], SESSION_CONFIG["effort"] = _normalize_model_effort(
+            SESSION_CONFIG["model"], SESSION_CONFIG.get("effort")
+        )
 
     if effort:
         SESSION_CONFIG["effort"] = effort.strip().lower()
-        # L'effort explicitement demandé est prioritaire : on aligne le modèle
-        # Flash dessus (ou on retombe sur high pour xhigh/max).
         SESSION_CONFIG["model"], SESSION_CONFIG["effort"] = _normalize_model_effort(
             SESSION_CONFIG.get("model"), SESSION_CONFIG.get("effort")
         )
