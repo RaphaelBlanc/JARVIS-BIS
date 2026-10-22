@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 import uuid
 import json
+import re
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
