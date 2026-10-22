@@ -109,6 +109,9 @@ cd JARVIS-BIS
 
 # 3. Démarrer l'assistant
 ./deploy.sh start
+
+# 4. (Optionnel) Exposer l'accès distant pour Noctalia via Tailscale (aucun timeout)
+./deploy.sh expose
 ```
 
 L'installateur interactif (`./deploy.sh setup`) vous demandera pour chaque service s'il doit être activé et vous invitera à saisir les tokens correspondants (Telegram, Discord, Moodle, etc.).

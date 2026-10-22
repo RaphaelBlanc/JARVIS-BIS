@@ -17,7 +17,45 @@ directement le home-runner** (port `8080`) : c'est l'API privée qui exécute
 PC Noctalia (n'importe où) ──HTTPS──► URL publique ──► gateway :8000 ──► runner :8080
 ```
 
-## Option A — Cloudflare Tunnel (recommandé, aucun port ouvert)
+## Option A — Tailscale (recommandé pour Noctalia & tâches longues)
+
+Tailscale crée un réseau privé chiffré (WireGuard) de machine à machine.
+**C'est la solution recommandée** pour lier Noctalia à JARVIS car :
+- **Aucun timeout de 100 s** : contrairement à Cloudflare qui coupe après 100 s (erreur 524), Tailscale n'impose aucune limite de temps sur les requêtes `/api/ask`. Idéal pour les tâches de réflexion ou de dev longues.
+- **Sécurité maximale** : le port `8000` n'est pas exposé sur l'Internet public ; seules tes machines authentifiées peuvent y accéder.
+- **Aucun nom de domaine requis**.
+
+### Installation & Démarrage
+
+```bash
+# 1. Sur le serveur ET sur le PC Noctalia
+sudo tailscale up
+
+# 2. Sur le serveur JARVIS : publier le gateway
+./deploy.sh expose
+# ou manuellement : ./scripts/expose-gateway.sh tailscale
+```
+
+La commande affiche deux options d'URL :
+- **Via MagicDNS (HTTPS)** : `https://mon-serveur.tailnet-xxxx.ts.net` (si MagicDNS / HTTPS est activé dans la console Tailscale).
+- **Via IP Tailscale directe (HTTP)** : `http://100.x.y.z:8000` (fonctionne immédiatement sans aucune configuration préalable).
+
+### Sur le PC Noctalia
+
+```bash
+nc-assistant configurer
+# URL     : https://mon-serveur.tailnet-xxxx.ts.net (ou http://100.x.y.z:8000)
+# Clé     : la valeur SECRET_KEY de ton .env
+# USER_ID : ton nom (ou "xenospacex")
+
+nc-assistant verifier
+```
+
+---
+
+## Option B — Cloudflare Tunnel (accès public, mais limité à 100 s)
+
+> ⚠️ **Limitation critique de Cloudflare** : Les tunnels Cloudflare gratuits coupent impérativement toute requête HTTP sans réponse au bout de **100 secondes (erreur HTTP 524)**. Comme la route `/api/ask` est synchrone, **les tâches IA lourdes ou longues échoueront systématiquement**. Utilise Tailscale (Option A) si tu confies des tâches complexes à JARVIS.
 
 ### Test rapide, sans compte
 
@@ -104,23 +142,6 @@ nc-assistant verifier
 Exécute le script **sur le Pi**, dans le dossier du projet. Le tunnel part du
 Pi vers `127.0.0.1:8000`. Inutile d'ouvrir un port sur la box.
 
-## Option B — Tailscale (réseau privé, aucune exposition publique)
-
-Tailscale crée un réseau privé entre tes appareils. C'est la solution la plus
-discrète : le gateway n'est pas visible sur Internet.
-
-```bash
-# Sur le serveur ET sur le PC Noctalia
-sudo tailscale up
-
-# Sur le serveur uniquement
-cd ~/assistant-perso
-./scripts/expose-gateway.sh tailscale
-```
-
-Le script publie le port `8000` via `tailscale serve` et affiche une URL du
-type `https://mon-pi.tailnet-xxxx.ts.net`. Configure le client Noctalia avec
-cette URL. Les deux machines doivent être connectées au même tailnet.
 
 ## Option C — Gateway sur Render + tunnel vers le runner
 

@@ -5,21 +5,21 @@
 # Le client Noctalia (nc-assistant) doit joindre le GATEWAY (port 8000), jamais
 # le home-runner (port 8080), qui est une API privée.
 #
+#   scripts/expose-gateway.sh tailscale
+#       Tailscale Serve ou IP Tailscale directe sur le port 8000 (recommandé pour Noctalia :
+#       aucun port ouvert, aucun timeout de 100s, idéal pour tâches IA longues).
+#       Prérequis : Tailscale installé et connecté sur le serveur ET le PC.
+#
 #   scripts/expose-gateway.sh quick
 #       Tunnel Cloudflare temporaire, sans compte. URL aléatoire, change au
-#       redémarrage. Reste au premier plan (Ctrl+C pour arrêter).
+#       redémarrage (attention : timeout strict Cloudflare de 100s, HTTP 524).
 #
 #   scripts/expose-gateway.sh quick-service
-#       Même tunnel temporaire, mais en service systemd utilisateur : la
-#       commande rend la main et affiche l'URL. Recommandé via Discord/SSH.
+#       Même tunnel temporaire, mais en service systemd utilisateur.
 #
 #   scripts/expose-gateway.sh cloudflare --hostname assistant.example.com
 #       Tunnel Cloudflare nommé + DNS + service systemd utilisateur (durable).
 #       Prérequis : cloudflared installé et `cloudflared tunnel login` fait.
-#
-#   scripts/expose-gateway.sh tailscale
-#       Tailscale Serve sur le port 8000 (réseau privé, aucun port ouvert).
-#       Prérequis : Tailscale installé et connecté sur le serveur ET le PC.
 #
 #   scripts/expose-gateway.sh status | stop
 # ==============================================================================
@@ -54,8 +54,9 @@ verifier_gateway_local() {
 cloudflare_quick() {
   need cloudflared
   verifier_gateway_local
-  warn "Tunnel temporaire : l'URL change à chaque redémarrage."
-  warn "Pour un usage durable, utilise : $0 cloudflare --hostname assistant.tondomaine.fr"
+  warn "Tunnel temporaire Cloudflare : l'URL change à chaque redémarrage."
+  warn "ATTENTION : Cloudflare limite les requêtes HTTP à 100 secondes (HTTP 524)."
+  warn "Les tâches IA longues (> 100 s) échoueront. Pour ces tâches, privilégie : $0 tailscale"
   info "Copie l'URL https://…trycloudflare.com affichée ci-dessous dans nc-assistant."
   exec cloudflared tunnel --no-autoupdate --url "${LOCAL_URL}"
 }
@@ -210,23 +211,40 @@ tailscale_access() {
     die "Tailscale n'est pas connecté. Lance : sudo tailscale up"
   fi
 
+  local ip
+  ip="$(tailscale ip -4 2>/dev/null || true)"
+
   info "Publication du gateway sur le tailnet…"
-  if ! tailscale serve --bg "$GATEWAY_PORT" >/dev/null 2>&1; then
-    tailscale serve --bg "${LOCAL_URL}" >/dev/null 2>&1 || \
-      die "Tailscale Serve a échoué. Active HTTPS/MagicDNS dans la console Tailscale."
+  local dns=""
+  if tailscale serve --bg "$GATEWAY_PORT" >/dev/null 2>&1 || tailscale serve --bg "${LOCAL_URL}" >/dev/null 2>&1; then
+    dns="$(tailscale status --json 2>/dev/null |
+      python3 -c 'import json,sys; print((json.load(sys.stdin).get("Self") or {}).get("DNSName","").rstrip("."))' 2>/dev/null || true)"
   fi
 
-  local dns
-  dns="$(tailscale status --json 2>/dev/null |
-    python3 -c 'import json,sys; print((json.load(sys.stdin).get("Self") or {}).get("DNSName","").rstrip("."))' 2>/dev/null || true)"
-  [ -n "$dns" ] || die "Nom DNS Tailscale introuvable. Active MagicDNS."
-
-  ok "Gateway accessible sur : https://${dns}"
+  ok "Gateway prêt sur Tailscale (aucun port ouvert, aucun timeout de 100 s)."
   echo
-  echo "Le PC Noctalia doit aussi être connecté au même tailnet."
-  echo "  nc-assistant configurer"
-  echo "    URL     : https://${dns}"
-  echo "  nc-assistant verifier"
+  if [ -n "$dns" ]; then
+    echo "• Option A (avec MagicDNS / HTTPS) :"
+    echo "  URL : https://${dns}"
+    echo
+  fi
+  if [ -n "$ip" ]; then
+    echo "• Option B (IP directe Tailscale, zéro configuration requise) :"
+    echo "  URL : http://${ip}:${GATEWAY_PORT}"
+    echo
+  fi
+  echo "Configuration sur le PC Noctalia :"
+  echo "  1. Assure-toi que le PC Noctalia est aussi connecté au Tailnet (sudo tailscale up)"
+  echo "  2. Lance la configuration :"
+  echo "     nc-assistant configurer"
+  if [ -n "$dns" ]; then
+    echo "       URL : https://${dns}"
+  elif [ -n "$ip" ]; then
+    echo "       URL : http://${ip}:${GATEWAY_PORT}"
+  fi
+  echo "       USER_ID : $(whoami)"
+  echo "  3. Vérifie la connexion :"
+  echo "     nc-assistant verifier"
 }
 
 statut() {

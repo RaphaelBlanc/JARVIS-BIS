@@ -34,6 +34,12 @@ case "$ACTION" in
         exit 0
         ;;
 
+    expose)
+        echo -e "${BLUE}Configuration de l'accès distant via Tailscale...${NC}"
+        bash "$ROOT_DIR/scripts/expose-gateway.sh" tailscale
+        exit 0
+        ;;
+
     start)
         echo -e "${BLUE}Démarrage de l'Assistant Personnel...${NC}"
         "$HOME_RUNNER_DIR/.venv/bin/uvicorn" main:app --app-dir "$HOME_RUNNER_DIR" --port 8080 &
@@ -105,7 +111,8 @@ echo -e "\n${GREEN}======================================================${NC}"
 echo -e "${GREEN}   ✅ Prêt à l'emploi !                               ${NC}"
 echo -e "${GREEN}======================================================${NC}"
 echo -e "Commandes :"
-echo -e "  • ${BLUE}./deploy.sh setup${NC}  : Configurer les tokens et outils MCP"
-echo -e "  • ${BLUE}./deploy.sh start${NC}  : Lancer l'assistant"
-echo -e "  • ${BLUE}./deploy.sh status${NC} : Vérifier la santé"
+echo -e "  • ${BLUE}./deploy.sh setup${NC}   : Configurer les tokens et outils MCP"
+echo -e "  • ${BLUE}./deploy.sh start${NC}   : Lancer l'assistant"
+echo -e "  • ${BLUE}./deploy.sh status${NC}  : Vérifier la santé"
+echo -e "  • ${BLUE}./deploy.sh expose${NC}  : Exposer l'assistant via Tailscale (aucun timeout, idéal Noctalia)"
 echo -e "======================================================\n"
