@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "").strip()
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "").strip()
 LOCAL_WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "base").strip()
-# "auto" (ou vide) laisse Whisper détecter la langue. Sinon forcer "fr", "en", etc.
-STT_LANGUAGE: str = os.getenv("WHISPER_LANGUAGE", "auto").strip().lower()
+# Langue de transcription par défaut : "fr" pour éviter les hallucinations (russe, cyrillique) sur les silences ou bruits de fond.
+STT_LANGUAGE: str = os.getenv("WHISPER_LANGUAGE", "fr").strip().lower()
 STT_MAX_AUDIO_MB: int = int(os.getenv("STT_MAX_AUDIO_MB", "25"))
 MAX_AUDIO_BYTES: int = max(1, STT_MAX_AUDIO_MB) * 1024 * 1024
 
@@ -62,10 +62,11 @@ async def _transcribe_groq(
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         with open(file_path, "rb") as f:
-            files = {"file": (file_path.name, f, "audio/ogg")}
+            files = {"file": (file_path.name, f, "audio/wav")}
             data = {
                 "model": "whisper-large-v3-turbo",
                 "response_format": "text",
+                "prompt": "Transcription en français.",
             }
             if language:
                 data["language"] = language
@@ -85,10 +86,11 @@ async def _transcribe_openai(
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         with open(file_path, "rb") as f:
-            files = {"file": (file_path.name, f, "audio/ogg")}
+            files = {"file": (file_path.name, f, "audio/wav")}
             data = {
                 "model": "whisper-1",
                 "response_format": "text",
+                "prompt": "Transcription en français.",
             }
             if language:
                 data["language"] = language
@@ -114,6 +116,7 @@ def _transcribe_local_sync(
         kwargs = {
             "beam_size": 3,
             "vad_filter": True,  # Supprime les blancs/silences
+            "initial_prompt": "Transcription en français.",
         }
         if language:
             kwargs["language"] = language
@@ -151,11 +154,11 @@ async def warmup_stt() -> None:
 
 
 def _resolve_language(language: Optional[str]) -> Optional[str]:
-    """Résout la langue demandée ; None signifie détection automatique."""
+    """Résout la langue demandée ; fallback sur STT_LANGUAGE ou 'fr'."""
     value = (language if language is not None else STT_LANGUAGE).strip().lower()
-    if not value or value in {"auto", "automatic", "détection", "detection"}:
+    if value in {"auto", "automatic", "détection", "detection"}:
         return None
-    return value
+    return value or "fr"
 
 
 async def transcribe_audio(

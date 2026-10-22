@@ -119,7 +119,7 @@ class Engines:
         names = ('run_agy','get_session_info','update_session','reset_session_async','list_recent_conversations',
                  'get_conversation_history','resume_conversation','delete_conversation','delete_all_conversations','get_token_usage')
         self.original = {n:getattr(upstream,n) for n in names}
-        self.should_inject = getattr(upstream, '_should_inject_memory', lambda v: True)
+        self.should_inject = getattr(upstream, '_should_inject_memory', lambda v, *a, **kw: True)
         self.agy_models = list(getattr(upstream, 'KNOWN_MODELS', []))
         self.path = Path(upstream.__file__).resolve().parent/'.nc-jarvis-engines.json'
         self.lock = asyncio.Lock()
@@ -227,14 +227,14 @@ class Engines:
         return dict(engine=self.state['engine'],tokens_available=False,message='Les tokens de ce CLI ne sont pas agrégés par JARVIS.')
 
     async def run(self, prompt, timeout=120, model=None, effort=None, mode=None,
-                  continue_session=True, reset_session_flag=False, permission_mode=None):
+                  continue_session=True, reset_session_flag=False, permission_mode=None, **kwargs):
         def failure(message): return dict(success=False,output='',error=message,session=self.session())
         if self.lock.locked(): return failure('Une autre requête JARVIS est déjà en cours.')
         async with self.lock:
             engine=self.state['engine']
             if engine=='agy':
                 return await self.original['run_agy'](prompt=prompt,timeout=timeout,model=model,effort=effort,mode=mode,
-                    continue_session=continue_session,reset_session_flag=reset_session_flag,permission_mode=permission_mode)
+                    continue_session=continue_session,reset_session_flag=reset_session_flag,permission_mode=permission_mode, **kwargs)
             path=executable(engine)
             if not path: return failure('CLI '+ENGINES[engine]+' absent sur la machine du runner.')
             if prompt.lstrip().startswith('/'):
@@ -272,5 +272,5 @@ def install(upstream):
     upstream.get_conversation_history=engines.history; upstream.resume_conversation=engines.resume
     upstream.delete_conversation=engines.delete; upstream.delete_all_conversations=lambda:engines.delete('all')
     upstream.get_token_usage=engines.usage; upstream.KNOWN_MODELS=engines.models()
-    upstream._should_inject_memory=lambda version: engines.should_inject(version) if engines.state['engine']=='agy' else False
+    upstream._should_inject_memory=lambda version, *args, **kwargs: engines.should_inject(version, *args, **kwargs) if engines.state['engine']=='agy' else False
     return engines
