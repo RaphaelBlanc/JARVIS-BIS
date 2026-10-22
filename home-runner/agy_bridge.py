@@ -60,16 +60,29 @@ def find_agy() -> Optional[str]:
     return None
 
 
-# Configuration de session en mémoire
-SESSION_CONFIG = {
-    "model": "gemini-3.8-flash-low",
-    "effort": "low",
-    "mode": None,
-    "has_active_session": False,
-    "conversation_id": None,
-    "permission_mode": "always-proceed",  # always-proceed | request-review
-    "turns": 0,
-}
+# Configuration de sessions en mémoire (isolées par clé de session)
+def _default_session() -> dict:
+    return {
+        "model": "gemini-3.8-flash-low",
+        "effort": "low",
+        "mode": None,
+        "has_active_session": False,
+        "conversation_id": None,
+        "permission_mode": "always-proceed",  # always-proceed | request-review
+        "turns": 0,
+    }
+
+_SESSIONS: dict[str, dict] = {}
+
+
+def _get_session(session_key: str = "default") -> dict:
+    key = (session_key or "default").strip()
+    if key not in _SESSIONS:
+        _SESSIONS[key] = _default_session()
+    return _SESSIONS[key]
+
+
+SESSION_CONFIG = _get_session("default")
 
 # Compaction automatique : au-delà de N tours, le worker est arrêté et la
 # conversation repart d'un historique vierge. 0 désactive la fonctionnalité.
@@ -120,9 +133,9 @@ def _normalize_model_effort(
     return model, effort
 
 
-def get_session_info() -> dict:
-    """Retourne la configuration actuelle de la session."""
-    return dict(SESSION_CONFIG)
+def get_session_info(session_key: str = "default") -> dict:
+    """Retourne la configuration actuelle de la session spécifiée."""
+    return dict(_get_session(session_key))
 
 
 def update_session(
@@ -130,33 +143,36 @@ def update_session(
     effort: Optional[str] = None,
     mode: Optional[str] = None,
     permission_mode: Optional[str] = None,
+    session_key: str = "default",
 ) -> dict:
     """Met à jour les paramètres de session."""
+    cfg = _get_session(session_key)
     if model:
-        SESSION_CONFIG["model"] = model.strip()
-        SESSION_CONFIG["model"], SESSION_CONFIG["effort"] = _normalize_model_effort(
-            SESSION_CONFIG["model"], SESSION_CONFIG.get("effort")
+        cfg["model"] = model.strip()
+        cfg["model"], cfg["effort"] = _normalize_model_effort(
+            cfg["model"], cfg.get("effort")
         )
 
     if effort:
-        SESSION_CONFIG["effort"] = effort.strip().lower()
-        SESSION_CONFIG["model"], SESSION_CONFIG["effort"] = _normalize_model_effort(
-            SESSION_CONFIG.get("model"), SESSION_CONFIG.get("effort")
+        cfg["effort"] = effort.strip().lower()
+        cfg["model"], cfg["effort"] = _normalize_model_effort(
+            cfg.get("model"), cfg.get("effort")
         )
 
     if mode:
-        SESSION_CONFIG["mode"] = mode.strip().lower()
+        cfg["mode"] = mode.strip().lower()
     if permission_mode:
-        SESSION_CONFIG["permission_mode"] = permission_mode.strip().lower()
-    return dict(SESSION_CONFIG)
+        cfg["permission_mode"] = permission_mode.strip().lower()
+    return dict(cfg)
 
 
-def reset_session() -> dict:
+def reset_session(session_key: str = "default") -> dict:
     """Réinitialise la session conversationnelle (démarre une nouvelle conversation vierge)."""
-    SESSION_CONFIG["has_active_session"] = False
-    SESSION_CONFIG["conversation_id"] = None
-    SESSION_CONFIG["turns"] = 0
-    return dict(SESSION_CONFIG)
+    cfg = _get_session(session_key)
+    cfg["has_active_session"] = False
+    cfg["conversation_id"] = None
+    cfg["turns"] = 0
+    return dict(cfg)
 
 
 # ── Suivi local des tokens ────────────────────────────────────────────────────
@@ -274,30 +290,34 @@ def get_token_usage() -> dict:
     return dict(_TOKEN_USAGE)
 
 
-def _note_turn() -> None:
+def _note_turn(session_key: str = "default") -> None:
     """Compte un tour conversationnel réussi."""
-    SESSION_CONFIG["turns"] = int(SESSION_CONFIG.get("turns", 0)) + 1
+    cfg = _get_session(session_key)
+    cfg["turns"] = int(cfg.get("turns", 0)) + 1
 
 
-def _auto_compact_due() -> bool:
+def _auto_compact_due(session_key: str = "default") -> bool:
     """Indique si le seuil de compaction automatique est atteint."""
+    cfg = _get_session(session_key)
     return AUTO_COMPACT_TURNS > 0 and int(
-        SESSION_CONFIG.get("turns", 0)
+        cfg.get("turns", 0)
     ) >= AUTO_COMPACT_TURNS
 
 
-async def _maybe_auto_compact() -> bool:
+async def _maybe_auto_compact(session_key: str = "default") -> bool:
     """Réinitialise proprement la conversation si le seuil est atteint."""
-    if not _auto_compact_due():
+    if not _auto_compact_due(session_key):
         return False
+    cfg = _get_session(session_key)
     logger.info(
-        "Compaction automatique : %d tours atteints (seuil=%d), "
+        "Compaction automatique [%s] : %d tours atteints (seuil=%d), "
         "réinitialisation de l'historique.",
-        SESSION_CONFIG.get("turns", 0),
+        session_key,
+        cfg.get("turns", 0),
         AUTO_COMPACT_TURNS,
     )
-    await _stop_worker()
-    reset_session()
+    await _stop_worker(session_key)
+    reset_session(session_key)
     return True
 
 
@@ -341,12 +361,18 @@ def get_conversation_history(conv_id: str, max_turns: int = 15) -> list[dict]:
     return turns[-max_turns:]
 
 
-def resume_conversation(conv_id: str) -> dict:
+def resume_conversation(conv_id: str, session_key: str = "default") -> dict:
     """Active une conversation passée par son identifiant pour les futurs échanges."""
     clean_id = conv_id.strip()
-    SESSION_CONFIG["conversation_id"] = clean_id
-    SESSION_CONFIG["has_active_session"] = True
-    SESSION_CONFIG["turns"] = 0
+    cfg = _get_session(session_key)
+    cfg["conversation_id"] = clean_id
+    cfg["has_active_session"] = True
+    cfg["turns"] = 0
+    history = get_conversation_history(clean_id)
+    return {
+        "session": dict(cfg),
+        "history": history,
+    }
     history = get_conversation_history(clean_id)
     return {
         "session": dict(SESSION_CONFIG),
@@ -425,8 +451,9 @@ def delete_conversation(conv_id: str) -> dict:
 
     try:
         shutil.rmtree(target_dir)
-        if SESSION_CONFIG.get("conversation_id") == clean_id:
-            reset_session()
+        for s_key, s_cfg in list(_SESSIONS.items()):
+            if s_cfg.get("conversation_id") == clean_id:
+                reset_session(s_key)
         logger.info("Conversation %s supprimée avec succès.", clean_id)
         return {"success": True, "deleted_id": clean_id}
     except Exception as e:
@@ -721,60 +748,72 @@ class _AgyStreamWorker:
         logger.info("Worker agy arrêté.")
 
 
-_WORKER: Optional[_AgyStreamWorker] = None
+_WORKERS: dict[str, _AgyStreamWorker] = {}
+_SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+_GLOBAL_SEMAPHORE = asyncio.Semaphore(2)
 _WATCHDOG_TASK: Optional[asyncio.Task] = None
 
 
-def get_worker_info() -> dict:
+def _get_session_lock(session_key: str = "default") -> asyncio.Lock:
+    key = (session_key or "default").strip()
+    if key not in _SESSION_LOCKS:
+        _SESSION_LOCKS[key] = asyncio.Lock()
+    return _SESSION_LOCKS[key]
+
+
+def get_worker_info(session_key: str = "default") -> dict:
     """Retourne l'état du worker persistant, pour /health et le diagnostic."""
-    worker = _WORKER
+    key = (session_key or "default").strip()
+    worker = _WORKERS.get(key)
+    cfg = _get_session(key)
+    active_count = len([w for w in _WORKERS.values() if w.is_alive()])
     return {
         "persistent": AGY_PERSISTENT,
         "sandbox": AGY_SANDBOX,
+        "session_key": key,
         "running": bool(worker and worker.is_alive()),
         "conversation_id": worker.conversation_id if worker else None,
         "idle_seconds": (
             round(time.monotonic() - worker.last_used, 1) if worker else None
         ),
         "idle_timeout": AGY_WORKER_IDLE_TIMEOUT,
-        "turns": SESSION_CONFIG.get("turns", 0),
+        "turns": cfg.get("turns", 0),
         "auto_compact_turns": AUTO_COMPACT_TURNS,
+        "active_workers_count": active_count,
     }
 
 
-async def _stop_worker() -> None:
-    """Arrête et oublie le worker courant."""
-    global _WORKER
-    worker = _WORKER
-    _WORKER = None
+async def _stop_worker(session_key: str = "default") -> None:
+    """Arrête et oublie le worker pour la session donnée."""
+    key = (session_key or "default").strip()
+    worker = _WORKERS.pop(key, None)
     if worker is not None:
         await worker.stop()
 
 
 async def _worker_watchdog() -> None:
-    """Arrête le worker après une longue période d'inactivité."""
+    """Arrête les workers après une longue période d'inactivité."""
     while True:
         await asyncio.sleep(30)
-        if _AGY_LOCK.locked():
-            continue
-        try:
-            await _AGY_LOCK.acquire()
-        except Exception:  # noqa: BLE001
-            continue
-        try:
-            worker = _WORKER
+        now = time.monotonic()
+        for key, worker in list(_WORKERS.items()):
             if (
                 worker is not None
                 and not worker.busy
-                and time.monotonic() - worker.last_used > AGY_WORKER_IDLE_TIMEOUT
+                and (now - worker.last_used) > AGY_WORKER_IDLE_TIMEOUT
             ):
-                logger.info(
-                    "Arrêt du worker agy inactif depuis %.0fs.",
-                    time.monotonic() - worker.last_used,
-                )
-                await _stop_worker()
-        finally:
-            _AGY_LOCK.release()
+                lock = _get_session_lock(key)
+                if not lock.locked():
+                    try:
+                        async with lock:
+                            logger.info(
+                                "Arrêt du worker agy [%s] inactif depuis %.0fs.",
+                                key,
+                                now - worker.last_used,
+                            )
+                            await _stop_worker(key)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Erreur arrêt worker watchdog [%s]: %s", key, exc)
 
 
 def _ensure_watchdog() -> None:
@@ -784,7 +823,7 @@ def _ensure_watchdog() -> None:
 
 
 async def shutdown_agy_worker() -> None:
-    """Arrête proprement le worker (appelé à l'arrêt du home-runner)."""
+    """Arrête proprement tous les workers (appelé à l'arrêt du home-runner)."""
     global _WATCHDOG_TASK
     task = _WATCHDOG_TASK
     _WATCHDOG_TASK = None
@@ -794,15 +833,16 @@ async def shutdown_agy_worker() -> None:
             await task
         except asyncio.CancelledError:
             pass
-    async with _AGY_LOCK:
-        await _stop_worker()
+    for key in list(_WORKERS.keys()):
+        await _stop_worker(key)
 
 
-async def reset_session_async() -> dict:
+async def reset_session_async(session_key: str = "default") -> dict:
     """Réinitialise la session et arrête le worker qui la détenait."""
-    async with _AGY_LOCK:
-        await _stop_worker()
-        return reset_session()
+    lock = _get_session_lock(session_key)
+    async with lock:
+        await _stop_worker(session_key)
+        return reset_session(session_key)
 
 
 async def _run_agy_oneshot(
@@ -815,48 +855,39 @@ async def _run_agy_oneshot(
     reset_session_flag: bool = False,
     permission_mode: Optional[str] = None,
     update_session: bool = True,
+    session_key: str = "default",
 ) -> dict:
     """
     Lance `agy` en subprocess non-interactif (-p / --print) avec support de continuité conversationnelle.
-
-    Args:
-        prompt: Texte de la requête.
-        timeout: Délai d'attente en secondes.
-        model: Modèle spécifique (ou celui de session par défaut).
-        effort: Niveau d'effort de raisonnement (low|medium|high|xhigh|max).
-        mode: Mode d'exécution (accept-edits|auto|plan).
-        continue_session: Si True, reprend la conversation en cours (-c).
-        reset_session_flag: Si True, force le démarrage d'une nouvelle session.
-        permission_mode: always-proceed ou request-review.
     """
+    cfg = _get_session(session_key)
     agy_path = find_agy()
     if not agy_path:
         return {
             "success": False,
             "output": "",
             "error": "agy introuvable dans PATH et dans les emplacements connus.",
-            "session": dict(SESSION_CONFIG),
+            "session": dict(cfg),
         }
 
     if reset_session_flag:
-        SESSION_CONFIG["has_active_session"] = False
-        SESSION_CONFIG["conversation_id"] = None
+        cfg["has_active_session"] = False
+        cfg["conversation_id"] = None
 
     # Construction des arguments agy
     cmd = [agy_path, *_sandbox_args()]
 
     # Reprise de conversation ciblée (--conversation) ou continue (-c) UNIQUEMENT si continue_session est True
     if continue_session and not reset_session_flag:
-        target_conv = SESSION_CONFIG.get("conversation_id")
+        target_conv = cfg.get("conversation_id")
         if target_conv:
             cmd.extend(["--conversation", target_conv])
-        elif SESSION_CONFIG.get("has_active_session"):
+        elif cfg.get("has_active_session"):
             cmd.append("-c")
 
-
     # Modèle et effort de raisonnement (normalisés pour les modèles Flash)
-    active_model = model or SESSION_CONFIG.get("model")
-    active_effort = effort or SESSION_CONFIG.get("effort") or "low"
+    active_model = model or cfg.get("model")
+    active_effort = effort or cfg.get("effort") or "low"
     active_model, active_effort = _normalize_model_effort(
         active_model, active_effort
     )
@@ -866,12 +897,12 @@ async def _run_agy_oneshot(
         cmd.extend(["--effort", active_effort])
 
     # Mode d'exécution
-    active_mode = mode or SESSION_CONFIG.get("mode")
+    active_mode = mode or cfg.get("mode")
     if active_mode:
         cmd.extend(["--mode", active_mode])
 
     # Permissions
-    perm = permission_mode or SESSION_CONFIG.get("permission_mode", "always-proceed")
+    perm = permission_mode or cfg.get("permission_mode", "always-proceed")
     if perm == "always-proceed":
         cmd.append("--dangerously-skip-permissions")
 
@@ -887,7 +918,7 @@ async def _run_agy_oneshot(
         "COLORTERM": "",
     }
 
-    logger.info("Exécution agy: %s (timeout=%ds)", " ".join(cmd[:6]), timeout)
+    logger.info("Exécution agy [%s]: %s (timeout=%ds)", session_key, " ".join(cmd[:6]), timeout)
 
     proc: Optional[asyncio.subprocess.Process] = None
     try:
@@ -909,19 +940,18 @@ async def _run_agy_oneshot(
 
         if success:
             if update_session:
-                SESSION_CONFIG["has_active_session"] = True
+                cfg["has_active_session"] = True
                 if prompt.lstrip().startswith("/"):
-                    # `/compact` remet le compteur à zéro ; les autres slash
-                    # commands ne comptent pas comme des tours de conversation.
                     if prompt.strip().startswith("/compact"):
-                        SESSION_CONFIG["turns"] = 0
+                        cfg["turns"] = 0
                 else:
-                    _note_turn()
-                    await _maybe_auto_compact()
-            logger.info("agy terminé avec succès (code 0). Sortie : %d caractères.", len(out))
+                    _note_turn(session_key)
+                    await _maybe_auto_compact(session_key)
+            logger.info("agy [%s] terminé avec succès (code 0). Sortie : %d caractères.", session_key, len(out))
         else:
             logger.warning(
-                "agy terminé avec code %d. stderr : %.200s",
+                "agy [%s] terminé avec code %d. stderr : %.200s",
+                session_key,
                 proc.returncode,
                 err or "(vide)",
             )
@@ -932,11 +962,11 @@ async def _run_agy_oneshot(
             "success": success,
             "output": out,
             "error": err if err else None,
-            "session": dict(SESSION_CONFIG),
+            "session": dict(cfg),
         }
 
     except asyncio.TimeoutError:
-        logger.error("agy a dépassé le timeout de %ds.", timeout)
+        logger.error("agy [%s] a dépassé le timeout de %ds.", session_key, timeout)
         if proc is not None:
             try:
                 proc.kill()
@@ -947,16 +977,16 @@ async def _run_agy_oneshot(
             "success": False,
             "output": "",
             "error": f"Timeout dépassé ({timeout}s). Le processus a été interrompu.",
-            "session": dict(SESSION_CONFIG),
+            "session": dict(cfg),
         }
 
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Erreur inattendue lors de l'exécution de agy : %s", exc)
+        logger.exception("Erreur inattendue lors de l'exécution de agy [%s]: %s", session_key, exc)
         return {
             "success": False,
             "output": "",
             "error": str(exc),
-            "session": dict(SESSION_CONFIG),
+            "session": dict(cfg),
         }
 
 
@@ -969,45 +999,37 @@ async def _run_agy_persistent(
     continue_session: bool,
     reset_session_flag: bool,
     permission_mode: Optional[str],
+    session_key: str = "default",
 ) -> dict:
-    """Exécute un tour via le worker stream-json persistant.
-
-    Les commandes sans continuité (`continue_session=False`) et les commandes
-    slash d'agy utilisent l'ancien mode one-shot : elles ne doivent pas
-    polluer la conversation principale, et certaines slash commands ne sont
-    pas disponibles en stream-json.
-    """
-    global _WORKER
-
+    """Exécute un tour via le worker stream-json persistant associé à la session."""
+    cfg = _get_session(session_key)
     agy_path = find_agy()
     if not agy_path:
         return {
             "success": False,
             "output": "",
             "error": "agy introuvable dans PATH et dans les emplacements connus.",
-            "session": dict(SESSION_CONFIG),
+            "session": dict(cfg),
         }
 
     if reset_session_flag:
-        await _stop_worker()
-        SESSION_CONFIG["has_active_session"] = False
-        SESSION_CONFIG["conversation_id"] = None
+        await _stop_worker(session_key)
+        cfg["has_active_session"] = False
+        cfg["conversation_id"] = None
 
-    active_model = model or SESSION_CONFIG.get("model")
-    active_effort = effort or SESSION_CONFIG.get("effort") or "low"
+    active_model = model or cfg.get("model")
+    active_effort = effort or cfg.get("effort") or "low"
     active_model, active_effort = _normalize_model_effort(
         active_model, active_effort
     )
-    active_mode = mode or SESSION_CONFIG.get("mode")
-    active_perm = permission_mode or SESSION_CONFIG.get(
+    active_mode = mode or cfg.get("mode")
+    active_perm = permission_mode or cfg.get(
         "permission_mode", "always-proceed"
     )
 
     is_slash = prompt.lstrip().startswith("/")
     if not continue_session or is_slash:
-        # Un seul processus agy à la fois : on arrête le worker principal
-        # avant de lancer une commande one-shot.
-        await _stop_worker()
+        await _stop_worker(session_key)
         return await _run_agy_oneshot(
             prompt=prompt,
             timeout=timeout,
@@ -1018,33 +1040,32 @@ async def _run_agy_persistent(
             reset_session_flag=False,
             permission_mode=permission_mode,
             update_session=continue_session,
+            session_key=session_key,
         )
 
-    worker = _WORKER
+    worker = _WORKERS.get(session_key)
     if worker is not None and not worker.is_alive():
-        await _stop_worker()
+        await _stop_worker(session_key)
         worker = None
 
-    # `/session/reset` remet has_active_session à False sans forcément arrêter
-    # le worker : on ne doit alors surtout pas réutiliser l'ancienne conversation.
-    if worker is not None and not SESSION_CONFIG.get("has_active_session"):
-        await _stop_worker()
+    if worker is not None and not cfg.get("has_active_session"):
+        await _stop_worker(session_key)
         worker = None
 
     if worker is not None and not worker.matches(
         active_model, active_effort, active_mode, active_perm
     ):
-        await _stop_worker()
+        await _stop_worker(session_key)
         worker = None
 
     if worker is not None:
-        current_id = SESSION_CONFIG.get("conversation_id")
+        current_id = cfg.get("conversation_id")
         if (
             current_id
             and worker.conversation_id
             and worker.conversation_id != current_id
         ):
-            await _stop_worker()
+            await _stop_worker(session_key)
             worker = None
 
     if worker is None:
@@ -1055,14 +1076,15 @@ async def _run_agy_persistent(
             mode=active_mode,
             permission_mode=active_perm,
             continue_session=True,
-            conversation_id=SESSION_CONFIG.get("conversation_id"),
-            has_active_session=SESSION_CONFIG.get("has_active_session", False),
+            conversation_id=cfg.get("conversation_id"),
+            has_active_session=cfg.get("has_active_session", False),
         )
         try:
             await worker.start()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Échec du worker agy persistant (%s) ; repli sur une exécution one-shot.",
+                "Échec du worker agy persistant [%s] (%s) ; repli sur une exécution one-shot.",
+                session_key,
                 exc,
             )
             await worker.stop()
@@ -1076,29 +1098,30 @@ async def _run_agy_persistent(
                 reset_session_flag=False,
                 permission_mode=permission_mode,
                 update_session=True,
+                session_key=session_key,
             )
-        _WORKER = worker
+        _WORKERS[session_key] = worker
         _ensure_watchdog()
 
     try:
         result = await worker.send(prompt, timeout)
     except asyncio.TimeoutError:
-        logger.error("Worker agy : timeout de %ds dépassé.", timeout)
-        await _stop_worker()
+        logger.error("Worker agy [%s] : timeout de %ds dépassé.", session_key, timeout)
+        await _stop_worker(session_key)
         return {
             "success": False,
             "output": "",
             "error": f"Timeout dépassé ({timeout}s). Le processus a été interrompu.",
-            "session": dict(SESSION_CONFIG),
+            "session": dict(cfg),
         }
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Erreur du worker agy : %s", exc)
-        await _stop_worker()
+        logger.exception("Erreur du worker agy [%s] : %s", session_key, exc)
+        await _stop_worker(session_key)
         return {
             "success": False,
             "output": "",
             "error": str(exc),
-            "session": dict(SESSION_CONFIG),
+            "session": dict(cfg),
         }
 
     status = str(result.get("status", "")).upper()
@@ -1107,17 +1130,18 @@ async def _run_agy_persistent(
     error = result.get("error")
 
     if success:
-        SESSION_CONFIG["has_active_session"] = True
+        cfg["has_active_session"] = True
         if worker.conversation_id:
-            SESSION_CONFIG["conversation_id"] = worker.conversation_id
-        _note_turn()
-        await _maybe_auto_compact()
+            cfg["conversation_id"] = worker.conversation_id
+        _note_turn(session_key)
+        await _maybe_auto_compact(session_key)
         logger.info(
-            "agy (worker) terminé avec succès. Sortie : %d caractères.", len(output)
+            "agy (worker) [%s] terminé avec succès. Sortie : %d caractères.", session_key, len(output)
         )
     else:
         logger.warning(
-            "agy (worker) terminé avec statut %s : %s",
+            "agy (worker) [%s] terminé avec statut %s : %s",
+            session_key,
             status or "?",
             error or "(sans détail)",
         )
@@ -1128,7 +1152,7 @@ async def _run_agy_persistent(
         "success": success,
         "output": output,
         "error": None if success else error,
-        "session": dict(SESSION_CONFIG),
+        "session": dict(cfg),
     }
 
 
@@ -1141,25 +1165,42 @@ async def run_agy(
     continue_session: bool = True,
     reset_session_flag: bool = False,
     permission_mode: Optional[str] = None,
+    session_key: str = "default",
 ) -> dict:
-    """Exécute agy en garantissant qu'une seule requête tourne à la fois.
+    """Exécute agy pour la session demandée.
 
-    Si une requête est déjà en cours, on répond immédiatement par une erreur
-    explicite plutôt que de lancer un second processus sur la même session.
+    Chaque session_key possède son propre verrou et sa propre conversation.
+    Un sémaphore global (2 requêtes max) empêche de surcharger le processeur
+    tout en permettant à plusieurs machines de converser simultanément.
     """
-    if _AGY_LOCK.locked():
-        logger.warning("Requête agy refusée : une exécution est déjà en cours.")
+    key = (session_key or "default").strip()
+    session_lock = _get_session_lock(key)
+
+    if session_lock.locked():
+        logger.warning("Requête agy refusée pour la session '%s' : une exécution est déjà en cours.", key)
         return {
             "success": False,
             "output": "",
-            "error": "Une autre requête est déjà en cours. Réessayez dans quelques instants.",
-            "session": dict(SESSION_CONFIG),
+            "error": "Une autre requête est déjà en cours sur cette session. Réessayez dans quelques instants.",
+            "session": dict(_get_session(key)),
         }
 
-    await _AGY_LOCK.acquire()
+    await session_lock.acquire()
     try:
-        if AGY_PERSISTENT:
-            return await _run_agy_persistent(
+        async with _GLOBAL_SEMAPHORE:
+            if AGY_PERSISTENT:
+                return await _run_agy_persistent(
+                    prompt=prompt,
+                    timeout=timeout,
+                    model=model,
+                    effort=effort,
+                    mode=mode,
+                    continue_session=continue_session,
+                    reset_session_flag=reset_session_flag,
+                    permission_mode=permission_mode,
+                    session_key=key,
+                )
+            return await _run_agy_oneshot(
                 prompt=prompt,
                 timeout=timeout,
                 model=model,
@@ -1168,17 +1209,8 @@ async def run_agy(
                 continue_session=continue_session,
                 reset_session_flag=reset_session_flag,
                 permission_mode=permission_mode,
+                update_session=continue_session,
+                session_key=key,
             )
-        return await _run_agy_oneshot(
-            prompt=prompt,
-            timeout=timeout,
-            model=model,
-            effort=effort,
-            mode=mode,
-            continue_session=continue_session,
-            reset_session_flag=reset_session_flag,
-            permission_mode=permission_mode,
-            update_session=continue_session,
-        )
     finally:
-        _AGY_LOCK.release()
+        session_lock.release()

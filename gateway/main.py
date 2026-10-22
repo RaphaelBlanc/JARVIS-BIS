@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.hardware_relay import HARDWARE_RELAY
+from core.node_hub import NODE_HUB
 from core.tools.base import ToolRegistry
 from core.tools.dispatcher import execute_tool_action
 
@@ -449,6 +450,9 @@ class AskRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="La question ou commande")
     platform: str = Field(default="desktop", description="Plateforme d'origine")
     user_id: str = Field(default="desktop", description="Identifiant utilisateur")
+    client_id: Optional[str] = Field(default=None, description="Identifiant unique de la machine cliente (laptop, tour)")
+    session_key: Optional[str] = Field(default=None, description="Clé de session isolée")
+    target_node: Optional[str] = Field(default=None, description="Nœud distant ciblé pour les actions matérielles")
     timeout: int = Field(default=600, ge=5, le=1800, description="Timeout en secondes")
     continue_session: bool = Field(
         default=True, description="Reprendre la session en cours"
@@ -478,16 +482,17 @@ async def api_ask(payload: AskRequest) -> dict:
     """Endpoint universel pour interroger l'assistant depuis n'importe quel
     client HTTP authentifié (bureau Noctalia, scripts, applications tierces).
 
-    Réutilise ``forward_to_runner()`` — même logique que les bots Telegram et
-    Discord — mais sans passer par un bot. La session est partagée avec les
-    autres plateformes (même ``home-runner``).
+    Isole les conversations par machine/utilisateur via effective_session_key.
     """
     from gateway import forward_to_runner
 
+    effective_session_key = payload.session_key or f"{payload.platform}:{payload.client_id or payload.user_id}"
     logger.info(
-        "API /api/ask — platform=%s user=%s prompt=%.60s…",
+        "API /api/ask — platform=%s user=%s client_id=%s session_key=%s prompt=%.60s…",
         payload.platform,
         payload.user_id,
+        payload.client_id,
+        effective_session_key,
         payload.prompt,
     )
 
@@ -498,6 +503,7 @@ async def api_ask(payload: AskRequest) -> dict:
         effort=payload.effort,
         continue_session=payload.continue_session,
         reset_session=payload.reset_session,
+        session_key=effective_session_key,
     )
 
     output = result.get("output", "")
@@ -643,6 +649,126 @@ async def api_action(payload: ActionRequest) -> dict:
         params=payload.params,
         platform=payload.platform,
     )
+
+
+# ── API Node Hub (Gestion des machines clientes distantes) ─────────────────────
+
+class NodeActionRequest(BaseModel):
+    action: str = Field(..., description="Action à exécuter (exec, read_file, write_file, screenshot, lock, etc.)")
+    params: Optional[dict] = Field(default_factory=dict, description="Paramètres de l'action")
+    timeout: float = Field(default=30.0, description="Délai maximum en secondes")
+
+class NodeExecRequest(BaseModel):
+    command: str = Field(..., description="Commande shell à exécuter")
+    timeout: float = Field(default=60.0, description="Délai maximum en secondes")
+
+class NodeReadFileRequest(BaseModel):
+    path: str = Field(..., description="Chemin absolu ou relatif du fichier à lire")
+
+class NodeWriteFileRequest(BaseModel):
+    path: str = Field(..., description="Chemin du fichier à écrire")
+    content: str = Field(..., description="Contenu du fichier")
+
+
+@app.get(
+    "/api/nodes",
+    tags=["nodes"],
+    summary="Lister les machines clientes connectées (Laptop, Tour, etc.)",
+    dependencies=[Depends(require_secret)],
+)
+async def api_list_nodes() -> dict:
+    nodes = NODE_HUB.list_nodes()
+    return {"nodes": nodes, "count": len(nodes)}
+
+
+@app.post(
+    "/api/node/{node_id}/action",
+    tags=["nodes"],
+    summary="Envoyer une action à une machine cliente",
+    dependencies=[Depends(require_secret)],
+)
+async def api_node_action(node_id: str, payload: NodeActionRequest) -> dict:
+    return await NODE_HUB.send_action(
+        node_id=node_id,
+        action=payload.action,
+        params=payload.params,
+        timeout=payload.timeout,
+    )
+
+
+@app.post(
+    "/api/node/{node_id}/exec",
+    tags=["nodes"],
+    summary="Exécuter une commande shell sur une machine cliente",
+    dependencies=[Depends(require_secret)],
+)
+async def api_node_exec(node_id: str, payload: NodeExecRequest) -> dict:
+    return await NODE_HUB.exec_cmd(
+        command=payload.command,
+        node_id=node_id,
+        timeout=payload.timeout,
+    )
+
+
+@app.post(
+    "/api/node/{node_id}/read_file",
+    tags=["nodes"],
+    summary="Lire un fichier sur une machine cliente",
+    dependencies=[Depends(require_secret)],
+)
+async def api_node_read_file(node_id: str, payload: NodeReadFileRequest) -> dict:
+    return await NODE_HUB.read_file(path=payload.path, node_id=node_id)
+
+
+@app.post(
+    "/api/node/{node_id}/write_file",
+    tags=["nodes"],
+    summary="Écrire un fichier sur une machine cliente",
+    dependencies=[Depends(require_secret)],
+)
+async def api_node_write_file(node_id: str, payload: NodeWriteFileRequest) -> dict:
+    return await NODE_HUB.write_file(path=payload.path, content=payload.content, node_id=node_id)
+
+
+@app.websocket("/api/node/ws")
+async def node_websocket_endpoint(websocket: WebSocket, secret: Optional[str] = None):
+    """Endpoint WebSocket pour la connexion permanente des agents clients JARVIS."""
+    header_secret = websocket.headers.get("X-Secret-Key")
+    query_secret = secret or websocket.query_params.get("secret")
+    provided_secret = header_secret or query_secret
+
+    if not SECRET_KEY or not provided_secret or not hmac.compare_digest(provided_secret, SECRET_KEY):
+        logger.warning("Connexion WebSocket refusée pour agent nœud : clé invalide ou absente.")
+        await websocket.close(code=1008, reason="Clé secrète invalide")
+        return
+
+    await websocket.accept()
+    node_id = None
+    try:
+        # Attente du message d'enregistrement initial
+        init_data = await asyncio.wait_for(websocket.receive_json(), timeout=15.0)
+        if init_data.get("type") != "register":
+            await websocket.close(code=1002, reason="Premier message doit être 'register'")
+            return
+
+        node_id = str(init_data.get("node_id") or uuid.uuid4().hex[:8])
+        await NODE_HUB.register_node(node_id=node_id, websocket=websocket, info=init_data)
+        logger.info("Nœud client connecté et enregistré : %s", node_id)
+
+        # Boucle d'écoute
+        while True:
+            msg = await websocket.receive_json()
+            NODE_HUB.handle_incoming_message(node_id=node_id, message=msg)
+
+    except WebSocketDisconnect:
+        logger.info("Nœud client déconnecté (WebSocketDisconnect) : %s", node_id)
+    except asyncio.TimeoutError:
+        logger.warning("Nœud client timeout lors de l'enregistrement.")
+    except Exception as exc:
+        logger.warning("Erreur connexion WebSocket nœud client %s : %s", node_id, exc)
+    finally:
+        if node_id:
+            await NODE_HUB.unregister_node(node_id=node_id, websocket=websocket)
 
 
 @app.get(

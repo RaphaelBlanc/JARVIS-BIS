@@ -28,17 +28,32 @@ class HardwareRelay:
         params = params or {}
 
         try:
+            import base64
+            from core.node_hub import NODE_HUB
             from core.tools import system_tools
 
             # Actions nécessitant un affichage graphique / Wayland
             is_wayland = bool(os.getenv("WAYLAND_DISPLAY") or os.getenv("XDG_SESSION_TYPE") == "wayland")
             has_display = bool(os.getenv("DISPLAY") or is_wayland)
+            node_target = params.get("node_id") or params.get("node")
+            target_node = NODE_HUB.get_node(node_target)
+
+            # Si un nœud spécifique est ciblé ou si le serveur est headless et qu'un nœud client est connecté
+            if target_node and (node_target or (not has_display and action in ("screenshot", "lock", "clipboard_set", "clipboard_get", "media", "notify", "run_shell"))):
+                res = await NODE_HUB.send_action(target_node.node_id, "exec" if action == "run_shell" else action, params, timeout=timeout)
+                if action == "screenshot" and res.get("success") and res.get("image_base64"):
+                    out_path = Path(params.get("output_path", "/tmp/screenshot.png"))
+                    out_path.write_bytes(base64.b64decode(res["image_base64"]))
+                    return True, f"Capture effectuée sur le nœud {target_node.node_id}.", {"file_path": str(out_path)}
+                if res.get("success"):
+                    return True, res.get("message") or f"Action '{action}' exécutée sur le nœud {target_node.node_id}.", res
+                return False, res.get("error") or f"Échec de l'action sur le nœud {target_node.node_id}.", None
 
             if action in ("screenshot", "lock", "cam") and not has_display and not os.path.exists("/dev/video0"):
                 return (
                     False,
                     "⚠️ <b>Commande matérielle indisponible</b>\n"
-                    "L'assistant tourne actuellement sur un serveur distant sans session graphique ou sans webcam connectée.",
+                    "L'assistant tourne actuellement sur un serveur distant sans session graphique ou sans webcam connectée (aucun nœud client connecté).",
                     None,
                 )
 

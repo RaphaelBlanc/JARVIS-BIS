@@ -72,7 +72,10 @@ Interroge le moteur de raisonnement de l'assistant (avec mémoire de session et 
   {
     "prompt": "Quel est mon programme et mes devoirs aujourd'hui ?",
     "platform": "noctalia",
-    "user_id": "noctalia",
+    "user_id": "xenospacex",
+    "client_id": "laptop",
+    "session_key": null,
+    "target_node": null,
     "timeout": 120,
     "continue_session": true,
     "reset_session": false,
@@ -80,6 +83,7 @@ Interroge le moteur de raisonnement de l'assistant (avec mémoire de session et 
     "effort": null
   }
   ```
+  *Note Multi-PC :* `client_id` (ex: `laptop`, `tour`) permet d'isoler les sessions conversationnelles pour chaque machine physique partageant le même `user_id`. Si omis, la session est mutualisée sous `platform:user_id`.
 - **Réponse réussie (200 OK)** :
   ```json
   {
@@ -236,6 +240,19 @@ Point d'entrée du protocole de gestion et du tableau de bord complet Noctalia (
 * **`conversations`**, **`conversation.history`**, **`conversation.resume`** : Historique et reprise de sessions passées.
 * **`config.update`** : Enregistrement atomique des jetons et variables `.env`.
 * **`services`**, **`service.restart`**, **`logs`** : État des services systemd et journaux filtrés.
+
+---
+
+### 3.8 Nœuds Clients Distants & Multi-PC (`/api/nodes` & `/api/node/*`)
+
+Permet de superviser et contrôler les machines connectées (Laptop, Tour, etc.) via un tunnel WebSocket sortant inverse (`clients/node_agent.py`), sans aucun port ouvert sur les PC.
+
+* **`GET /api/nodes`** : Liste les nœuds connectés, leur nom d'hôte, leur système et leurs capacités.
+* **`POST /api/node/{node_id}/action`** : Exécute une action sur la machine cliente (`exec`, `read_file`, `write_file`, `screenshot`, `lock`, `clipboard_get`, `clipboard_set`, `media`).
+* **`POST /api/node/{node_id}/exec`** : Exécute une commande shell avec les privilèges utilisateur normaux.
+* **`POST /api/node/{node_id}/read_file`** : Lit un fichier texte sécurisé (rejet absolu de `~/.ssh`, `.env`, clés privées, path traversal).
+* **`POST /api/node/{node_id}/write_file`** : Écrit un fichier sur la machine distante.
+* **`WebSocket /api/node/ws?secret=<SECRET_KEY>`** : Point d'ancrage pour l'agent de nœud client.
 
 ---
 

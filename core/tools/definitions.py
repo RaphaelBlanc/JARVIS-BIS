@@ -157,6 +157,15 @@ class WeatherTool(BaseTool):
     ]
 
 
+class NodesTool(BaseTool):
+    id = "nodes"
+    name = "Gestionnaire de Nœuds Distants (Multi-PC)"
+    description = "Supervision et contrôle des machines clientes connectées (Laptop, Tour, etc.) : statut, commandes shell et transferts de fichiers."
+    icon = "🖥️"
+    requires_local_hardware = False
+    params = []
+
+
 # Enregistrement initial
 ALL_TOOL_CLASSES = [
     SystemPcTool,
@@ -174,6 +183,7 @@ ALL_TOOL_CLASSES = [
     MailSorterTool,
     GoogleWorkspaceTool,
     WeatherTool,
+    NodesTool,
 ]
 
 

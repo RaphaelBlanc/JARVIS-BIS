@@ -1791,7 +1791,8 @@ async def _process_prompt_and_reply(update: Update, prompt: str, waiting_msg) ->
     if await _try_create_natural_reminder(update, prompt, waiting_msg):
         return
 
-    result = await forward_to_runner(prompt, continue_session=True)
+    session_key = f"telegram:{user.id}"
+    result = await forward_to_runner(prompt, continue_session=True, session_key=session_key)
 
     if result.get("success"):
         response_text = result.get("output", "").strip() or "✅ Tâche terminée (pas de sortie)."
@@ -1867,11 +1868,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         prompt = caption if caption else "Analyse cette image en détail et décris ce qu'elle contient ou réponds aux éléments visibles."
 
         logger.info("Image Telegram reçue de %d (%s, %d octets). Prompt: '%s'", user.id, filename, len(photo_bytes), prompt[:60])
+        session_key = f"telegram:{user.id}"
         result = await forward_to_runner(
             prompt,
             continue_session=True,
             image_base64=b64,
             image_filename=filename,
+            session_key=session_key,
         )
 
         if result.get("success"):

@@ -1,0 +1,16 @@
+[Unit]
+Description=JARVIS Client Node Agent (Pont machine distante)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 %h/JARVIS-BIS/clients/node_agent.py
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jarvis-node
+
+[Install]
+WantedBy=default.target

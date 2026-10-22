@@ -869,12 +869,14 @@ async def ask_slash(
             except Exception as exc:
                 logger.warning("Erreur lecture pièce jointe /ask: %s", exc)
 
+    session_key = f"discord:{interaction.user.id}"
     result = await forward_to_runner(
         question,
         continue_session=True,
         timeout=180,
         image_base64=img_b64,
         image_filename=img_name,
+        session_key=session_key,
     )
 
     if result.get("success"):
@@ -2070,11 +2072,13 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
                 await message.reply(format_reminder_confirmation(reminder))
                 return
 
+            session_key = f"discord:{message.author.id}"
             res = await forward_to_runner(
                 prompt,
                 continue_session=True,
                 image_base64=img_b64,
                 image_filename=img_name,
+                session_key=session_key,
             )
             if res.get("success"):
                 out = res.get("output", "").strip() or "✅ Tâche terminée."

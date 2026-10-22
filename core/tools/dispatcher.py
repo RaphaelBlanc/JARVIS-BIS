@@ -263,6 +263,59 @@ async def execute_tool_action(
                     "message": "🔒 Authentifié" if is_auth else "🔒 Verrouillé",
                 }
 
+        # ── NODES & MULTI-PC ─────────────────────────────────────────────────────
+        elif tool_id == "nodes":
+            from core.node_hub import NODE_HUB
+            if action in ("list", "status"):
+                nodes = NODE_HUB.list_nodes()
+                if not nodes:
+                    return {"success": True, "message": "ℹ️ Aucun nœud client connecté actuellement.", "nodes": []}
+                msg = f"🖥️ <b>Nœuds clients connectés ({len(nodes)}) :</b>\n\n"
+                for n in nodes:
+                    msg += f"• <b>{n['node_id']}</b> ({n['hostname']}) — {n['os_name']}\n  Activité: il y a {n['idle_seconds']}s\n"
+                return {"success": True, "message": msg, "nodes": nodes}
+
+            elif action in ("exec", "run_shell"):
+                cmd = str(params.get("command", "")).strip()
+                node_id = params.get("node_id") or params.get("node")
+                timeout = float(params.get("timeout", 60.0))
+                res = await NODE_HUB.exec_cmd(cmd, node_id=node_id, timeout=timeout)
+                return {
+                    "success": res.get("success", False),
+                    "message": res.get("message") or res.get("error", ""),
+                    "result": res,
+                }
+
+            elif action == "read_file":
+                path = str(params.get("path", "")).strip()
+                node_id = params.get("node_id") or params.get("node")
+                res = await NODE_HUB.read_file(path, node_id=node_id)
+                return {
+                    "success": res.get("success", False),
+                    "message": f"Fichier {path} lu ({res.get('size', 0)} octets)." if res.get("success") else res.get("error", ""),
+                    "result": res,
+                }
+
+            elif action == "write_file":
+                path = str(params.get("path", "")).strip()
+                content = str(params.get("content", ""))
+                node_id = params.get("node_id") or params.get("node")
+                res = await NODE_HUB.write_file(path, content, node_id=node_id)
+                return {
+                    "success": res.get("success", False),
+                    "message": f"Fichier {path} écrit avec succès." if res.get("success") else res.get("error", ""),
+                    "result": res,
+                }
+
+            elif action == "screenshot":
+                node_id = params.get("node_id") or params.get("node")
+                res = await NODE_HUB.send_action(node_id, "screenshot", params)
+                return {
+                    "success": res.get("success", False),
+                    "message": "Capture d'écran reçue." if res.get("success") else res.get("error", ""),
+                    "result": res,
+                }
+
         return {"success": False, "error": f"Action '{action}' non reconnue pour le module '{tool_id}'."}
 
     except Exception as exc:

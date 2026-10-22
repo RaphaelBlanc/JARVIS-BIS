@@ -31,13 +31,14 @@ async def forward_to_runner(
     permission_mode: str | None = None,
     image_base64: str | None = None,
     image_filename: str | None = None,
+    session_key: str | None = None,
 ) -> dict:
     """Transmet un prompt au home-runner et retourne sa réponse."""
     if not HOME_SERVER_URL:
         logger.error("HOME_SERVER_URL n'est pas configuré.")
         return {"success": False, "output": "", "error": "HOME_SERVER_URL non configuré"}
 
-    logger.info("Transmission au home-runner: prompt=%.60s… (continue=%s, timeout=%ds, image=%s)", prompt, continue_session, timeout, bool(image_base64))
+    logger.info("Transmission au home-runner [%s]: prompt=%.60s… (continue=%s, timeout=%ds, image=%s)", session_key or "default", prompt, continue_session, timeout, bool(image_base64))
 
     # Marge de 15s pour que httpx ne coupe pas avant que le runner ait renvoyé son diagnostic
     client_timeout = float(timeout + 15)
@@ -50,6 +51,8 @@ async def forward_to_runner(
                 "continue_session": continue_session,
                 "reset_session": reset_session,
             }
+            if session_key:
+                payload["session_key"] = session_key
             if model:
                 payload["model"] = model
             if effort:
@@ -132,14 +135,14 @@ async def fetch_models() -> dict:
         return {"success": False, "models": [], "error": str(e)}
 
 
-async def fetch_session() -> dict:
+async def fetch_session(session_key: str = "default") -> dict:
     """Récupère les informations de session du home-runner."""
     if not HOME_SERVER_URL:
         return {"error": "HOME_SERVER_URL non configuré"}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                f"{HOME_SERVER_URL}/session",
+                f"{HOME_SERVER_URL}/session?session_key={session_key}",
                 headers={"X-Secret-Key": SECRET_KEY},
             )
             resp.raise_for_status()
@@ -154,12 +157,13 @@ async def update_session_remote(
     effort: str | None = None,
     mode: str | None = None,
     permission_mode: str | None = None,
+    session_key: str = "default",
 ) -> dict:
     """Met à jour les paramètres de session du home-runner."""
     if not HOME_SERVER_URL:
         return {"error": "HOME_SERVER_URL non configuré"}
     try:
-        payload = {}
+        payload = {"session_key": session_key}
         if model:
             payload["model"] = model
         if effort:
@@ -193,7 +197,7 @@ def invalidate_conversations_cache() -> None:
     _CONV_CACHE_EXPIRY = 0.0
 
 
-async def reset_session_remote() -> dict:
+async def reset_session_remote(session_key: str = "default") -> dict:
     """Réinitialise la session active sur le home-runner."""
     invalidate_conversations_cache()
     if not HOME_SERVER_URL:
@@ -201,7 +205,7 @@ async def reset_session_remote() -> dict:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
-                f"{HOME_SERVER_URL}/session/reset",
+                f"{HOME_SERVER_URL}/session/reset?session_key={session_key}",
                 headers={"X-Secret-Key": SECRET_KEY},
             )
             resp.raise_for_status()
@@ -237,7 +241,7 @@ async def fetch_conversations(limit: int = 8, use_cache: bool = True) -> list[di
         return _CONV_CACHE[:limit] if _CONV_CACHE else []
 
 
-async def resume_conversation_remote(conversation_id: str) -> dict:
+async def resume_conversation_remote(conversation_id: str, session_key: str = "default") -> dict:
     """Demande au home-runner de reprendre une conversation spécifique."""
     invalidate_conversations_cache()
     if not HOME_SERVER_URL:
@@ -246,7 +250,7 @@ async def resume_conversation_remote(conversation_id: str) -> dict:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 f"{HOME_SERVER_URL}/conversation/resume",
-                json={"conversation_id": conversation_id},
+                json={"conversation_id": conversation_id, "session_key": session_key},
                 headers={"X-Secret-Key": SECRET_KEY},
             )
             resp.raise_for_status()
