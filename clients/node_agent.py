@@ -16,6 +16,7 @@ SÉCURITÉ RENFORCÉE (SANDBOX STRICTE) :
 import argparse
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
 import os
@@ -25,7 +26,9 @@ import shutil
 import socket
 import struct
 import sys
+import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -39,9 +42,10 @@ logger = logging.getLogger("node_agent")
 CONF_PATH = Path.home() / ".config" / "nc" / "assistant.conf"
 MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 Mo
 
-# Répertoires et fichiers strictement interdits d'accès
+# Répertoires et fichiers strictement interdits d'accès (lecture ou écriture)
 FORBIDDEN_EXACT_NAMES = {
     "assistant.conf",
+    "ia.conf",
     "id_rsa",
     "id_ed25519",
     "id_ecdsa",
@@ -49,6 +53,9 @@ FORBIDDEN_EXACT_NAMES = {
     ".env",
     "master.key",
     "credentials",
+    "hosts.yml",
+    ".git-credentials",
+    ".netrc",
 }
 
 FORBIDDEN_EXTENSIONS = {
@@ -63,26 +70,79 @@ FORBIDDEN_ROOTS = [
     Path.home() / ".ssh",
     Path.home() / ".gnupg",
     Path.home() / ".aws",
+    Path.home() / ".config" / "gh",
+    Path.home() / ".local" / "share" / "keyrings",
+    Path.home() / ".mozilla",
+    Path.home() / ".config" / "chromium",
+    Path.home() / ".config" / "google-chrome",
+    Path.home() / ".config" / "BraveSoftware",
+    Path.home() / ".config" / "microsoft-edge",
+    Path.home() / ".claude",
     Path("/etc/shadow"),
     Path("/etc/sudoers"),
     Path("/root"),
 ]
 
-SUDO_PATTERN = re.compile(r"\b(sudo|pkexec|su\s|doas)\b", re.IGNORECASE)
+# Chemins strictement interdits en écriture (protection contre la persistance d'attaques)
+FORBIDDEN_WRITE_PATHS = [
+    Path.home() / ".bashrc",
+    Path.home() / ".bash_profile",
+    Path.home() / ".bash_logout",
+    Path.home() / ".profile",
+    Path.home() / ".zshrc",
+    Path.home() / ".zprofile",
+    Path.home() / ".zshenv",
+    Path.home() / ".zlogin",
+    Path.home() / ".config" / "fish",
+    Path.home() / ".config" / "autostart",
+    Path.home() / ".config" / "systemd",
+    Path.home() / ".config" / "nc",
+    Path.home() / ".local" / "bin" / "nc-noeud",
+    Path.home() / ".local" / "bin" / "node_agent.py",
+    Path("/etc/systemd"),
+    Path("/etc/cron.d"),
+    Path("/etc/cron.daily"),
+    Path("/etc/cron.hourly"),
+    Path("/etc/cron.weekly"),
+    Path("/etc/cron.monthly"),
+    Path("/var/spool/cron"),
+]
 
 
-def is_path_safe(target_path: Path) -> Tuple[bool, str]:
-    """Vérifie qu'un chemin ne tente pas d'accéder à des secrets système ou utilisateur."""
+def is_private_or_tailscale_host(host: str) -> bool:
+    """Vérifie si l'hôte est local, privé (RFC 1918) ou Tailscale (100.64.0.0/10)."""
+    if not host:
+        return False
+    clean = host.strip().lower()
+    if clean in ("localhost", "127.0.0.1", "::1") or clean.endswith(".local") or clean.endswith(".ts.net"):
+        return True
     try:
-        resolved = target_path.expanduser().resolve()
+        ip = ipaddress.ip_address(clean)
+        if ip.is_loopback or ip.is_private:
+            return True
+        if ip in ipaddress.ip_network("100.64.0.0/10"):
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def is_path_safe(target_path: Path, mode: str = "read") -> Tuple[bool, str]:
+    """Vérifie qu'un chemin ne tente pas d'accéder à des secrets ou de s'installer en persistance."""
+    try:
+        expanded = target_path.expanduser()
+        if expanded.exists():
+            resolved = expanded.resolve()
+        else:
+            resolved = expanded.parent.resolve() / expanded.name
     except Exception as exc:
         return False, f"Impossible de résoudre le chemin : {exc}"
 
-    # Vérification des répertoires racines interdits
+    # Vérification des répertoires sensibles absolus
     for forbidden_root in FORBIDDEN_ROOTS:
         try:
-            resolved_forbidden = forbidden_root.expanduser().resolve()
-            if resolved == resolved_forbidden or resolved_forbidden in resolved.parents:
+            res_forbidden = forbidden_root.expanduser().resolve()
+            if resolved == res_forbidden or res_forbidden in resolved.parents:
                 return False, f"Accès refusé au répertoire sensible : {forbidden_root}"
         except Exception:
             pass
@@ -96,23 +156,54 @@ def is_path_safe(target_path: Path) -> Tuple[bool, str]:
         if name.endswith(ext):
             return False, f"Accès refusé aux clés et certificats : {name}"
 
-    # Vérification du fichier de configuration JARVIS lui-même
+    # Vérification de configuration JARVIS
     try:
         if resolved == CONF_PATH.resolve():
             return False, "Accès refusé au fichier de configuration confidentiel de l'assistant."
     except Exception:
         pass
 
+    # En écriture : interdire toute persistance (shells, autostart, services, cron)
+    if mode == "write":
+        for fw in FORBIDDEN_WRITE_PATHS:
+            try:
+                res_fw = fw.expanduser().resolve()
+                if resolved == res_fw or res_fw in resolved.parents:
+                    return False, f"Écriture refusée sur un chemin système/persistance protégé : {fw.name}"
+            except Exception:
+                pass
+
     return True, ""
 
 
 def is_command_safe(command: str) -> Tuple[bool, str]:
-    """Vérifie qu'une commande ne tente pas d'escalade de privilèges."""
+    """Vérifie qu'une commande ne tente pas d'escalade de privilèges ou d'accéder aux secrets."""
     if os.geteuid() == 0:
         return False, "L'agent nœud ne doit JAMAIS être exécuté en tant que root."
 
-    if SUDO_PATTERN.search(command):
-        return False, "L'utilisation de 'sudo', 'su', 'pkexec' ou 'doas' est strictement interdite."
+    if not command or not command.strip():
+        return False, "Commande vide."
+
+    # 1. Neutraliser les techniques d'évasion (quotes imbriquées, antislash, subshells)
+    # Ex: s''udo, $(printf sudo), `echo su`, \su
+    clean = re.sub(r"['\"\\`]", "", command)
+
+    # 2. Vérification d'élévation de privilèges dans n'importe quel segment
+    # Détecte sudo, pkexec, doas avec frontières de mots, et su isolé
+    if re.search(r"\b(sudo|pkexec|doas)\b", clean, re.IGNORECASE):
+        return False, "L'utilisation de 'sudo', 'pkexec' ou 'doas' est strictement interdite."
+
+    if re.search(r"(?:^|[\s;&|/()${}`])su(?:$|[\s;&|/()${}`])", clean, re.IGNORECASE):
+        return False, "L'utilisation de 'su' est strictement interdite."
+
+    # 3. Vérification d'accès aux fichiers sensibles dans les arguments de commandes
+    forbidden_terms = (
+        ".ssh", ".gnupg", ".aws", ".git-credentials", ".netrc", "hosts.yml",
+        "keyrings", "assistant.conf", "shadow", "sudoers"
+    )
+    for term in forbidden_terms:
+        if re.search(rf"(?:^|[\s/]){re.escape(term)}(?:$|[\s/])", clean, re.IGNORECASE):
+            return False, f"Accès aux secrets et clés interdit dans les commandes : '{term}'."
 
     return True, ""
 
@@ -276,15 +367,39 @@ class NodeAgent:
         self._running = False
 
     def get_ws_url(self) -> str:
-        """Convertit l'URL HTTP/HTTPS en URL WebSocket WS/WSS."""
-        url = self.gateway_url
-        if url.startswith("https://"):
-            ws_url = "wss://" + url[len("https://") :]
-        elif url.startswith("http://"):
-            ws_url = "ws://" + url[len("http://") :]
+        """Convertit l'URL HTTP/HTTPS en URL WebSocket WS/WSS avec validation de sécurité."""
+        u = urllib.parse.urlsplit(self.gateway_url)
+        host = u.hostname or "localhost"
+        scheme = u.scheme.lower()
+
+        if scheme == "https":
+            ws_scheme = "wss"
+        elif scheme == "http":
+            if not is_private_or_tailscale_host(host):
+                raise ValueError(
+                    f"Connexion ws:// refusée vers l'hôte public '{host}' : le secret et les requêtes circuleraient en clair. "
+                    "Configurez une URL https:// (TLS) ou utilisez une adresse IP privée / Tailscale."
+                )
+            ws_scheme = "ws"
+        elif scheme == "wss":
+            ws_scheme = "wss"
+        elif scheme == "ws":
+            if not is_private_or_tailscale_host(host):
+                raise ValueError(
+                    f"Connexion ws:// refusée vers l'hôte public '{host}' : le secret et les requêtes circuleraient en clair. "
+                    "Utilisez wss:// ou une adresse IP privée / Tailscale."
+                )
+            ws_scheme = "ws"
         else:
-            ws_url = "ws://" + url
-        return f"{ws_url}/api/node/ws?secret={self.secret_key}"
+            ws_scheme = "ws"
+
+        netloc = host
+        if u.port:
+            netloc += f":{u.port}"
+
+        path = u.path.rstrip("/")
+        # Le secret n'est JAMAIS inclus dans l'URL (transmission stricte par en-tête X-Secret-Key)
+        return f"{ws_scheme}://{netloc}{path}/api/node/ws"
 
     async def handle_action(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Traite une action reçue du serveur dans un environnement sécurisé."""
@@ -341,7 +456,7 @@ class NodeAgent:
                     return {"success": False, "error": "Chemin de fichier manquant"}
 
                 target = Path(path_str).expanduser()
-                safe, reason = is_path_safe(target)
+                safe, reason = is_path_safe(target, mode="read")
                 if not safe:
                     return {"success": False, "error": f"Sécurité : {reason}"}
 
@@ -376,7 +491,7 @@ class NodeAgent:
                     return {"success": False, "error": "Contenu trop volumineux (> 5 Mo)"}
 
                 target = Path(path_str).expanduser()
-                safe, reason = is_path_safe(target)
+                safe, reason = is_path_safe(target, mode="write")
                 if not safe:
                     return {"success": False, "error": f"Sécurité : {reason}"}
 
@@ -385,44 +500,52 @@ class NodeAgent:
                 return {"success": True, "path": str(target.resolve()), "bytes_written": len(content)}
 
             elif action == "screenshot":
-                out_path = Path("/tmp") / f"nc-node-screenshot-{int(time.time())}.png"
-                is_wayland = bool(os.getenv("WAYLAND_DISPLAY") or os.getenv("XDG_SESSION_TYPE") == "wayland")
-                grim = shutil.which("grim")
+                with tempfile.NamedTemporaryFile(prefix="nc-node-screenshot-", suffix=".png", delete=False) as tmp_f:
+                    out_path = Path(tmp_f.name)
+                try:
+                    os.chmod(out_path, 0o600)
+                except Exception:
+                    pass
 
-                captured = False
-                if is_wayland and grim:
-                    proc = await asyncio.create_subprocess_exec(
-                        grim, str(out_path),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    await proc.wait()
-                    captured = out_path.exists() and out_path.stat().st_size > 0
+                try:
+                    is_wayland = bool(os.getenv("WAYLAND_DISPLAY") or os.getenv("XDG_SESSION_TYPE") == "wayland")
+                    grim = shutil.which("grim")
 
-                if not captured:
-                    ffmpeg = shutil.which("ffmpeg")
-                    display = os.getenv("DISPLAY", ":0")
-                    if ffmpeg:
+                    captured = False
+                    if is_wayland and grim:
                         proc = await asyncio.create_subprocess_exec(
-                            ffmpeg, "-f", "x11grab", "-video_size", "1920x1080",
-                            "-i", display, "-vframes", "1", str(out_path), "-y",
+                            grim, str(out_path),
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
                         )
                         await proc.wait()
                         captured = out_path.exists() and out_path.stat().st_size > 0
 
-                if not captured:
-                    return {"success": False, "error": "Aucun utilitaire de capture disponible (grim/ffmpeg)"}
+                    if not captured:
+                        ffmpeg = shutil.which("ffmpeg")
+                        display = os.getenv("DISPLAY", ":0")
+                        if ffmpeg:
+                            proc = await asyncio.create_subprocess_exec(
+                                ffmpeg, "-f", "x11grab", "-video_size", "1920x1080",
+                                "-i", display, "-vframes", "1", str(out_path), "-y",
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            await proc.wait()
+                            captured = out_path.exists() and out_path.stat().st_size > 0
 
-                # Encode en base64 pour transmission facile
-                data = base64.b64encode(out_path.read_bytes()).decode("ascii")
-                try:
-                    out_path.unlink()
-                except Exception:
-                    pass
+                    if not captured:
+                        return {"success": False, "error": "Aucun utilitaire de capture disponible (grim/ffmpeg)"}
 
-                return {"success": True, "image_base64": data, "format": "png"}
+                    # Encode en base64 pour transmission facile
+                    data = base64.b64encode(out_path.read_bytes()).decode("ascii")
+                    return {"success": True, "image_base64": data, "format": "png"}
+                finally:
+                    try:
+                        if out_path.exists():
+                            out_path.unlink()
+                    except Exception:
+                        pass
 
             elif action == "lock":
                 hyprlock = shutil.which("hyprlock")

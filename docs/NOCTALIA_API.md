@@ -252,7 +252,7 @@ Permet de superviser et contrôler les machines connectées (Laptop, Tour, etc.)
 * **`POST /api/node/{node_id}/exec`** : Exécute une commande shell avec les privilèges utilisateur normaux.
 * **`POST /api/node/{node_id}/read_file`** : Lit un fichier texte sécurisé (rejet absolu de `~/.ssh`, `.env`, clés privées, path traversal).
 * **`POST /api/node/{node_id}/write_file`** : Écrit un fichier sur la machine distante.
-* **`WebSocket /api/node/ws?secret=<SECRET_KEY>`** : Point d'ancrage pour l'agent de nœud client.
+* **`WebSocket /api/node/ws`** : Point d'ancrage pour l'agent de nœud client (authentification stricte par en-tête HTTP `X-Secret-Key`, aucun secret dans l'URL ; `ws://` réservé aux adresses privées et Tailscale).
 
 ---
 

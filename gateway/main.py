@@ -656,7 +656,7 @@ async def api_action(payload: ActionRequest) -> dict:
 class NodeActionRequest(BaseModel):
     action: str = Field(..., description="Action à exécuter (exec, read_file, write_file, screenshot, lock, etc.)")
     params: Optional[dict] = Field(default_factory=dict, description="Paramètres de l'action")
-    timeout: float = Field(default=30.0, description="Délai maximum en secondes")
+    timeout: float = Field(default=35.0, description="Délai maximum en secondes")
 
 class NodeExecRequest(BaseModel):
     command: str = Field(..., description="Commande shell à exécuter")
@@ -664,10 +664,12 @@ class NodeExecRequest(BaseModel):
 
 class NodeReadFileRequest(BaseModel):
     path: str = Field(..., description="Chemin absolu ou relatif du fichier à lire")
+    timeout: float = Field(default=35.0, description="Délai maximum en secondes")
 
 class NodeWriteFileRequest(BaseModel):
     path: str = Field(..., description="Chemin du fichier à écrire")
     content: str = Field(..., description="Contenu du fichier")
+    timeout: float = Field(default=35.0, description="Délai maximum en secondes")
 
 
 @app.get(
@@ -717,7 +719,7 @@ async def api_node_exec(node_id: str, payload: NodeExecRequest) -> dict:
     dependencies=[Depends(require_secret)],
 )
 async def api_node_read_file(node_id: str, payload: NodeReadFileRequest) -> dict:
-    return await NODE_HUB.read_file(path=payload.path, node_id=node_id)
+    return await NODE_HUB.read_file(path=payload.path, node_id=node_id, timeout=payload.timeout)
 
 
 @app.post(
@@ -727,19 +729,23 @@ async def api_node_read_file(node_id: str, payload: NodeReadFileRequest) -> dict
     dependencies=[Depends(require_secret)],
 )
 async def api_node_write_file(node_id: str, payload: NodeWriteFileRequest) -> dict:
-    return await NODE_HUB.write_file(path=payload.path, content=payload.content, node_id=node_id)
+    return await NODE_HUB.write_file(path=payload.path, content=payload.content, node_id=node_id, timeout=payload.timeout)
 
 
 @app.websocket("/api/node/ws")
-async def node_websocket_endpoint(websocket: WebSocket, secret: Optional[str] = None):
-    """Endpoint WebSocket pour la connexion permanente des agents clients JARVIS."""
-    header_secret = websocket.headers.get("X-Secret-Key")
-    query_secret = secret or websocket.query_params.get("secret")
-    provided_secret = header_secret or query_secret
+async def node_websocket_endpoint(websocket: WebSocket):
+    """Endpoint WebSocket pour la connexion permanente des agents clients JARVIS.
+    Authentification stricte par en-tête X-Secret-Key (aucun secret dans l'URL)."""
+    # Refus strict si le secret est passé dans l'URL pour éviter les fuites dans les logs et proxies
+    if "secret" in websocket.query_params:
+        logger.warning("Connexion WebSocket refusée : passage du secret en query param interdit.")
+        await websocket.close(code=1008, reason="Secret dans l'URL interdit, utilisez le header X-Secret-Key")
+        return
 
-    if not SECRET_KEY or not provided_secret or not hmac.compare_digest(provided_secret, SECRET_KEY):
+    header_secret = websocket.headers.get("X-Secret-Key")
+    if not SECRET_KEY or not header_secret or not hmac.compare_digest(header_secret, SECRET_KEY):
         logger.warning("Connexion WebSocket refusée pour agent nœud : clé invalide ou absente.")
-        await websocket.close(code=1008, reason="Clé secrète invalide")
+        await websocket.close(code=1008, reason="Clé secrète invalide ou absente (header X-Secret-Key requis)")
         return
 
     await websocket.accept()

@@ -276,8 +276,20 @@ async def execute_tool_action(
                 return {"success": True, "message": msg, "nodes": nodes}
 
             elif action in ("exec", "run_shell"):
-                cmd = str(params.get("command", "")).strip()
+                if os.getenv("ENABLE_NODE_EXEC", "0").lower() not in ("1", "true", "yes"):
+                    return {
+                        "success": False,
+                        "error": "L'exécution distante de commandes (exec) sur les nœuds clients est désactivée par défaut par sécurité. Définissez ENABLE_NODE_EXEC=1 côté serveur pour l'autoriser.",
+                        "message": "⚠️ <b>Exécution distante désactivée</b> : l'exécution de commandes shell sur les machines clientes requiert ENABLE_NODE_EXEC=1 côté serveur JARVIS.",
+                    }
                 node_id = params.get("node_id") or params.get("node")
+                if not node_id or str(node_id).strip().lower() in ("", "auto", "default", "any"):
+                    return {
+                        "success": False,
+                        "error": "node_id obligatoire : le ciblage implicite/auto est interdit pour exec par sécurité.",
+                        "message": "⚠️ Précisez la machine cible (ex: node_id='laptop').",
+                    }
+                cmd = str(params.get("command", "")).strip()
                 timeout = float(params.get("timeout", 60.0))
                 res = await NODE_HUB.exec_cmd(cmd, node_id=node_id, timeout=timeout)
                 return {
@@ -289,7 +301,7 @@ async def execute_tool_action(
             elif action == "read_file":
                 path = str(params.get("path", "")).strip()
                 node_id = params.get("node_id") or params.get("node")
-                res = await NODE_HUB.read_file(path, node_id=node_id)
+                res = await NODE_HUB.read_file(path, node_id=node_id, timeout=35.0)
                 return {
                     "success": res.get("success", False),
                     "message": f"Fichier {path} lu ({res.get('size', 0)} octets)." if res.get("success") else res.get("error", ""),
@@ -297,10 +309,16 @@ async def execute_tool_action(
                 }
 
             elif action == "write_file":
+                node_id = params.get("node_id") or params.get("node")
+                if not node_id or str(node_id).strip().lower() in ("", "auto", "default", "any"):
+                    return {
+                        "success": False,
+                        "error": "node_id obligatoire : le ciblage implicite/auto est interdit pour write_file par sécurité.",
+                        "message": "⚠️ Précisez la machine cible (ex: node_id='laptop').",
+                    }
                 path = str(params.get("path", "")).strip()
                 content = str(params.get("content", ""))
-                node_id = params.get("node_id") or params.get("node")
-                res = await NODE_HUB.write_file(path, content, node_id=node_id)
+                res = await NODE_HUB.write_file(path, content, node_id=node_id, timeout=35.0)
                 return {
                     "success": res.get("success", False),
                     "message": f"Fichier {path} écrit avec succès." if res.get("success") else res.get("error", ""),
@@ -309,7 +327,7 @@ async def execute_tool_action(
 
             elif action == "screenshot":
                 node_id = params.get("node_id") or params.get("node")
-                res = await NODE_HUB.send_action(node_id, "screenshot", params)
+                res = await NODE_HUB.send_action(node_id, "screenshot", params, timeout=35.0)
                 return {
                     "success": res.get("success", False),
                     "message": "Capture d'écran reçue." if res.get("success") else res.get("error", ""),

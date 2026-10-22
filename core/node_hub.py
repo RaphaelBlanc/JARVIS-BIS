@@ -155,7 +155,7 @@ class NodeHub:
         node_id: Optional[str],
         action: str,
         params: Optional[Dict[str, Any]] = None,
-        timeout: float = 30.0,
+        timeout: float = 35.0,
     ) -> Dict[str, Any]:
         """Envoie une requête d'action au nœud cible et attend la réponse."""
         node = self.get_node(node_id)
@@ -201,7 +201,12 @@ class NodeHub:
         node_id: Optional[str] = None,
         timeout: float = 60.0,
     ) -> Dict[str, Any]:
-        """Exécute une commande shell sécurisée sur le nœud distant."""
+        """Exécute une commande shell sécurisée sur le nœud distant (node_id explicite requis)."""
+        if not node_id or str(node_id).strip().lower() in ("", "auto", "default", "any"):
+            return {
+                "success": False,
+                "error": "Sécurité : un identifiant de nœud client (node_id) explicite est obligatoire pour exécuter des commandes.",
+            }
         return await self.send_action(
             node_id=node_id,
             action="exec",
@@ -213,7 +218,7 @@ class NodeHub:
         self,
         path: str,
         node_id: Optional[str] = None,
-        timeout: float = 15.0,
+        timeout: float = 35.0,
     ) -> Dict[str, Any]:
         """Lit un fichier sur le nœud distant."""
         return await self.send_action(
@@ -228,9 +233,14 @@ class NodeHub:
         path: str,
         content: str,
         node_id: Optional[str] = None,
-        timeout: float = 15.0,
+        timeout: float = 35.0,
     ) -> Dict[str, Any]:
-        """Écrit un fichier sur le nœud distant."""
+        """Écrit un fichier sur le nœud distant (node_id explicite requis)."""
+        if not node_id or str(node_id).strip().lower() in ("", "auto", "default", "any"):
+            return {
+                "success": False,
+                "error": "Sécurité : un identifiant de nœud client (node_id) explicite est obligatoire pour écrire des fichiers.",
+            }
         return await self.send_action(
             node_id=node_id,
             action="write_file",

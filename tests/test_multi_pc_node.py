@@ -161,14 +161,21 @@ class TestSecuritySandbox(unittest.IsolatedAsyncioTestCase):
     """Vérifie la robustesse de la Sandbox : interdiction de sudo et protection des secrets."""
 
     def test_command_security(self):
-        # Commandes dangereuses avec sudo/su/pkexec doivent être rejetées
+        # Commandes dangereuses avec sudo/su/pkexec doivent être rejetées, y compris avec évasion
         dangerous_commands = [
             "sudo rm -rf /",
             "sudo apt update",
             "pkexec bash",
             "su root",
+            "echo test | su",
+            "s''udo whoami",
+            's""udo ls',
+            "$(printf sudo) rm -rf /",
             "doas cat /etc/shadow",
             "echo test | sudo tee /etc/hosts",
+            "cat ~/.ssh/id_ed25519",
+            "tail -n 10 ~/.git-credentials",
+            "grep token ~/.config/gh/hosts.yml",
         ]
         for cmd in dangerous_commands:
             safe, reason = is_command_safe(cmd)
@@ -187,13 +194,19 @@ class TestSecuritySandbox(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(safe, f"La commande '{cmd}' aurait dû être autorisée")
 
     def test_path_security(self):
-        # Chemins sensibles interdits
+        # Chemins sensibles interdits en lecture et écriture
         forbidden_paths = [
             Path.home() / ".ssh" / "id_rsa",
             Path.home() / ".ssh" / "id_ed25519",
             Path.home() / ".ssh" / "authorized_keys",
             Path.home() / ".gnupg" / "secring.gpg",
             Path.home() / ".aws" / "credentials",
+            Path.home() / ".config" / "gh" / "hosts.yml",
+            Path.home() / ".git-credentials",
+            Path.home() / ".netrc",
+            Path.home() / ".local" / "share" / "keyrings" / "login.keyring",
+            Path.home() / ".mozilla" / "firefox" / "profiles.ini",
+            Path.home() / ".config" / "chromium" / "Default" / "Cookies",
             Path.home() / ".config" / "nc" / "assistant.conf",
             Path("/etc/shadow"),
             Path("/etc/sudoers"),
@@ -203,8 +216,22 @@ class TestSecuritySandbox(unittest.IsolatedAsyncioTestCase):
             Path.home() / "cert.pem",
         ]
         for p in forbidden_paths:
-            safe, reason = is_path_safe(p)
-            self.assertFalse(safe, f"Le chemin '{p}' aurait dû être rejeté : {reason}")
+            safe_read, r_reason = is_path_safe(p, mode="read")
+            self.assertFalse(safe_read, f"La lecture de '{p}' aurait dû être rejetée : {r_reason}")
+            safe_write, w_reason = is_path_safe(p, mode="write")
+            self.assertFalse(safe_write, f"L'écriture de '{p}' aurait dû être rejetée : {w_reason}")
+
+        # Chemins de persistance interdits spécifiquement en écriture
+        persistence_paths = [
+            Path.home() / ".bashrc",
+            Path.home() / ".zshrc",
+            Path.home() / ".profile",
+            Path.home() / ".config" / "autostart" / "malicious.desktop",
+            Path.home() / ".config" / "systemd" / "user" / "evil.service",
+        ]
+        for p in persistence_paths:
+            safe_write, w_reason = is_path_safe(p, mode="write")
+            self.assertFalse(safe_write, f"L'écriture de persistance '{p}' aurait dû être rejetée : {w_reason}")
 
         # Chemins utilisateur normaux autorisés
         safe_paths = [
@@ -213,8 +240,46 @@ class TestSecuritySandbox(unittest.IsolatedAsyncioTestCase):
             Path("/tmp/test.log"),
         ]
         for p in safe_paths:
-            safe, reason = is_path_safe(p)
+            safe, reason = is_path_safe(p, mode="read")
             self.assertTrue(safe, f"Le chemin '{p}' aurait dû être autorisé ({reason})")
+
+    def test_ws_url_security_and_no_secret_in_url(self):
+        # 1. ws:// vers IP publique doit être rejeté
+        agent_public = NodeAgent("http://51.15.22.44:8000", "my-secret", "node1")
+        with self.assertRaises(ValueError):
+            agent_public.get_ws_url()
+
+        # 2. ws:// vers Tailscale (100.x.y.z) ou IP privée doit être accepté
+        agent_tailscale = NodeAgent("http://100.89.134.15:8000", "my-secret", "node1")
+        url_ts = agent_tailscale.get_ws_url()
+        self.assertTrue(url_ts.startswith("ws://100.89.134.15:8000/api/node/ws"))
+        self.assertNotIn("my-secret", url_ts)
+
+        agent_local = NodeAgent("http://192.168.1.50:8000", "my-secret", "node1")
+        url_loc = agent_local.get_ws_url()
+        self.assertTrue(url_loc.startswith("ws://192.168.1.50:8000/api/node/ws"))
+        self.assertNotIn("my-secret", url_loc)
+
+        # 3. https:// (TLS) vers IP publique doit être accepté
+        agent_tls = NodeAgent("https://api.jarvis.example.com", "my-secret", "node1")
+        url_tls = agent_tls.get_ws_url()
+        self.assertTrue(url_tls.startswith("wss://api.jarvis.example.com/api/node/ws"))
+        self.assertNotIn("my-secret", url_tls)
+
+    async def test_node_hub_requires_explicit_node_for_exec_and_write(self):
+        hub = NodeHub()
+        ws = DummyWebSocket()
+        await hub.register_node("single-pc", ws, {"hostname": "single", "capabilities": ["exec"]})
+
+        # exec_cmd sans node_id explicite doit échouer par sécurité
+        res_exec = await hub.exec_cmd("uptime", node_id=None)
+        self.assertFalse(res_exec["success"])
+        self.assertIn("node_id", res_exec["error"])
+
+        # write_file sans node_id explicite doit échouer par sécurité
+        res_write = await hub.write_file("/tmp/foo.txt", "content", node_id="")
+        self.assertFalse(res_write["success"])
+        self.assertIn("node_id", res_write["error"])
 
     async def test_node_agent_action_execution(self):
         agent = NodeAgent("http://localhost:8000", "test-secret", "test-node")
@@ -242,6 +307,11 @@ class TestSecuritySandbox(unittest.IsolatedAsyncioTestCase):
         res_ssh = await agent.handle_action("read_file", {"path": str(Path.home() / ".ssh" / "id_rsa")})
         self.assertFalse(res_ssh.get("success"))
         self.assertIn("Sécurité", res_ssh.get("error", ""))
+
+        # 5. Tentative d'écriture sur un fichier de persistance (ex: ~/.bashrc)
+        res_persist = await agent.handle_action("write_file", {"path": str(Path.home() / ".bashrc"), "content": "alias ls=evil"})
+        self.assertFalse(res_persist.get("success"))
+        self.assertIn("Sécurité", res_persist.get("error", ""))
 
         # Nettoyage
         if os.path.exists(test_file):

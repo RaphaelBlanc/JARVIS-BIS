@@ -22,13 +22,14 @@ class HardwareRelay:
         self,
         action: str,
         params: Optional[Dict[str, Any]] = None,
-        timeout: float = 20.0,
+        timeout: float = 35.0,
     ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """Exécute une action matérielle directement sur le système hôte."""
         params = params or {}
 
         try:
             import base64
+            import tempfile
             from core.node_hub import NODE_HUB
             from core.tools import system_tools
 
@@ -39,10 +40,16 @@ class HardwareRelay:
             target_node = NODE_HUB.get_node(node_target)
 
             # Si un nœud spécifique est ciblé ou si le serveur est headless et qu'un nœud client est connecté
-            if target_node and (node_target or (not has_display and action in ("screenshot", "lock", "clipboard_set", "clipboard_get", "media", "notify", "run_shell"))):
+            # Sécurité : seules les actions graphiques/multimédia sont relayées automatiquement en headless (pas run_shell)
+            if target_node and (node_target or (not has_display and action in ("screenshot", "lock", "clipboard_set", "clipboard_get", "media", "notify"))):
                 res = await NODE_HUB.send_action(target_node.node_id, "exec" if action == "run_shell" else action, params, timeout=timeout)
                 if action == "screenshot" and res.get("success") and res.get("image_base64"):
-                    out_path = Path(params.get("output_path", "/tmp/screenshot.png"))
+                    user_out = params.get("output_path")
+                    if user_out:
+                        out_path = Path(user_out)
+                    else:
+                        with tempfile.NamedTemporaryFile(prefix="nc_screenshot_", suffix=".png", delete=False) as tmp_f:
+                            out_path = Path(tmp_f.name)
                     out_path.write_bytes(base64.b64decode(res["image_base64"]))
                     return True, f"Capture effectuée sur le nœud {target_node.node_id}.", {"file_path": str(out_path)}
                 if res.get("success"):
