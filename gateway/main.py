@@ -448,7 +448,7 @@ class AskRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="La question ou commande")
     platform: str = Field(default="desktop", description="Plateforme d'origine")
     user_id: str = Field(default="desktop", description="Identifiant utilisateur")
-    timeout: int = Field(default=180, ge=5, le=600, description="Timeout en secondes")
+    timeout: int = Field(default=600, ge=5, le=1800, description="Timeout en secondes")
     continue_session: bool = Field(
         default=True, description="Reprendre la session en cours"
     )
@@ -499,10 +499,25 @@ async def api_ask(payload: AskRequest) -> dict:
         reset_session=payload.reset_session,
     )
 
+    output = result.get("output", "")
+    choices = result.get("choices") or []
+    msg_type = result.get("type") or ("question" if choices else "message")
+
+    if not choices and output:
+        tag_match = re.search(r"\[(?:CHOIX|CHOICES)\s*:\s*([^\]]+)\]", output, re.IGNORECASE)
+        if tag_match:
+            items = [c.strip() for c in tag_match.group(1).split("|") if c.strip()]
+            if len(items) >= 2:
+                choices = items
+                msg_type = "question"
+                output = (output[:tag_match.start()].rstrip() + " " + output[tag_match.end():].lstrip()).strip()
+
     return {
         "success": result.get("success", False),
-        "output": result.get("output", ""),
+        "output": output,
         "error": result.get("error"),
+        "type": msg_type,
+        "choices": choices,
     }
 
 

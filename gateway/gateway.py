@@ -22,7 +22,7 @@ MAX_RESPONSE_LENGTH: int = int(os.getenv("MAX_RESPONSE_LENGTH", "50000"))
 
 async def forward_to_runner(
     prompt: str,
-    timeout: int = 180,
+    timeout: int = 600,
     model: str | None = None,
     effort: str | None = None,
     mode: str | None = None,

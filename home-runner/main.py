@@ -60,7 +60,7 @@ load_dotenv()  # Charge .env si présent
 
 SECRET_KEY: str = os.environ.get("SECRET_KEY", "")
 PORT: int = int(os.environ.get("PORT", "8080"))
-AGY_TIMEOUT: int = int(os.environ.get("AGY_TIMEOUT", "120"))
+AGY_TIMEOUT: int = int(os.environ.get("AGY_TIMEOUT", "600"))
 MAX_PROMPT_CHARS: int = int(os.environ.get("MAX_PROMPT_CHARS", "20000"))
 MAX_IMAGE_MB: int = int(os.environ.get("MAX_IMAGE_MB", "10"))
 MAX_IMAGE_BYTES: int = max(1, MAX_IMAGE_MB) * 1024 * 1024
@@ -208,8 +208,8 @@ class RunRequest(BaseModel):
     timeout: int = Field(
         default=AGY_TIMEOUT,
         ge=1,
-        le=600,
-        description="Timeout en secondes (1–600, défaut depuis AGY_TIMEOUT).",
+        le=1800,
+        description="Timeout en secondes (1–1800, défaut depuis AGY_TIMEOUT).",
     )
     model: str | None = Field(default=None, description="Modèle spécifique.")
     effort: str | None = Field(default=None, description="Effort de raisonnement.")
@@ -229,6 +229,62 @@ class RunRequest(BaseModel):
     )
 
 
+def extract_choices(text: str) -> tuple[str, list[str]]:
+    """Détecte et extrait une liste de choix interactifs pour le bureau / les bots.
+
+    Formats supportés :
+    1. Tag explicite : [CHOIX: Option 1 | Option 2] ou [CHOICES: Option 1 | Option 2]
+    2. Tag JSON : <!-- choices: [\"Option 1\", \"Option 2\"] -->
+    3. Liste numérotée/lettrée consécutive à une question (ex: '1. A\\n2. B').
+    """
+    if not text:
+        return text, []
+
+    # 1. Tag explicite : [CHOIX: A | B | C]
+    tag_match = re.search(r"\[(?:CHOIX|CHOICES)\s*:\s*([^\]]+)\]", text, re.IGNORECASE)
+    if tag_match:
+        items = [c.strip() for c in tag_match.group(1).split("|") if c.strip()]
+        if len(items) >= 2:
+            clean_text = (text[:tag_match.start()].rstrip() + " " + text[tag_match.end():].lstrip()).strip()
+            return clean_text, items
+
+    # 2. Tag HTML/JSON : <!-- choices: [\"A\", \"B\"] -->
+    json_match = re.search(r"<!--\s*choices\s*:\s*(\[.*?\])\s*-->", text, re.DOTALL | re.IGNORECASE)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group(1))
+            if isinstance(parsed, list) and len(parsed) >= 2:
+                items = [str(x).strip() for x in parsed if str(x).strip()]
+                clean_text = (text[:json_match.start()].rstrip() + " " + text[json_match.end():].lstrip()).strip()
+                return clean_text, items
+        except Exception:
+            pass
+
+    # 3. Liste numérotée ou lettrée en fin de message consécutive à une question
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    choice_lines: list[str] = []
+    pattern = re.compile(r"^(?:[1-9]\.|\b[A-Da-d]\))\s+(.+)$")
+    for line in reversed(lines):
+        m = pattern.match(line)
+        if m:
+            choice_lines.insert(0, m.group(1).strip())
+        else:
+            line_lower = line.lower()
+            is_question = "?" in line or any(
+                phrase in line_lower for phrase in (
+                    "lequel", "laquelle", "lesquels", "lesquelles",
+                    "que souhaitez-vous", "que veux-tu", "que préfères-tu", "que preferez-vous",
+                    "quel choix", "quelle option", "choisissez", "choisis", "votre choix"
+                )
+            )
+            is_not_question = any(w in line_lower for w in ("étape", "etape", "instruction", "procédure", "procedure", "suivez", "marche à suivre"))
+            if is_question and not is_not_question and 2 <= len(choice_lines) <= 6:
+                return text, choice_lines
+            break
+
+    return text, []
+
+
 class RunResponse(BaseModel):
     """Réponse de POST /run."""
 
@@ -236,6 +292,8 @@ class RunResponse(BaseModel):
     output: str
     error: str | None = None
     session: dict | None = None
+    type: str = "message"
+    choices: list[str] = Field(default_factory=list)
 
 
 class SessionUpdateRequest(BaseModel):
@@ -618,11 +676,16 @@ async def run(request: Request, body: RunRequest):
     if result["success"] and body.prompt.strip() == "/usage":
         output = f"{output}\n\n{_format_token_usage()}".strip()
 
+    clean_output, choices = extract_choices(output)
+    msg_type = "question" if choices else "message"
+
     return RunResponse(
         success=result["success"],
-        output=output,
+        output=clean_output,
         error=result.get("error"),
         session=result.get("session"),
+        type=msg_type,
+        choices=choices,
     )
 
 # ---------------------------------------------------------------------------

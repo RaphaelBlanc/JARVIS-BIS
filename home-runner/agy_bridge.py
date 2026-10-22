@@ -1134,7 +1134,7 @@ async def _run_agy_persistent(
 
 async def run_agy(
     prompt: str,
-    timeout: int = 120,
+    timeout: int = 600,
     model: Optional[str] = None,
     effort: Optional[str] = None,
     mode: Optional[str] = None,
