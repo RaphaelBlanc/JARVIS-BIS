@@ -23,6 +23,7 @@ import platform
 import re
 import shutil
 import socket
+import struct
 import sys
 import time
 from pathlib import Path
@@ -114,6 +115,137 @@ def is_command_safe(command: str) -> Tuple[bool, str]:
         return False, "L'utilisation de 'sudo', 'su', 'pkexec' ou 'doas' est strictement interdite."
 
     return True, ""
+
+
+class StdlibWebSocket:
+    """Client WebSocket minimaliste RFC 6455 en pure bibliothèque standard Python."""
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.reader = reader
+        self.writer = writer
+        self.closed = False
+
+    async def send(self, data: str | bytes) -> None:
+        if isinstance(data, str):
+            payload = data.encode("utf-8")
+            opcode = 0x01
+        else:
+            payload = data
+            opcode = 0x02
+
+        length = len(payload)
+        mask_key = os.urandom(4)
+        header = bytearray([0x80 | opcode])
+
+        if length <= 125:
+            header.append(0x80 | length)
+        elif length <= 65535:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", length))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", length))
+
+        header.extend(mask_key)
+        masked_payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        self.writer.write(header + masked_payload)
+        await self.writer.drain()
+
+    async def recv(self) -> str:
+        while not self.closed:
+            head = await self.reader.readexactly(2)
+            b1, b2 = head[0], head[1]
+            opcode = b1 & 0x0F
+            is_masked = bool(b2 & 0x80)
+            payload_len = b2 & 0x7F
+
+            if payload_len == 126:
+                ext = await self.reader.readexactly(2)
+                payload_len = struct.unpack("!H", ext)[0]
+            elif payload_len == 127:
+                ext = await self.reader.readexactly(8)
+                payload_len = struct.unpack("!Q", ext)[0]
+
+            mask = None
+            if is_masked:
+                mask = await self.reader.readexactly(4)
+
+            payload = await self.reader.readexactly(payload_len)
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+            if opcode == 0x08:  # Close
+                self.closed = True
+                break
+            elif opcode == 0x09:  # Ping -> Pong
+                header = bytearray([0x8A, 0x80 | len(payload)])
+                mk = os.urandom(4)
+                header.extend(mk)
+                self.writer.write(header + bytes(b ^ mk[i % 4] for i, b in enumerate(payload)))
+                await self.writer.drain()
+                continue
+            elif opcode == 0x0A:  # Pong
+                continue
+            elif opcode in (0x01, 0x02):
+                return payload.decode("utf-8", errors="replace")
+
+        raise ConnectionResetError("Connexion WebSocket fermée.")
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            try:
+                mk = os.urandom(4)
+                self.writer.write(bytearray([0x88, 0x80]) + mk)
+                await self.writer.drain()
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
+                pass
+
+
+async def connect_ws(url: str, secret_key: str):
+    """Établit une connexion WebSocket avec repli transparent sur la bibliothèque standard."""
+    try:
+        import websockets
+        headers = {"X-Secret-Key": secret_key}
+        return await websockets.connect(
+            url,
+            additional_headers=headers,
+            ping_interval=20,
+            ping_timeout=20,
+        )
+    except ImportError:
+        import ssl
+        import urllib.parse
+        u = urllib.parse.urlsplit(url)
+        host = u.hostname
+        port = u.port or (443 if u.scheme == "wss" else 80)
+        ssl_ctx = ssl.create_default_context() if u.scheme == "wss" else None
+
+        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_ctx)
+        sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        path_query = u.path + ("?" + u.query if u.query else "")
+        req = (
+            f"GET {path_query} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {sec_key}\r\n"
+            f"X-Secret-Key: {secret_key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        writer.write(req.encode("utf-8"))
+        await writer.drain()
+
+        resp = await reader.readuntil(b"\r\n\r\n")
+        status_line = resp.split(b"\r\n")[0].decode()
+        if "101" not in status_line:
+            writer.close()
+            await writer.wait_closed()
+            raise ConnectionError(f"Échec handshake HTTP WebSocket : {status_line}")
+
+        return StdlibWebSocket(reader, writer)
 
 
 class NodeAgent:
@@ -375,12 +507,6 @@ class NodeAgent:
 
     async def run(self) -> None:
         """Boucle principale de maintien de connexion WebSocket avec reconnexion automatique."""
-        try:
-            import websockets
-        except ImportError:
-            logger.error("La bibliothèque 'websockets' est requise. Installez-la avec : pip install websockets")
-            sys.exit(1)
-
         self._running = True
         ws_url = self.get_ws_url()
         backoff = 3.0
@@ -388,56 +514,58 @@ class NodeAgent:
         logger.info("Démarrage du nœud JARVIS '%s' vers %s", self.node_id, self.gateway_url)
 
         while self._running:
+            ws = None
             try:
-                headers = {"X-Secret-Key": self.secret_key}
-                async with websockets.connect(
-                    ws_url,
-                    additional_headers=headers,
-                    ping_interval=20,
-                    ping_timeout=20,
-                ) as ws:
-                    logger.info("✅ Connecté au hub Gateway JARVIS avec succès !")
-                    backoff = 3.0
+                ws = await connect_ws(ws_url, self.secret_key)
+                logger.info("✅ Connecté au hub Gateway JARVIS avec succès !")
+                backoff = 3.0
 
-                    # 1. Enregistrement initial
-                    reg_payload = {
-                        "type": "register",
-                        "node_id": self.node_id,
-                        "hostname": self.hostname,
-                        "os": sys.platform,
-                        "capabilities": self.capabilities,
-                        "metadata": {
-                            "user": os.getenv("USER", "unknown"),
-                            "platform": platform.platform(),
-                        },
-                    }
-                    await ws.send(json.dumps(reg_payload))
+                # 1. Enregistrement initial
+                reg_payload = {
+                    "type": "register",
+                    "node_id": self.node_id,
+                    "hostname": self.hostname,
+                    "os": sys.platform,
+                    "capabilities": self.capabilities,
+                    "metadata": {
+                        "user": os.getenv("USER", "unknown"),
+                        "platform": platform.platform(),
+                    },
+                }
+                await ws.send(json.dumps(reg_payload))
 
-                    # 2. Boucle de réception des commandes
-                    async for raw_msg in ws:
-                        try:
-                            msg = json.loads(raw_msg)
-                        except Exception:
-                            continue
+                # 2. Boucle de réception des commandes
+                while self._running:
+                    try:
+                        raw_msg = await ws.recv()
+                    except (ConnectionResetError, EOFError):
+                        break
+                    if not raw_msg:
+                        continue
 
-                        msg_type = msg.get("type")
-                        req_id = msg.get("req_id")
+                    try:
+                        msg = json.loads(raw_msg)
+                    except Exception:
+                        continue
 
-                        if msg_type == "ping":
-                            await ws.send(json.dumps({"type": "pong"}))
-                            continue
+                    msg_type = msg.get("type")
+                    req_id = msg.get("req_id")
 
-                        if msg_type == "action" and req_id:
-                            action = msg.get("action", "")
-                            params = msg.get("params", {})
-                            logger.info("⚡ Action reçue : %s (req_id=%s)", action, req_id)
-                            res = await self.handle_action(action, params)
-                            resp_payload = {
-                                "type": "response",
-                                "req_id": req_id,
-                                **res,
-                            }
-                            await ws.send(json.dumps(resp_payload))
+                    if msg_type == "ping":
+                        await ws.send(json.dumps({"type": "pong"}))
+                        continue
+
+                    if msg_type == "action" and req_id:
+                        action = msg.get("action", "")
+                        params = msg.get("params", {})
+                        logger.info("⚡ Action reçue : %s (req_id=%s)", action, req_id)
+                        res = await self.handle_action(action, params)
+                        resp_payload = {
+                            "type": "response",
+                            "req_id": req_id,
+                            **res,
+                        }
+                        await ws.send(json.dumps(resp_payload))
 
             except asyncio.CancelledError:
                 logger.info("Arrêt de l'agent nœud demandé.")
@@ -446,6 +574,12 @@ class NodeAgent:
                 logger.warning("Connexion perdue ou échec : %s. Nouvelle tentative dans %.1fs...", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.5, 30.0)
+            finally:
+                if ws:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
 
 
 def load_config() -> Dict[str, str]:
