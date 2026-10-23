@@ -136,9 +136,11 @@ class Engines:
         if self.state['engine']=='agy' and self.state['settings'].get('agy'):
             self.original['update_session'](**{k:v for k,v in self.state['settings']['agy'].items() if k in ('model','effort','mode','permission_mode')})
 
-    def session(self):
+    def session(self, *args, **kwargs):
         engine = self.state['engine']
-        if engine == 'agy': return dict(self.original['get_session_info'](), engine='agy')
+        if engine == 'agy':
+            res = self.original['get_session_info'](*args, **kwargs)
+            return dict(res, engine='agy') if isinstance(res, dict) else res
         settings = self.state['settings'].get(engine, {})
         ident = self.state['active'].get(engine)
         conv = next((c for c in self.state['conversations'] if c['id']==ident), {})
@@ -164,14 +166,15 @@ class Engines:
             efforts=(['low','medium','high'] if k=='agy' else ['low','medium','high','xhigh','max'] if k=='claude' else ['low','medium','high','xhigh','max','ultra'] if k=='codex' else [])) for k,v in ENGINES.items()],
             shared_session=True, context_limit=32000)
 
-    def choose(self, **values):
+    def choose(self, *args, **values):
         if self.lock.locked(): raise ValueError('Une réponse est en cours ; attends avant de changer de moteur.')
+        session_key = values.pop('session_key', 'default')
         if set(values)-{'engine','model','effort','mode','permission_mode'}: raise ValueError('Réglage inconnu.')
         engine = values.get('engine',self.state['engine'])
         if engine not in ENGINES: raise ValueError('Moteur inconnu.')
         if engine != self.state['engine'] and not executable(engine): raise ValueError('Installe et authentifie ce CLI sur la machine du runner.')
         if engine == 'agy':
-            result = self.original['update_session'](**{k:v for k,v in values.items() if k!='engine'})
+            result = self.original['update_session'](session_key=session_key, **{k:v for k,v in values.items() if k!='engine'})
         else:
             if any(values.get(k) not in (None,'',v) for k,v in (('mode','plan'),('permission_mode','request-review'))):
                 raise ValueError('Ce moteur utilise le mode plan avec ses protections habituelles.')
@@ -182,38 +185,39 @@ class Engines:
         atomique(self.path,state); self.state = state
         self.up.KNOWN_MODELS = self.models()
         if hasattr(self.up, '_reset_memory_injection'):
-            self.up._reset_memory_injection()
-        return self.session()
+            self.up._reset_memory_injection(session_key=session_key)
+        return self.session(session_key=session_key)
 
-    async def reset(self):
+    async def reset(self, *args, **kwargs):
         if self.lock.locked(): raise ValueError('Une réponse est en cours.')
         async with self.lock:
-            if self.state['engine']=='agy': return await self.original['reset_session_async']()
+            if self.state['engine']=='agy': return await self.original['reset_session_async'](*args, **kwargs)
             active=dict(self.state['active']); active.pop(self.state['engine'],None)
             state=dict(self.state,active=active); atomique(self.path,state); self.state=state
-            return self.session()
+            return self.session(*args, **kwargs)
 
-    def conversations(self, limit=8):
-        if self.state['engine']=='agy': return self.original['list_recent_conversations'](limit=limit)
+    def conversations(self, limit=8, *args, **kwargs):
+        if self.state['engine']=='agy': return self.original['list_recent_conversations'](limit=limit, *args, **kwargs)
         return [dict(id=c['id'],title=c['title'],engine=c['engine']) for c in reversed(self.state['conversations']) if c['engine']==self.state['engine']][:max(0,min(limit,30))]
 
-    def history(self, ident, max_turns=15):
-        if self.state['engine']=='agy': return self.original['get_conversation_history'](ident,max_turns=max_turns)
+    def history(self, ident, max_turns=15, *args, **kwargs):
+        if self.state['engine']=='agy': return self.original['get_conversation_history'](ident,max_turns=max_turns, *args, **kwargs)
         return next((c['history'][-max(1,min(max_turns,20)):] for c in self.state['conversations'] if c['id']==ident and c['engine']==self.state['engine']), [])
 
-    def resume(self, ident):
+    def resume(self, ident, *args, **kwargs):
         if self.lock.locked(): raise ValueError('Une réponse est en cours.')
-        if self.state['engine']=='agy': return self.original['resume_conversation'](ident)
+        if self.state['engine']=='agy': return self.original['resume_conversation'](ident, *args, **kwargs)
         if not any(c['id']==ident and c['engine']==self.state['engine'] for c in self.state['conversations']): raise ValueError('Conversation inconnue pour ce moteur.')
         state=dict(self.state,active=dict(self.state['active'],**{self.state['engine']:ident}))
         atomique(self.path,state); self.state=state
+        session_key = kwargs.get('session_key', 'default')
         if hasattr(self.up, '_reset_memory_injection'):
-            self.up._reset_memory_injection()
-        return dict(session=self.session(),history=self.history(ident))
+            self.up._reset_memory_injection(session_key=session_key)
+        return dict(session=self.session(*args, **kwargs),history=self.history(ident))
 
-    def delete(self, ident):
+    def delete(self, ident, *args, **kwargs):
         if self.lock.locked(): return dict(success=False,error='Une réponse est en cours.')
-        if self.state['engine']=='agy': return self.original['delete_all_conversations']() if ident=='all' else self.original['delete_conversation'](ident)
+        if self.state['engine']=='agy': return self.original['delete_all_conversations'](*args, **kwargs) if ident=='all' else self.original['delete_conversation'](ident, *args, **kwargs)
         engine=self.state['engine']
         before=len(self.state['conversations'])
         conversations=[c for c in self.state['conversations'] if c['engine']!=engine or (ident!='all' and c['id']!=ident)]
@@ -222,8 +226,8 @@ class Engines:
         state=dict(self.state,active=active,conversations=conversations); atomique(self.path,state); self.state=state
         return dict(success=before!=len(self.state['conversations']))
 
-    def usage(self):
-        if self.state['engine']=='agy': return self.original['get_token_usage']()
+    def usage(self, *args, **kwargs):
+        if self.state['engine']=='agy': return self.original['get_token_usage'](*args, **kwargs)
         return dict(engine=self.state['engine'],tokens_available=False,message='Les tokens de ce CLI ne sont pas agrégés par JARVIS.')
 
     async def run(self, prompt, timeout=120, model=None, effort=None, mode=None,
