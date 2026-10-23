@@ -42,6 +42,11 @@ class HardwareRelay:
             # Si un nœud spécifique est ciblé ou si le serveur est headless et qu'un nœud client est connecté
             # Sécurité : seules les actions graphiques/multimédia sont relayées automatiquement en headless (pas run_shell)
             if target_node and (node_target or (not has_display and action in ("screenshot", "lock", "clipboard_set", "clipboard_get", "media", "notify"))):
+                if action == "run_shell":
+                    if os.getenv("ENABLE_NODE_EXEC", "0").lower() not in ("1", "true", "yes"):
+                        return False, "L'exécution distante de commandes (exec) sur les nœuds clients requiert ENABLE_NODE_EXEC=1 côté serveur.", None
+                    if not node_target or str(node_target).strip().lower() in ("", "auto", "default", "any"):
+                        return False, "Sécurité : un identifiant de nœud client explicite est obligatoire pour exécuter des commandes.", None
                 res = await NODE_HUB.send_action(target_node.node_id, "exec" if action == "run_shell" else action, params, timeout=timeout)
                 if action == "screenshot" and res.get("success") and res.get("image_base64"):
                     user_out = params.get("output_path")

@@ -9,6 +9,7 @@ des fichiers et exécuter des commandes sur les machines clientes de façon séc
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -176,6 +177,7 @@ class NodeHub:
             "type": "action",
             "action": action,
             "params": params or {},
+            "timeout": timeout,
         }
 
         try:
@@ -206,6 +208,11 @@ class NodeHub:
             return {
                 "success": False,
                 "error": "Sécurité : un identifiant de nœud client (node_id) explicite est obligatoire pour exécuter des commandes.",
+            }
+        if os.getenv("ENABLE_NODE_EXEC", "0").lower() not in ("1", "true", "yes"):
+            return {
+                "success": False,
+                "error": "L'exécution distante de commandes (exec) sur les nœuds clients requiert ENABLE_NODE_EXEC=1 côté serveur.",
             }
         return await self.send_action(
             node_id=node_id,
