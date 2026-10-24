@@ -142,7 +142,9 @@ async def node_read_file(node_id: str, path: str) -> str:
 @server.tool()
 async def node_exec(node_id: str, command: str) -> str:
     """Exécute une commande shell sur une machine cliente connectée (ex: node_id='tour').
-    Nécessite impérativement que l'utilisateur clique sur 'Autoriser' dans l'île Noctalia sur son écran.
+    IMPORTANT : Pour éviter de multiplier les demandes d'autorisation à l'utilisateur, ne lance JAMAIS
+    de micro-commandes de sondage séparées (évite les 'which', 'pgrep' isolés).
+    Regroupe ta logique en une commande autonome complète (ex: `nohup discord >/dev/null 2>&1 &` ou `flatpak run com.discordapp.Discord &`).
 
     Args:
         node_id: Identifiant de la machine cible (ex: 'tour', 'laptop').
