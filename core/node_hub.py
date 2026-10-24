@@ -276,7 +276,7 @@ class NodeHub:
         node_id: Optional[str],
         action: str,
         params: Optional[Dict[str, Any]] = None,
-        timeout: float = 35.0,
+        timeout: float = 65.0,
     ) -> Dict[str, Any]:
         """Envoie une requête d'action au nœud cible et attend la réponse."""
         node = self.get_node(node_id)
@@ -345,7 +345,7 @@ class NodeHub:
         self,
         path: str,
         node_id: Optional[str] = None,
-        timeout: float = 35.0,
+        timeout: float = 65.0,
     ) -> Dict[str, Any]:
         """Lit un fichier sur le nœud distant."""
         return await self.send_action(
@@ -360,7 +360,7 @@ class NodeHub:
         path: str,
         content: str,
         node_id: Optional[str] = None,
-        timeout: float = 35.0,
+        timeout: float = 65.0,
     ) -> Dict[str, Any]:
         """Écrit un fichier sur le nœud distant (node_id explicite requis)."""
         if not node_id or str(node_id).strip().lower() in ("", "auto", "default", "any"):

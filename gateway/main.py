@@ -660,7 +660,7 @@ async def api_action(payload: ActionRequest) -> dict:
 class NodeActionRequest(BaseModel):
     action: str = Field(..., description="Action à exécuter (exec, read_file, write_file, screenshot, lock, etc.)")
     params: Optional[dict] = Field(default_factory=dict, description="Paramètres de l'action")
-    timeout: float = Field(default=35.0, description="Délai maximum en secondes")
+    timeout: float = Field(default=65.0, description="Délai maximum en secondes")
 
 class NodeExecRequest(BaseModel):
     command: str = Field(..., description="Commande shell à exécuter")
@@ -668,12 +668,12 @@ class NodeExecRequest(BaseModel):
 
 class NodeReadFileRequest(BaseModel):
     path: str = Field(..., description="Chemin absolu ou relatif du fichier à lire")
-    timeout: float = Field(default=35.0, description="Délai maximum en secondes")
+    timeout: float = Field(default=65.0, description="Délai maximum en secondes")
 
 class NodeWriteFileRequest(BaseModel):
     path: str = Field(..., description="Chemin du fichier à écrire")
     content: str = Field(..., description="Contenu du fichier")
-    timeout: float = Field(default=35.0, description="Délai maximum en secondes")
+    timeout: float = Field(default=65.0, description="Délai maximum en secondes")
 
 
 @app.get(

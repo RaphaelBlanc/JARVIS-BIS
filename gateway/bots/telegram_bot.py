@@ -650,9 +650,15 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     user = update.effective_user
     if not user or not _is_allowed(user.id):
-        await query.answer("⛔ Accès non autorisé.", show_alert=True)
+        try:
+            await query.answer("⛔ Accès non autorisé.", show_alert=True)
+        except Exception:
+            pass
         return
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
     data = query.data or ""
 
     if data.startswith("totp_deny:"):
@@ -2007,7 +2013,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text("✅ Code transmis au nœud client.")
             else:
                 await update.message.reply_text("❌ Échec de transmission du code (demande expirée ou nœud déconnecté).")
-            return
+        else:
+            await update.message.reply_text("⏱ Aucun code n'est attendu actuellement (la demande a expiré ou a déjà été traitée).")
+        return
 
     logger.info("Message Telegram reçu de %d: '%s'", user.id, prompt[:80])
 

@@ -53,7 +53,7 @@ class HardwareRelay:
         self,
         action: str,
         params: Optional[Dict[str, Any]] = None,
-        timeout: float = 35.0,
+        timeout: float = 65.0,
     ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """Exécute une action matérielle directement sur le système hôte."""
         params = params or {}

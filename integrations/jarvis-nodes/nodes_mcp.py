@@ -104,7 +104,7 @@ async def node_write_file(node_id: str, path: str, content: str) -> str:
     """
     headers = _headers()
     payload = {"path": path, "content": content}
-    async with httpx.AsyncClient(timeout=35.0) as client:
+    async with httpx.AsyncClient(timeout=75.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/write_file", headers=headers, json=payload)
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
@@ -127,7 +127,7 @@ async def node_read_file(node_id: str, path: str) -> str:
     """
     headers = _headers()
     payload = {"path": path}
-    async with httpx.AsyncClient(timeout=35.0) as client:
+    async with httpx.AsyncClient(timeout=75.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/read_file", headers=headers, json=payload)
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
@@ -152,7 +152,7 @@ async def node_exec(node_id: str, command: str) -> str:
     """
     headers = _headers()
     payload = {"command": command}
-    async with httpx.AsyncClient(timeout=40.0) as client:
+    async with httpx.AsyncClient(timeout=75.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/exec", headers=headers, json=payload)
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
@@ -179,7 +179,7 @@ async def node_screenshot(node_id: str) -> str:
         node_id: Identifiant de la machine cible (ex: 'tour', 'laptop').
     """
     headers = _headers()
-    async with httpx.AsyncClient(timeout=35.0) as client:
+    async with httpx.AsyncClient(timeout=75.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/action", headers=headers, json={"action": "screenshot", "params": {}})
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
