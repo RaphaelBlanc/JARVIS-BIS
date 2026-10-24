@@ -111,6 +111,8 @@ class NodeHub:
         self._nodes: Dict[str, ConnectedNode] = {}
         self._pending_requests: Dict[str, asyncio.Future] = {}
         self._pending_request_nodes: Dict[str, str] = {}
+        self._pending_request_origins: Dict[str, Optional[Dict[str, Any]]] = {}
+        self._pending_desktop_prompts: Dict[str, str] = {}
         self._pending_confirmations: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._confirm_request_callbacks: List[Callable[[str, Dict[str, Any]], Any]] = []
         self._confirm_cancel_callbacks: List[Callable[[str, Dict[str, Any]], Any]] = []
@@ -366,6 +368,46 @@ class NodeHub:
         """Enregistre un callback appelé lors de l'annulation d'une confirmation."""
         self._confirm_cancel_callbacks.append(callback)
 
+    def _send_to_node_bg(self, node: ConnectedNode, payload: Dict[str, Any]) -> None:
+        """Envoie un message JSON à un nœud de manière asynchrone et thread-safe."""
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        async def _do_send() -> None:
+            try:
+                await node.websocket.send_json(payload)
+            except Exception as exc:
+                logger.debug("Erreur envoi trame %s au nœud %s : %s", payload.get("type"), node.node_id, exc)
+
+        if node.loop is not None and node.loop.is_running() and node.loop is not current_loop:
+            asyncio.run_coroutine_threadsafe(_do_send(), node.loop)
+        elif current_loop is not None:
+            asyncio.create_task(_do_send())
+
+    async def _handle_desktop_totp_response(self, caller_node_id: str, message: Dict[str, Any]) -> None:
+        """Traite la réponse du code Authenticator saisie sur le PC appelant."""
+        req_id = str(message.get("req_id") or "")
+        target_node = str(message.get("target_node") or "") or None
+        decision = str(message.get("decision") or "").strip().lower()
+        code = str(message.get("code") or "").strip() if message.get("code") else None
+        ok = await self.send_confirm_response(
+            req_id=req_id,
+            decision=decision,
+            code=code,
+            node_id=target_node,
+        )
+        if ok:
+            logger.info("Confirmation inter-PC transmise depuis %s vers %s (req_id=%s, decision=%s)", caller_node_id, target_node, req_id, decision)
+            for cb in self._confirm_cancel_callbacks:
+                try:
+                    res = cb(target_node or "", {"type": "confirm_cancel", "req_id": req_id})
+                    if asyncio.iscoroutine(res):
+                        asyncio.create_task(res)
+                except Exception as exc:
+                    logger.error("Erreur dans callback confirm_cancel après totp_prompt_response: %s", exc)
+
     def handle_incoming_message(self, node_id: str, message: Dict[str, Any]) -> None:
         """Traite un message reçu depuis un nœud (réponse à requête, ping/pong, ou confirm_request)."""
         node = self._nodes.get(node_id)
@@ -407,6 +449,7 @@ class NodeHub:
             except (ValueError, TypeError, OverflowError):
                 expires_in = 32
 
+            req_origin = self._pending_request_origins.get(req_id)
             self._pending_confirmations[(node_id, req_id)] = {
                 "node_id": node_id,
                 "req_id": req_id,
@@ -414,8 +457,28 @@ class NodeHub:
                 "summary": str(message.get("summary") or ""),
                 "expires_at": time.time() + expires_in,
                 "code_required": bool(message.get("code_required", True)),
+                "origin": req_origin,
             }
             logger.info("Requête confirm_request reçue du nœud %s pour req_id %s (expires_in=%ss)", node_id, req_id, expires_in)
+
+            # Si la demande provient d'un autre PC connecté (via='desktop'), lui envoyer une invite TOTP locale
+            if isinstance(req_origin, dict) and req_origin.get("via") == "desktop":
+                caller_chat = str(req_origin.get("chat") or "").strip()
+                caller_node = self.get_node(caller_chat) if caller_chat else None
+                if caller_node and caller_node.node_id != node_id:
+                    self._pending_desktop_prompts[req_id] = caller_node.node_id
+                    self._send_to_node_bg(
+                        caller_node,
+                        {
+                            "type": "totp_prompt",
+                            "req_id": req_id,
+                            "target_node": node_id,
+                            "action": str(message.get("action") or ""),
+                            "summary": str(message.get("summary") or ""),
+                            "expires_in": expires_in,
+                        },
+                    )
+                    logger.info("Invite TOTP inter-PC (totp_prompt) envoyée au PC appelant %s pour autoriser %s", caller_node.node_id, node_id)
 
             for cb in self._confirm_request_callbacks:
                 try:
@@ -426,9 +489,28 @@ class NodeHub:
                     logger.error("Erreur dans callback confirm_request: %s", exc)
             return
 
+        elif msg_type == "totp_prompt_response":
+            if not req_id or not isinstance(req_id, str):
+                return
+            expected_caller = self._pending_desktop_prompts.get(req_id)
+            if expected_caller != node_id:
+                logger.warning(
+                    "totp_prompt_response (%s) ignorée : reçue de %s mais attendue de %s",
+                    req_id,
+                    node_id,
+                    expected_caller,
+                )
+                return
+            self._pending_desktop_prompts.pop(req_id, None)
+            asyncio.create_task(self._handle_desktop_totp_response(node_id, message))
+            return
+
         elif msg_type == "confirm_cancel":
             if not req_id or not isinstance(req_id, str):
                 return
+            caller_nid = self._pending_desktop_prompts.pop(req_id, None)
+            if caller_nid and caller_nid in self._nodes:
+                self._send_to_node_bg(self._nodes[caller_nid], {"type": "totp_prompt_cancel", "req_id": req_id})
             removed = self._pending_confirmations.pop((node_id, req_id), None)
             if removed is None:
                 return
@@ -497,6 +579,12 @@ class NodeHub:
         node_id: Optional[str] = None,
     ) -> bool:
         self._purge_expired_confirmations()
+        # Si une invite TOTP est active sur le PC appelant (desktop), la confirmation distante est toujours en cours
+        caller_nid = self._pending_desktop_prompts.get(req_id)
+        if caller_nid and caller_nid in self._nodes:
+            logger.info("confirm_unavailable ignorée pour req_id %s : invite TOTP active sur le PC appelant %s", req_id, caller_nid)
+            return False
+
         conf = None
         if node_id:
             conf = self._pending_confirmations.pop((node_id, req_id), None)
@@ -565,6 +653,10 @@ class NodeHub:
         if not conf:
             logger.warning("confirm_response ignorée : req_id %s introuvable ou déjà traitée", req_id)
             return False
+
+        caller_nid = self._pending_desktop_prompts.pop(req_id, None)
+        if caller_nid and caller_nid in self._nodes:
+            self._send_to_node_bg(self._nodes[caller_nid], {"type": "totp_prompt_cancel", "req_id": req_id})
 
         if time.time() > conf["expires_at"]:
             logger.warning("confirm_response ignorée : req_id %s est expirée", req_id)
@@ -683,6 +775,7 @@ class NodeHub:
         self._pending_request_nodes[req_id] = node.node_id
 
         clean_origin = normalize_origin(origin)
+        self._pending_request_origins[req_id] = clean_origin
         payload: Dict[str, Any] = {
             "req_id": req_id,
             "type": "action",
@@ -717,7 +810,7 @@ class NodeHub:
                     else:
                         self._active_sessions.pop(node.node_id, None)
                         self._notify_session_update(node.node_id, None, clean_origin)
-                elif action == "exec" and node.node_id in self._active_sessions:
+                elif action in ("exec", "screenshot", "read_file", "write_file", "clipboard_set") and node.node_id in self._active_sessions:
                     prev_sess = self._active_sessions.pop(node.node_id, None)
                     self._notify_session_update(
                         node.node_id,
@@ -737,6 +830,10 @@ class NodeHub:
         finally:
             self._pending_requests.pop(req_id, None)
             self._pending_request_nodes.pop(req_id, None)
+            self._pending_request_origins.pop(req_id, None)
+            caller_nid = self._pending_desktop_prompts.pop(req_id, None)
+            if caller_nid and caller_nid in self._nodes:
+                self._send_to_node_bg(self._nodes[caller_nid], {"type": "totp_prompt_cancel", "req_id": req_id})
             self._pending_confirmations.pop((node.node_id, req_id), None)
 
     async def exec_cmd(

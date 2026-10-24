@@ -742,6 +742,67 @@ class TestTrustSessionOrigin(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.hub.get_active_session("tour"))
         self.assertIsNone(updates[-1][1])
 
+    async def test_distinct_sessions_per_machine_and_cross_pc_totp_prompt(self):
+        origin_tour = self.hub.build_origin(session_key="desktop:tour")
+
+        async def fake_laptop_screenshot_with_cross_pc_totp():
+            await asyncio.sleep(0.02)
+            action_msg = self.ws_laptop.sent_messages[-1]
+            req_id = action_msg["req_id"]
+            self.assertEqual(action_msg["action"], "screenshot")
+            self.assertEqual(action_msg["origin"], origin_tour)
+
+            # 1. Le laptop demande une confirmation à distance (confirm_request)
+            self.hub.handle_incoming_message("laptop", {
+                "type": "confirm_request",
+                "req_id": req_id,
+                "action": "screenshot",
+                "summary": "JARVIS veut faire une capture de ton écran",
+                "expires_in": 32,
+                "code_required": True,
+            })
+            await asyncio.sleep(0.02)
+
+            # 2. La tour (PC appelant) doit avoir reçu totp_prompt
+            self.assertTrue(any(m.get("type") == "totp_prompt" and m.get("req_id") == req_id for m in self.ws_tour.sent_messages))
+
+            # 3. La tour renvoie le code Authenticator à 6 chiffres (totp_prompt_response)
+            self.hub.handle_incoming_message("tour", {
+                "type": "totp_prompt_response",
+                "req_id": req_id,
+                "target_node": "laptop",
+                "decision": "allow",
+                "code": "654321",
+            })
+            await asyncio.sleep(0.02)
+
+            # 4. Le laptop reçoit confirm_response avec le code 654321
+            conf_resp = self.ws_laptop.sent_messages[-1]
+            self.assertEqual(conf_resp["type"], "confirm_response")
+            self.assertEqual(conf_resp["req_id"], req_id)
+            self.assertEqual(conf_resp["decision"], "allow")
+            self.assertEqual(conf_resp["code"], "654321")
+
+            # 5. Le laptop exécute la capture et ouvre automatiquement sa session de confiance dès ce 1er accès
+            self.hub.handle_incoming_message("laptop", {
+                "type": "response",
+                "req_id": req_id,
+                "success": True,
+                "image_base64": "iVBORw0KGgo=",
+                "session": {"reste_s": 900, "reste_actions": 20},
+            })
+
+        asyncio.create_task(fake_laptop_screenshot_with_cross_pc_totp())
+        res = await self.hub.send_action("laptop", "screenshot", {}, origin=origin_tour, timeout=2.0)
+        self.assertTrue(res.get("success"))
+
+        # Vérifie que la session est active sur laptop mais PAS sur tour (sessions distinctes par machine)
+        sess_laptop = self.hub.get_active_session("laptop")
+        sess_tour = self.hub.get_active_session("tour")
+        self.assertIsNotNone(sess_laptop)
+        self.assertEqual(sess_laptop["reste_actions"], 20)
+        self.assertIsNone(sess_tour)
+
 
 if __name__ == "__main__":
     unittest.main()

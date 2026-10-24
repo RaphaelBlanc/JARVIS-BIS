@@ -111,10 +111,22 @@ def _attach_session(payload: dict) -> dict:
     return payload
 
 
+def _format_session_suffix(node_id: str, data: dict) -> str:
+    sess = data.get("session")
+    if isinstance(sess, dict):
+        return (
+            f"\n🟢 Session de confiance active sur `{node_id}` : "
+            f"{sess.get('reste_actions')} action(s) restante(s), {sess.get('reste_s')}s restantes."
+        )
+    return ""
+
+
 @server.tool()
 async def nodes_list() -> str:
-    """Vérifie l'état et liste toutes les machines clientes (Tour, PC portable, etc.) connectées à JARVIS.
-    Permet de savoir immédiatement si une machine (comme la tour) est allumée et prête à recevoir des ordres.
+    """Vérifie l'état et liste toutes les machines clientes (Tour, PC portable, etc.) connectées à JARVIS,
+    ainsi que l'état de la session de confiance propre à chaque machine.
+    IMPORTANT : Pour vérifier si une session de confiance est active sur une machine, utilise UNIQUEMENT cet outil (`nodes_list`).
+    N'appelle JAMAIS `node_exec` juste pour tester ou activer une session de confiance.
     """
     headers = _headers()
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -168,7 +180,7 @@ async def node_write_file(node_id: str, path: str, content: str) -> str:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/write_file", headers=headers, json=payload)
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
             if resp.status_code == 200 and data.get("success"):
-                return f"✅ Fichier `{path}` créé avec succès sur `{node_id}` (validé par l'utilisateur)."
+                return f"✅ Fichier `{path}` créé avec succès sur `{node_id}` (validé par l'utilisateur).{_format_session_suffix(node_id, data)}"
             err = data.get("error") or data.get("detail") or resp.text
             return f"❌ Échec de l'écriture sur `{node_id}` : {err}"
         except Exception as exc:
@@ -191,7 +203,7 @@ async def node_read_file(node_id: str, path: str) -> str:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/read_file", headers=headers, json=payload)
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
             if resp.status_code == 200 and data.get("success"):
-                return f"📄 Contenu de `{path}` sur `{node_id}` :\n\n{data.get('content', '')}"
+                return f"📄 Contenu de `{path}` sur `{node_id}` :\n\n{data.get('content', '')}{_format_session_suffix(node_id, data)}"
             err = data.get("error") or data.get("detail") or resp.text
             return f"❌ Impossible de lire `{path}` sur `{node_id}` : {err}"
         except Exception as exc:
@@ -270,7 +282,7 @@ async def node_screenshot(node_id: str) -> str:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/action", headers=headers, json=body)
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
             if resp.status_code == 200 and data.get("success"):
-                return f"📸 Capture d'écran effectuée sur `{node_id}` avec succès."
+                return f"📸 Capture d'écran effectuée sur `{node_id}` avec succès.{_format_session_suffix(node_id, data)}"
             err = data.get("error") or data.get("detail") or resp.text
             return f"❌ Échec capture d'écran sur `{node_id}` : {err}"
         except Exception as exc:
