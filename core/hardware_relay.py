@@ -106,7 +106,8 @@ class HardwareRelay:
             is_wayland = bool(os.getenv("WAYLAND_DISPLAY") or os.getenv("XDG_SESSION_TYPE") == "wayland")
             has_display = bool(os.getenv("DISPLAY") or is_wayland)
             node_target = params.get("node_id") or params.get("node")
-            target_node = NODE_HUB.get_node(node_target)
+            sensitive = bool(action in ("exec", "run_shell", "write_file") or node_target)
+            target_node = NODE_HUB.get_node(node_target, exact_only=sensitive)
 
             # Si un nœud spécifique est ciblé ou si le serveur est headless et qu'un nœud client est connecté
             # Sécurité : seules les actions graphiques/multimédia sont relayées automatiquement en headless (pas run_shell/exec/write_file)

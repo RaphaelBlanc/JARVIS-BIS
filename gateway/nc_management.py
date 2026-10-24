@@ -161,7 +161,7 @@ def identifier(value):
 
 
 ALLOWED_PERMISSION_MODES = frozenset({
-    'always-proceed', 'request-review', 'default', 'auto_edit', 'yolo', 'ask', 'bypass', 'plan', 'auto'
+    'default', 'request-review', 'plan', 'ask', 'auto_edit', 'auto'
 })
 ALLOWED_MODES = frozenset({
     'agent', 'auto', 'plan', 'accept-edits', 'ask'

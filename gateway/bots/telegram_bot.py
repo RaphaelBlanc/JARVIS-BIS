@@ -2260,7 +2260,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_msg = getattr(update.message, "reply_to_message", None)
             reply_id = getattr(reply_msg, "message_id", None)
             expected_mid = pending_entry.get("message_id")
-            if expected_mid and reply_id != expected_mid:
+            if not expected_mid or reply_id != expected_mid:
                 await update.message.reply_text(
                     "↩️ Pour lier ton code à la demande lue, réponds directement au message de la demande "
                     "(« Répondre » / glisser vers la gauche) avec tes 6 chiffres."
