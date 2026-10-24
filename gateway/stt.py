@@ -66,8 +66,9 @@ async def _transcribe_groq(
             data = {
                 "model": "whisper-large-v3-turbo",
                 "response_format": "text",
-                "prompt": "Transcription en français.",
             }
+            if not language or language.lower().startswith("fr"):
+                data["prompt"] = "Transcription en français."
             if language:
                 data["language"] = language
             resp = await client.post(url, headers=headers, files=files, data=data)
@@ -90,8 +91,9 @@ async def _transcribe_openai(
             data = {
                 "model": "whisper-1",
                 "response_format": "text",
-                "prompt": "Transcription en français.",
             }
+            if not language or language.lower().startswith("fr"):
+                data["prompt"] = "Transcription en français."
             if language:
                 data["language"] = language
             resp = await client.post(url, headers=headers, files=files, data=data)
@@ -116,8 +118,9 @@ def _transcribe_local_sync(
         kwargs = {
             "beam_size": 3,
             "vad_filter": True,  # Supprime les blancs/silences
-            "initial_prompt": "Transcription en français.",
         }
+        if not language or language.lower().startswith("fr"):
+            kwargs["initial_prompt"] = "Transcription en français."
         if language:
             kwargs["language"] = language
         segments, info = model.transcribe(str(file_path), **kwargs)

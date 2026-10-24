@@ -161,8 +161,12 @@ async def try_nlp_route(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
                 await wait_msg.delete()
                 return True
             elif file_path and Path(file_path).exists():
-                with open(file_path, "rb") as fp:
-                    await update.message.reply_photo(photo=fp, caption="📸 Capture d'écran PC")
+                try:
+                    with open(file_path, "rb") as fp:
+                        await update.message.reply_photo(photo=fp, caption="📸 Capture d'écran PC")
+                finally:
+                    if "nc_screenshot_" in str(file_path):
+                        Path(file_path).unlink(missing_ok=True)
                 await wait_msg.delete()
                 return True
         await wait_msg.edit_text(res.get("message", "Échec de la capture."), parse_mode=ParseMode.HTML)
@@ -365,8 +369,12 @@ async def cmd_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await wait_msg.delete()
             return
         elif file_path and Path(file_path).exists():
-            with open(file_path, "rb") as fp:
-                await update.message.reply_photo(photo=fp, caption="📸 Capture d'écran PC")
+            try:
+                with open(file_path, "rb") as fp:
+                    await update.message.reply_photo(photo=fp, caption="📸 Capture d'écran PC")
+            finally:
+                if "nc_screenshot_" in str(file_path):
+                    Path(file_path).unlink(missing_ok=True)
             await wait_msg.delete()
             return
 

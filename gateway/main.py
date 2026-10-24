@@ -56,6 +56,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 from bots.telegram_bot import (  # noqa: E402
     get_application as get_telegram_app,
+    init_node_hub_confirm_handlers,
     setup_webhook,
     start_telegram_polling,
     stop_telegram_polling,
@@ -362,6 +363,9 @@ async def lifespan(app: FastAPI):
         start_telegram_polling()
     else:
         logger.warning("TELEGRAM_TOKEN manquant — bot Telegram inactif.")
+
+    # Active les écouteurs de confirmation distante TOTP pour les nœuds clients
+    init_node_hub_confirm_handlers()
 
     # Démarre les tâches de fond (briefing + rappels + préchauffage STT)
     scheduler_task = asyncio.create_task(morning_briefing_scheduler())

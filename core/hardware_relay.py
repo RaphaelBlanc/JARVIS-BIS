@@ -9,10 +9,41 @@ d'information clair sans faire planter l'application.
 
 import logging
 import os
+import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger("core.hardware_relay")
+
+_FORBIDDEN_PATH_PREFIXES = (
+    "/etc", "/bin", "/sbin", "/usr", "/boot", "/dev", "/sys", "/proc", "/root"
+)
+
+
+def _sanitize_output_path(
+    user_path: Optional[str],
+    default_prefix: str = "nc_screenshot_",
+    default_suffix: str = ".png",
+) -> Tuple[Optional[Path], Optional[str]]:
+    """Sanitise le chemin de sortie pour éviter l'écrasement de fichiers système et nettoie les vieux temporaires."""
+    if not user_path:
+        try:
+            tmp_dir = Path(tempfile.gettempdir())
+            now = time.time()
+            for old_tmp in tmp_dir.glob(f"{default_prefix}*{default_suffix}"):
+                if now - old_tmp.stat().st_mtime > 300:
+                    old_tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        with tempfile.NamedTemporaryFile(prefix=default_prefix, suffix=default_suffix, delete=False) as tmp_f:
+            return Path(tmp_f.name), None
+
+    resolved = Path(user_path).expanduser().resolve()
+    resolved_str = str(resolved)
+    if any(resolved_str == prefix or resolved_str.startswith(f"{prefix}/") for prefix in _FORBIDDEN_PATH_PREFIXES):
+        return None, f"Chemin de sortie interdit : {user_path}"
+    return resolved, None
 
 
 class HardwareRelay:
@@ -50,13 +81,14 @@ class HardwareRelay:
                 res = await NODE_HUB.send_action(target_node.node_id, "exec" if action == "run_shell" else action, params, timeout=timeout)
                 if action == "screenshot" and res.get("success") and res.get("image_base64"):
                     user_out = params.get("output_path")
-                    if user_out:
-                        out_path = Path(user_out)
-                    else:
-                        with tempfile.NamedTemporaryFile(prefix="nc_screenshot_", suffix=".png", delete=False) as tmp_f:
-                            out_path = Path(tmp_f.name)
+                    out_path, err = _sanitize_output_path(user_out, default_prefix="nc_screenshot_", default_suffix=".png")
+                    if err or not out_path:
+                        return False, err or "Chemin de sortie invalide.", None
                     out_path.write_bytes(base64.b64decode(res["image_base64"]))
-                    return True, f"Capture effectuée sur le nœud {target_node.node_id}.", {"file_path": str(out_path)}
+                    return True, f"Capture effectuée sur le nœud {target_node.node_id}.", {
+                        "file_path": str(out_path),
+                        "image_base64": res["image_base64"],
+                    }
                 if res.get("success"):
                     return True, res.get("message") or f"Action '{action}' exécutée sur le nœud {target_node.node_id}.", res
                 return False, res.get("error") or f"Échec de l'action sur le nœud {target_node.node_id}.", None
@@ -70,7 +102,9 @@ class HardwareRelay:
                 )
 
             if action == "screenshot":
-                out_path = Path(params.get("output_path", "/tmp/screenshot.png"))
+                out_path, err = _sanitize_output_path(params.get("output_path"), default_prefix="nc_screenshot_", default_suffix=".png")
+                if err or not out_path:
+                    return False, err or "Chemin de sortie invalide.", None
                 ok, msg = await system_tools.take_screenshot(out_path)
                 return ok, msg, {"file_path": str(out_path)} if ok else None
 
@@ -79,7 +113,9 @@ class HardwareRelay:
                 return ok, msg, None
 
             elif action == "cam":
-                out_path = Path(params.get("output_path", "/tmp/cam_snapshot.jpg"))
+                out_path, err = _sanitize_output_path(params.get("output_path"), default_prefix="nc_cam_", default_suffix=".jpg")
+                if err or not out_path:
+                    return False, err or "Chemin de sortie invalide.", None
                 ok, msg = await system_tools.capture_webcam(out_path)
                 return ok, msg, {"file_path": str(out_path)} if ok else None
 

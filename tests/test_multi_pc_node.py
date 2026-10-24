@@ -318,5 +318,161 @@ class TestSecuritySandbox(unittest.IsolatedAsyncioTestCase):
             os.unlink(test_file)
 
 
+class TestRemoteConfirmRelay(unittest.IsolatedAsyncioTestCase):
+    """Vérifie le protocole de confirmation distante TOTP (confirm_request -> confirm_response)."""
+
+    async def asyncSetUp(self):
+        self.hub = NodeHub()
+        self.ws = DummyWebSocket()
+        # Nœud annonçant remote_confirm
+        await self.hub.register_node(
+            "pc-remote",
+            self.ws,
+            info={"capabilities": ["exec", "remote_confirm"], "hostname": "remote-station"},
+        )
+
+    async def test_capability_remote_confirm_enforced(self):
+        ws_legacy = DummyWebSocket()
+        await self.hub.register_node(
+            "pc-legacy",
+            ws_legacy,
+            info={"capabilities": ["exec"], "hostname": "legacy-station"},
+        )
+        called = False
+
+        def cb(node_id, msg):
+            nonlocal called
+            called = True
+
+        self.hub.on_confirm_request(cb)
+        self.hub.handle_incoming_message("pc-legacy", {
+            "type": "confirm_request",
+            "req_id": "legacy_req_1",
+            "summary": "action sensible",
+            "expires_in": 30,
+        })
+        self.assertFalse(called)
+        self.assertIsNone(self.hub.get_pending_confirmation("legacy_req_1"))
+
+    async def test_confirm_request_and_allow_with_totp(self):
+        received_req = None
+
+        def cb(node_id, msg):
+            nonlocal received_req
+            received_req = msg
+
+        self.hub.on_confirm_request(cb)
+        self.hub.handle_incoming_message("pc-remote", {
+            "type": "confirm_request",
+            "req_id": "req_123",
+            "action": "exec",
+            "summary": "exécuter rm -rf /tmp/test",
+            "expires_in": 32,
+            "code_required": True,
+        })
+
+        self.assertIsNotNone(received_req)
+        self.assertEqual(received_req["req_id"], "req_123")
+
+        # Validation de la présence dans pending
+        pending = self.hub.get_pending_confirmation("req_123")
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["node_id"], "pc-remote")
+
+        # Envoi de la confirmation avec code TOTP à 6 chiffres
+        ok = await self.hub.send_confirm_response("req_123", decision="allow", code="654321")
+        self.assertTrue(ok)
+        self.assertEqual(len(self.ws.sent_messages), 1)
+        resp_msg = self.ws.sent_messages[0]
+        self.assertEqual(resp_msg["type"], "confirm_response")
+        self.assertEqual(resp_msg["req_id"], "req_123")
+        self.assertEqual(resp_msg["decision"], "allow")
+        self.assertEqual(resp_msg["code"], "654321")
+
+        # La confirmation a été consommée
+        self.assertIsNone(self.hub.get_pending_confirmation("req_123"))
+
+    async def test_confirm_allow_requires_valid_6_digits(self):
+        self.hub.handle_incoming_message("pc-remote", {
+            "type": "confirm_request",
+            "req_id": "req_invalid_code",
+            "expires_in": 30,
+        })
+        # Sans code
+        ok1 = await self.hub.send_confirm_response("req_invalid_code", decision="allow", code=None)
+        self.assertFalse(ok1)
+
+        # Code à 5 chiffres
+        ok2 = await self.hub.send_confirm_response("req_invalid_code", decision="allow", code="12345")
+        self.assertFalse(ok2)
+
+        # Code alphanumérique non valide
+        ok3 = await self.hub.send_confirm_response("req_invalid_code", decision="allow", code="abcdef")
+        self.assertFalse(ok3)
+
+    async def test_confirm_deny(self):
+        self.hub.handle_incoming_message("pc-remote", {
+            "type": "confirm_request",
+            "req_id": "req_deny_1",
+            "summary": "touch /tmp/evil",
+            "expires_in": 30,
+        })
+        ok = await self.hub.send_confirm_response("req_deny_1", decision="deny")
+        self.assertTrue(ok)
+        self.assertEqual(len(self.ws.sent_messages), 1)
+        resp = self.ws.sent_messages[0]
+        self.assertEqual(resp["decision"], "deny")
+        self.assertNotIn("code", resp)
+
+    async def test_confirm_cancel(self):
+        canceled_req = None
+
+        def cancel_cb(node_id, msg):
+            nonlocal canceled_req
+            canceled_req = msg
+
+        self.hub.on_confirm_cancel(cancel_cb)
+        self.hub.handle_incoming_message("pc-remote", {
+            "type": "confirm_request",
+            "req_id": "req_cancel_1",
+            "expires_in": 30,
+        })
+        self.assertIsNotNone(self.hub.get_pending_confirmation("req_cancel_1"))
+
+        # Annulation
+        self.hub.handle_incoming_message("pc-remote", {
+            "type": "confirm_cancel",
+            "req_id": "req_cancel_1",
+        })
+        self.assertIsNotNone(canceled_req)
+        self.assertIsNone(self.hub.get_pending_confirmation("req_cancel_1"))
+
+
+class TestHardwareRelaySecurity(unittest.TestCase):
+    """Vérifie la sanitisation des chemins et le nettoyage des temporaires."""
+
+    def test_sanitize_forbidden_paths(self):
+        from core.hardware_relay import _sanitize_output_path
+
+        # Chemins interdits
+        for bad in ["/etc/passwd", "/root/.bashrc", "/usr/bin/python", "/boot/grub"]:
+            p, err = _sanitize_output_path(bad)
+            self.assertIsNone(p)
+            self.assertIn("interdit", err)
+
+        # Chemin autorisé
+        p_ok, err_ok = _sanitize_output_path("/tmp/safe_shot.png")
+        self.assertIsNone(err_ok)
+        self.assertEqual(str(p_ok), "/tmp/safe_shot.png")
+
+        # Génération automatique si None
+        p_auto, err_auto = _sanitize_output_path(None)
+        self.assertIsNone(err_auto)
+        self.assertIsNotNone(p_auto)
+        self.assertTrue("nc_screenshot_" in str(p_auto))
+        # Nettoyage
+        p_auto.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     unittest.main()

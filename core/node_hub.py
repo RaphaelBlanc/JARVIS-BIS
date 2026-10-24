@@ -13,7 +13,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -54,6 +54,9 @@ class NodeHub:
     def __init__(self) -> None:
         self._nodes: Dict[str, ConnectedNode] = {}
         self._pending_requests: Dict[str, asyncio.Future] = {}
+        self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
+        self._confirm_request_callbacks: List[Callable[[str, Dict[str, Any]], Any]] = []
+        self._confirm_cancel_callbacks: List[Callable[[str, Dict[str, Any]], Any]] = []
         self._lock = asyncio.Lock()
 
     async def register_node(
@@ -133,8 +136,16 @@ class NodeHub:
 
         return None
 
+    def on_confirm_request(self, callback: Callable[[str, Dict[str, Any]], Any]) -> None:
+        """Enregistre un callback appelé lors d'une demande de confirmation distante."""
+        self._confirm_request_callbacks.append(callback)
+
+    def on_confirm_cancel(self, callback: Callable[[str, Dict[str, Any]], Any]) -> None:
+        """Enregistre un callback appelé lors de l'annulation d'une confirmation."""
+        self._confirm_cancel_callbacks.append(callback)
+
     def handle_incoming_message(self, node_id: str, message: Dict[str, Any]) -> None:
-        """Traite un message reçu depuis un nœud (réponse à requête ou ping/pong)."""
+        """Traite un message reçu depuis un nœud (réponse à requête, ping/pong, ou confirm_request)."""
         node = self._nodes.get(node_id)
         if node:
             node.last_seen = time.time()
@@ -148,8 +159,115 @@ class NodeHub:
                 future.set_result(message)
             return
 
+        if msg_type == "confirm_request":
+            if not req_id:
+                return
+            if not node or "remote_confirm" not in node.capabilities:
+                logger.warning(
+                    "Requête confirm_request (%s) ignorée : le nœud %s n'a pas annoncé la capacité remote_confirm.",
+                    req_id,
+                    node_id,
+                )
+                return
+
+            expires_in = int(message.get("expires_in") or 32)
+            self._pending_confirmations[req_id] = {
+                "node_id": node_id,
+                "req_id": req_id,
+                "action": message.get("action", ""),
+                "summary": message.get("summary", ""),
+                "expires_at": time.time() + expires_in,
+                "code_required": bool(message.get("code_required", True)),
+            }
+            logger.info("Requête confirm_request reçue du nœud %s pour req_id %s (expires_in=%ss)", node_id, req_id, expires_in)
+
+            for cb in self._confirm_request_callbacks:
+                try:
+                    res = cb(node_id, message)
+                    if asyncio.iscoroutine(res):
+                        asyncio.create_task(res)
+                except Exception as exc:
+                    logger.error("Erreur dans callback confirm_request: %s", exc)
+            return
+
+        elif msg_type == "confirm_cancel":
+            if not req_id:
+                return
+            self._pending_confirmations.pop(req_id, None)
+            logger.info("confirm_cancel reçu du nœud %s pour req_id %s", node_id, req_id)
+            for cb in self._confirm_cancel_callbacks:
+                try:
+                    res = cb(node_id, message)
+                    if asyncio.iscoroutine(res):
+                        asyncio.create_task(res)
+                except Exception as exc:
+                    logger.error("Erreur dans callback confirm_cancel: %s", exc)
+            return
+
         if msg_type == "ping":
             logger.debug("Ping reçu du nœud %s", node_id)
+
+    async def send_confirm_response(
+        self,
+        req_id: str,
+        decision: str,
+        code: Optional[str] = None,
+    ) -> bool:
+        """Envoie la décision de confirmation (allow ou deny) au nœud client."""
+        conf = self._pending_confirmations.pop(req_id, None)
+        if not conf:
+            logger.warning("confirm_response ignorée : req_id %s introuvable ou déjà traitée", req_id)
+            return False
+
+        if time.time() > conf["expires_at"]:
+            logger.warning("confirm_response ignorée : req_id %s est expirée", req_id)
+            return False
+
+        node_id = conf["node_id"]
+        node = self._nodes.get(node_id)
+        if not node:
+            logger.warning("confirm_response ignorée : nœud %s déconnecté", node_id)
+            return False
+
+        decision_clean = str(decision).strip().lower()
+        if decision_clean not in ("allow", "deny"):
+            logger.warning("confirm_response : décision inconnue '%s'", decision)
+            return False
+
+        payload: Dict[str, Any] = {
+            "type": "confirm_response",
+            "req_id": req_id,
+            "decision": decision_clean,
+        }
+
+        if decision_clean == "allow":
+            # Ne jamais autoriser sans code TOTP valide à 6 chiffres
+            clean_code = str(code).strip() if code else ""
+            if not clean_code.isdigit() or len(clean_code) != 6:
+                logger.warning("confirm_response 'allow' refusée : code TOTP manquant ou invalide")
+                return False
+            payload["code"] = clean_code
+
+        try:
+            await node.websocket.send_json(payload)
+            logger.info("confirm_response envoyée avec succès pour req_id %s au nœud %s (decision=%s)", req_id, node_id, decision_clean)
+            return True
+        except Exception as exc:
+            logger.error("Erreur transmission confirm_response au nœud %s : %s", node_id, exc)
+            return False
+
+    def get_pending_confirmation(self, req_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retourne la demande de confirmation active correspondante si non expirée."""
+        now = time.time()
+        expired = [rid for rid, c in self._pending_confirmations.items() if now > c["expires_at"]]
+        for rid in expired:
+            self._pending_confirmations.pop(rid, None)
+
+        if req_id:
+            return self._pending_confirmations.get(req_id)
+        if len(self._pending_confirmations) == 1:
+            return next(iter(self._pending_confirmations.values()))
+        return None
 
     async def send_action(
         self,

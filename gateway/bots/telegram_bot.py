@@ -18,7 +18,7 @@ import re
 import secrets
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from formatters import (
     extract_and_render_latex,
@@ -654,6 +654,13 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     await query.answer()
     data = query.data or ""
+
+    if data.startswith("totp_deny:"):
+        req_id = data.split(":", 1)[1]
+        from core.node_hub import NODE_HUB
+        await NODE_HUB.send_confirm_response(req_id, decision="deny")
+        await _cleanup_pending_totp_request(req_id, update_messages=True, result_status="❌ Demande refusée.")
+        return
 
     if data.startswith("reminder:"):
         parts = data.split(":")
@@ -1396,6 +1403,172 @@ async def send_telegram_reminder(reminder: dict) -> None:
     await _send_telegram_reminder_impl(reminder)
 
 
+# ── Confirmation TOTP distante pour les nœuds clients (nc-noeud) ─────────────
+
+_pending_totp_by_chat: Dict[int, str] = {}
+_pending_totp_prompts: Dict[str, List[Tuple[int, int, str]]] = {}
+_pending_totp_tasks: Dict[str, asyncio.Task] = {}
+_handlers_initialized = False
+
+
+async def _call_in_telegram_loop(coro_fn, *args, **kwargs) -> Any:
+    """Exécute une coroutine dans la boucle événementielle du bot Telegram si séparée."""
+    loop = _TELEGRAM_LOOP
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if loop is not None and loop.is_running() and loop is not current_loop:
+        future = asyncio.run_coroutine_threadsafe(coro_fn(*args, **kwargs), loop)
+        return await asyncio.wrap_future(future)
+    return await coro_fn(*args, **kwargs)
+
+
+async def _send_totp_request_impl(chat_id: int, text: str, req_id: str) -> Optional[int]:
+    """Envoie la demande de confirmation avec le bouton Refuser en texte brut."""
+    try:
+        app = get_application()
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Refuser", callback_data=f"totp_deny:{req_id}")]
+        ])
+        msg = await app.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+        return msg.message_id
+    except Exception as exc:
+        logger.error("Erreur envoi message confirmation TOTP vers %s : %s", chat_id, exc)
+        return None
+
+
+async def _edit_totp_message_impl(chat_id: int, message_id: int, text: str) -> None:
+    """Édite le message de confirmation pour retirer les boutons et afficher l'état final."""
+    try:
+        app = get_application()
+        await app.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=None,
+        )
+    except Exception as exc:
+        logger.debug("Impossible d'éditer le message TOTP %s:%s : %s", chat_id, message_id, exc)
+
+
+def _get_pending_totp_for_chat(chat_id: int) -> Optional[str]:
+    """Retourne l'identifiant de la requête TOTP en attente pour un chat donné."""
+    return _pending_totp_by_chat.get(chat_id)
+
+
+async def _cleanup_pending_totp_request(req_id: str, update_messages: bool = True, result_status: str = "") -> None:
+    """Nettoie une requête TOTP terminée (réponse, refus ou annulation)."""
+    task = _pending_totp_tasks.pop(req_id, None)
+    if task and not task.done():
+        task.cancel()
+
+    prompts = _pending_totp_prompts.pop(req_id, [])
+    for cid, rid in list(_pending_totp_by_chat.items()):
+        if rid == req_id:
+            del _pending_totp_by_chat[cid]
+
+    if update_messages:
+        for cid, mid, text in prompts:
+            status_text = f"\n\n{result_status}" if result_status else ""
+            await _call_in_telegram_loop(_edit_totp_message_impl, cid, mid, f"{text}{status_text}")
+
+
+async def _expire_pending_totp(req_id: str) -> None:
+    """Gère l'expiration d'une requête de confirmation."""
+    _pending_totp_tasks.pop(req_id, None)
+    prompts = _pending_totp_prompts.pop(req_id, [])
+    for cid, rid in list(_pending_totp_by_chat.items()):
+        if rid == req_id:
+            del _pending_totp_by_chat[cid]
+
+    for cid, mid, text in prompts:
+        await _call_in_telegram_loop(_edit_totp_message_impl, cid, mid, f"{text}\n\n⏱ Expiré.")
+
+
+async def handle_node_confirm_request(node_id: str, message: Dict[str, Any]) -> None:
+    """Relaye une demande de confirmation sensible vers Telegram."""
+    req_id = message.get("req_id")
+    if not req_id:
+        return
+
+    summary = message.get("summary", "")
+    expires_in = int(message.get("expires_in") or 32)
+    code_required = bool(message.get("code_required", True))
+
+    # Texte brut sans mise en page HTML/Markdown pour préserver fidèlement le résumé
+    text = summary
+    if code_required:
+        text += "\n\n🔐 Réponds avec le code de ton appli (6 chiffres)."
+
+    # Ciblage strict des utilisateurs autorisés, jamais dans un groupe
+    target_chats: set[int] = set()
+    if ALLOWED_USER_IDS:
+        target_chats.update(ALLOWED_USER_IDS)
+    else:
+        for cid in get_saved_chat_ids():
+            try:
+                icid = int(cid)
+                if icid > 0:
+                    target_chats.add(icid)
+            except Exception:
+                pass
+
+    if not target_chats:
+        logger.warning("confirm_request : aucun chat privé autorisé trouvé pour relayer la demande.")
+        return
+
+    prompts_list: List[Tuple[int, int, str]] = []
+
+    for cid in target_chats:
+        # Une seule demande active à la fois par conversation
+        old_req = _pending_totp_by_chat.get(cid)
+        if old_req:
+            await _cleanup_pending_totp_request(old_req, update_messages=True, result_status="⏱ Remplacé par une nouvelle demande.")
+
+        msg_id = await _call_in_telegram_loop(_send_totp_request_impl, cid, text, req_id)
+        if msg_id:
+            _pending_totp_by_chat[cid] = req_id
+            prompts_list.append((cid, msg_id, text))
+
+    if prompts_list:
+        _pending_totp_prompts[req_id] = prompts_list
+
+        async def _expire_task():
+            await asyncio.sleep(expires_in)
+            await _expire_pending_totp(req_id)
+
+        _pending_totp_tasks[req_id] = asyncio.create_task(_expire_task())
+
+
+async def handle_node_confirm_cancel(node_id: str, message: Dict[str, Any]) -> None:
+    """Annule l'affichage d'une requête de confirmation expirée ou annulée localement."""
+    req_id = message.get("req_id")
+    if req_id:
+        await _cleanup_pending_totp_request(req_id, update_messages=True, result_status="❌ Annulé par la machine cliente.")
+
+
+def init_node_hub_confirm_handlers() -> None:
+    """Branche les handlers de confirmation distante sur le NODE_HUB."""
+    global _handlers_initialized
+    if _handlers_initialized:
+        return
+    _handlers_initialized = True
+    try:
+        from core.node_hub import NODE_HUB
+        NODE_HUB.on_confirm_request(handle_node_confirm_request)
+        NODE_HUB.on_confirm_cancel(handle_node_confirm_cancel)
+        logger.info("Handlers de confirmation TOTP enregistrés sur NODE_HUB.")
+    except Exception as exc:
+        logger.error("Erreur enregistrement handlers confirmation TOTP sur NODE_HUB: %s", exc)
+
+
 def _format_memory(memory: dict) -> str:
     """Formate le profil et les souvenirs pour Telegram."""
     profile = memory.get("profile", {})
@@ -1820,6 +1993,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not prompt:
         return
 
+    # Vérification code TOTP à 6 chiffres pour confirmation d'action sur nœud distant
+    # Traiter immédiatement SANS journaliser le code, SANS l'envoyer au runner/LLM
+    if re.fullmatch(r"^\d{6}$", prompt):
+        req_id = _get_pending_totp_for_chat(chat_id)
+        if req_id:
+            from core.node_hub import NODE_HUB
+            success = await NODE_HUB.send_confirm_response(req_id, decision="allow", code=prompt)
+            await _cleanup_pending_totp_request(req_id, update_messages=True, result_status="✅ Code transmis.")
+            if success:
+                await update.message.reply_text("✅ Code transmis au nœud client.")
+            else:
+                await update.message.reply_text("❌ Échec de transmission du code (demande expirée ou nœud déconnecté).")
+            return
+
     logger.info("Message Telegram reçu de %d: '%s'", user.id, prompt[:80])
 
     # Routeur NLP local 0-token (<5ms) pour intents natifs (courses, budget, obsidian, pc, focus)
@@ -2068,6 +2255,9 @@ def get_application() -> Application:
     # Handlers modulaires (Moodle, Budget, Courses, Obsidian, PC, etc.)
     from core.tools.bot_telegram_handlers import register_modular_telegram_commands
     register_modular_telegram_commands(app)
+
+    # Initialisation des écouteurs de confirmation distante TOTP pour les nœuds clients
+    init_node_hub_confirm_handlers()
 
     _application = app
     logger.info("Application Telegram configurée avec l'ensemble des commandes et boutons interactifs.")
