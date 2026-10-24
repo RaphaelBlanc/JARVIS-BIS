@@ -295,6 +295,7 @@ class AssistantBot(commands.Bot):
             new_slash,
             models_slash,
             session_slash,
+            fin_session_slash,
             usage_slash,
             skills_slash,
         ]:
@@ -966,14 +967,15 @@ async def resume_slash(interaction: discord.Interaction, conversation: str) -> N
     if interaction.channel:
         await clear_channel_messages(interaction.channel)
 
+    s_key = f"discord:{interaction.user.id}"
     # 2. Si l'utilisateur choisit 'new' (Nouvelle discussion) : réinitialise et n'affiche rien
     if conversation == "new":
-        await reset_session_remote()
+        await reset_session_remote(session_key=s_key)
         await interaction.followup.send("✨ **Nouvelle conversation prête.** Le salon a été vidé.", ephemeral=True)
         return
 
     # 3. Réactivation d'une ancienne conversation et rechargement de l'historique
-    res = await resume_conversation_remote(conversation)
+    res = await resume_conversation_remote(conversation, session_key=s_key)
     if "error" in res:
         await interaction.followup.send(f"❌ Erreur : {res['error']}", ephemeral=True)
         return
@@ -1248,7 +1250,7 @@ async def compact_slash(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
     await _fast_ack(interaction, "⏳ Compactage de la mémoire en cours...")
-    res = await forward_to_runner("/compact", continue_session=True, timeout=60)
+    res = await forward_to_runner("/compact", continue_session=True, timeout=60, session_key=f"discord:{interaction.user.id}")
     out = res.get("output", "").strip() or "✅ Mémoire compactée."
     await send_discord_long_response(interaction, out)
 
@@ -1326,9 +1328,21 @@ async def new_slash(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
     await interaction.response.send_message("✨ **Nouvelle conversation prête.** Le salon a été vidé.", ephemeral=True)
-    await reset_session_remote()
+    await reset_session_remote(session_key=f"discord:{interaction.user.id}")
     if interaction.channel:
         await clear_channel_messages(interaction.channel)
+
+
+@app_commands.command(name="fin_session", description="Fermer immédiatement la session de confiance active sur une machine cliente")
+@app_commands.describe(node_id="Machine cible (ex: tour, laptop, ou all)")
+async def fin_session_slash(interaction: discord.Interaction, node_id: str = "all") -> None:
+    if not _is_allowed(interaction.user.id):
+        await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
+        return
+    from core.node_hub import NODE_HUB
+    closed = await NODE_HUB.send_session_end(node_id=node_id.strip() or "all")
+    label = ", ".join(closed) if closed else "aucun nœud actif"
+    await interaction.response.send_message(f"🛑 Session de confiance fermée sur : `{label}`.")
 
 
 @app_commands.command(name="models", description="Liste les modèles Antigravity disponibles")
@@ -1438,6 +1452,7 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
             continue_session=True,
             image_base64=img_b64,
             image_filename=img_name,
+            session_key=f"discord:{ctx.author.id}",
         )
 
         if result.get("success"):
@@ -1534,8 +1549,17 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
     async def new_cmd(ctx: commands.Context) -> None:
         if not _is_allowed(ctx.author.id):
             return
-        await reset_session_remote()
+        await reset_session_remote(session_key=f"discord:{ctx.author.id}")
         await clear_channel_messages(ctx.channel)
+
+    @bot.command(name="fin_session", aliases=["stop_session"], help="Ferme immédiatement la session de confiance active")
+    async def fin_session_cmd(ctx: commands.Context, node_id: str = "all") -> None:
+        if not _is_allowed(ctx.author.id):
+            return
+        from core.node_hub import NODE_HUB
+        closed = await NODE_HUB.send_session_end(node_id=node_id.strip() or "all")
+        label = ", ".join(closed) if closed else "aucun nœud actif"
+        await ctx.send(f"🛑 Session de confiance fermée sur : `{label}`.")
 
     @bot.command(name="session", help="Affiche l'état de la session active")
     async def session_cmd(ctx: commands.Context) -> None:
@@ -1989,7 +2013,7 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         if not _is_allowed(ctx.author.id):
             return
         waiting = await ctx.send("🧹 Compactage de la mémoire...")
-        res = await forward_to_runner("/compact", continue_session=True, timeout=60)
+        res = await forward_to_runner("/compact", continue_session=True, timeout=60, session_key=f"discord:{ctx.author.id}")
         out = res.get("output", "").strip() or "✅ Mémoire compactée."
         await waiting.edit(content=out)
 

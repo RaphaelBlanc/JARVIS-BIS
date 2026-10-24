@@ -273,6 +273,11 @@ async def execute_tool_action(
         # ── NODES & MULTI-PC ─────────────────────────────────────────────────────
         elif tool_id == "nodes":
             from core.node_hub import NODE_HUB
+            origin = params.get("origin") or (
+                NODE_HUB.build_origin(session_key=params.get("session_key"))
+                if params.get("session_key")
+                else None
+            )
             if action in ("list", "status"):
                 nodes = NODE_HUB.list_nodes()
                 if not nodes:
@@ -281,6 +286,15 @@ async def execute_tool_action(
                 for n in nodes:
                     msg += f"• <b>{n['node_id']}</b> ({n['hostname']}) — {n['os_name']}\n  Activité: il y a {n['idle_seconds']}s\n"
                 return {"success": True, "message": msg, "nodes": nodes}
+
+            elif action == "session_end":
+                node_id = params.get("node_id") or params.get("node") or "all"
+                closed = await NODE_HUB.send_session_end(node_id=node_id)
+                return {
+                    "success": True,
+                    "message": f"🛑 Session de confiance fermée sur : {', '.join(closed) if closed else 'aucun nœud actif'}.",
+                    "closed_nodes": closed,
+                }
 
             elif action in ("exec", "run_shell"):
                 if os.getenv("ENABLE_NODE_EXEC", "0").lower() not in ("1", "true", "yes"):
@@ -298,7 +312,7 @@ async def execute_tool_action(
                     }
                 cmd = str(params.get("command", "")).strip()
                 timeout = float(params.get("timeout", 60.0))
-                res = await NODE_HUB.exec_cmd(cmd, node_id=node_id, timeout=timeout)
+                res = await NODE_HUB.exec_cmd(cmd, node_id=node_id, timeout=timeout, origin=origin)
                 return {
                     "success": res.get("success", False),
                     "message": res.get("message") or res.get("error", ""),
@@ -308,7 +322,7 @@ async def execute_tool_action(
             elif action == "read_file":
                 path = str(params.get("path", "")).strip()
                 node_id = params.get("node_id") or params.get("node")
-                res = await NODE_HUB.read_file(path, node_id=node_id, timeout=35.0)
+                res = await NODE_HUB.read_file(path, node_id=node_id, timeout=35.0, origin=origin)
                 return {
                     "success": res.get("success", False),
                     "message": f"Fichier {path} lu ({res.get('size', 0)} octets)." if res.get("success") else res.get("error", ""),
@@ -325,7 +339,7 @@ async def execute_tool_action(
                     }
                 path = str(params.get("path", "")).strip()
                 content = str(params.get("content", ""))
-                res = await NODE_HUB.write_file(path, content, node_id=node_id, timeout=35.0)
+                res = await NODE_HUB.write_file(path, content, node_id=node_id, timeout=35.0, origin=origin)
                 return {
                     "success": res.get("success", False),
                     "message": f"Fichier {path} écrit avec succès." if res.get("success") else res.get("error", ""),
@@ -334,7 +348,7 @@ async def execute_tool_action(
 
             elif action == "screenshot":
                 node_id = params.get("node_id") or params.get("node")
-                res = await NODE_HUB.send_action(node_id, "screenshot", params, timeout=35.0)
+                res = await NODE_HUB.send_action(node_id, "screenshot", params, timeout=35.0, origin=origin)
                 return {
                     "success": res.get("success", False),
                     "message": "Capture d'écran reçue." if res.get("success") else res.get("error", ""),

@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Optional
@@ -68,6 +69,7 @@ def _default_session() -> dict:
         "mode": None,
         "has_active_session": False,
         "conversation_id": None,
+        "session_token": uuid.uuid4().hex[:16],
         "permission_mode": "always-proceed",  # always-proceed | request-review
         "turns": 0,
     }
@@ -79,6 +81,8 @@ def _get_session(session_key: str = "default") -> dict:
     key = (session_key or "default").strip()
     if key not in _SESSIONS:
         _SESSIONS[key] = _default_session()
+    elif not _SESSIONS[key].get("session_token"):
+        _SESSIONS[key]["session_token"] = uuid.uuid4().hex[:16]
     return _SESSIONS[key]
 
 
@@ -168,9 +172,18 @@ def update_session(
 
 def reset_session(session_key: str = "default") -> dict:
     """Réinitialise la session conversationnelle (démarre une nouvelle conversation vierge)."""
+    if (session_key or "").strip() == "all":
+        for k in list(_SESSIONS.keys()):
+            s = _SESSIONS[k]
+            s["has_active_session"] = False
+            s["conversation_id"] = None
+            s["session_token"] = uuid.uuid4().hex[:16]
+            s["turns"] = 0
+        return dict(_get_session("default"))
     cfg = _get_session(session_key)
     cfg["has_active_session"] = False
     cfg["conversation_id"] = None
+    cfg["session_token"] = uuid.uuid4().hex[:16]
     cfg["turns"] = 0
     return dict(cfg)
 
@@ -367,6 +380,7 @@ def resume_conversation(conv_id: str, session_key: str = "default") -> dict:
     cfg = _get_session(session_key)
     cfg["conversation_id"] = clean_id
     cfg["has_active_session"] = True
+    cfg["session_token"] = f"{clean_id[:16]}-{uuid.uuid4().hex[:8]}"
     cfg["turns"] = 0
     history = get_conversation_history(clean_id)
     return {
@@ -529,6 +543,8 @@ class _AgyStreamWorker:
         continue_session: bool,
         conversation_id: Optional[str],
         has_active_session: bool,
+        session_key: str = "default",
+        session_token: str = "",
     ) -> None:
         self.agy_path = agy_path
         self.model = model
@@ -538,6 +554,8 @@ class _AgyStreamWorker:
         self.continue_session = continue_session
         self.conversation_id = conversation_id
         self.has_active_session = has_active_session
+        self.session_key = session_key
+        self.session_token = session_token
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._stderr_tail: deque[str] = deque(maxlen=40)
@@ -550,6 +568,7 @@ class _AgyStreamWorker:
         effort: Optional[str],
         mode: Optional[str],
         permission_mode: Optional[str],
+        session_token: Optional[str] = None,
     ) -> bool:
         """Indique si le worker peut servir la configuration demandée."""
         return (
@@ -557,6 +576,7 @@ class _AgyStreamWorker:
             and self.effort == effort
             and self.mode == mode
             and self.permission_mode == permission_mode
+            and (session_token is None or self.session_token == session_token)
         )
 
     def is_alive(self) -> bool:
@@ -647,6 +667,8 @@ class _AgyStreamWorker:
             "NO_COLOR": "1",
             "FORCE_COLOR": "0",
             "COLORTERM": "",
+            "JARVIS_SESSION_KEY": self.session_key,
+            "JARVIS_SESSION_TOKEN": self.session_token,
         }
 
         logger.info(
@@ -844,6 +866,10 @@ async def shutdown_agy_worker() -> None:
 
 async def reset_session_async(session_key: str = "default") -> dict:
     """Réinitialise la session et arrête le worker qui la détenait."""
+    if (session_key or "").strip() == "all":
+        for key in list(_WORKERS.keys()):
+            await _stop_worker(key)
+        return reset_session("all")
     lock = _get_session_lock(session_key)
     async with lock:
         await _stop_worker(session_key)
@@ -878,6 +904,7 @@ async def _run_agy_oneshot(
     if reset_session_flag:
         cfg["has_active_session"] = False
         cfg["conversation_id"] = None
+        cfg["session_token"] = uuid.uuid4().hex[:16]
 
     # Construction des arguments agy
     cmd = [agy_path, *_sandbox_args()]
@@ -921,6 +948,8 @@ async def _run_agy_oneshot(
         "NO_COLOR": "1",
         "FORCE_COLOR": "0",
         "COLORTERM": "",
+        "JARVIS_SESSION_KEY": session_key,
+        "JARVIS_SESSION_TOKEN": str(cfg.get("session_token") or ""),
     }
 
     logger.info("Exécution agy [%s]: %s (timeout=%ds)", session_key, " ".join(cmd[:6]), timeout)
@@ -1021,6 +1050,7 @@ async def _run_agy_persistent(
         await _stop_worker(session_key)
         cfg["has_active_session"] = False
         cfg["conversation_id"] = None
+        cfg["session_token"] = uuid.uuid4().hex[:16]
 
     active_model = model or cfg.get("model")
     active_effort = effort or cfg.get("effort") or "low"
@@ -1061,7 +1091,11 @@ async def _run_agy_persistent(
         worker = None
 
     if worker is not None and not worker.matches(
-        active_model, active_effort, active_mode, active_perm
+        active_model,
+        active_effort,
+        active_mode,
+        active_perm,
+        session_token=cfg.get("session_token"),
     ):
         await _stop_worker(session_key)
         worker = None
@@ -1086,6 +1120,8 @@ async def _run_agy_persistent(
             continue_session=True,
             conversation_id=cfg.get("conversation_id"),
             has_active_session=cfg.get("has_active_session", False),
+            session_key=session_key,
+            session_token=str(cfg.get("session_token") or ""),
         )
         try:
             await worker.start()

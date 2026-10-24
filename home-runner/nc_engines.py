@@ -35,11 +35,14 @@ def atomique(path, data):
             if os.path.exists(name): os.unlink(name)
 
 
-async def process(args, prompt, timeout, cwd):
+async def process(args, prompt, timeout, cwd, env_extra=None):
     """Sorties bornées, groupe entier tué sur timeout/annulation/débordement."""
+    proc_env = {**os.environ, 'TERM':'dumb', 'NO_COLOR':'1', 'FORCE_COLOR':'0'}
+    if env_extra:
+        proc_env.update(env_extra)
     p = await asyncio.create_subprocess_exec(*args, cwd=cwd, start_new_session=True,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, 'TERM':'dumb', 'NO_COLOR':'1', 'FORCE_COLOR':'0'})
+        env=proc_env)
     async def read(stream):
         data = bytearray()
         while True:
@@ -144,8 +147,11 @@ class Engines:
         settings = self.state['settings'].get(engine, {})
         ident = self.state['active'].get(engine)
         conv = next((c for c in self.state['conversations'] if c['id']==ident), {})
+        agy_cfg = self.original['get_session_info'](*args, **kwargs)
+        tok = ident or (agy_cfg.get('session_token') if isinstance(agy_cfg, dict) else None) or uuid.uuid4().hex[:16]
         return dict(engine=engine, model=settings.get('model',''), effort=settings.get('effort',''),
                     mode='plan', permission_mode='request-review', conversation_id=ident,
+                    session_token=tok,
                     has_active_session=bool(conv.get('history')), turns=len(conv.get('history',[])))
 
     def models(self, engine=None):
@@ -259,7 +265,12 @@ class Engines:
             if memory: full=memory+'\n\n'+full
             try:
                 args=commande(engine,path,model if model is not None else settings.get('model',''),effort if effort is not None else settings.get('effort',''))
-                code,out=await process(args,full,timeout,self.path.parent)
+                sess_info = self.session(session_key=session_key)
+                env_extra = {
+                    'JARVIS_SESSION_KEY': str(session_key),
+                    'JARVIS_SESSION_TOKEN': str(sess_info.get('session_token') or ''),
+                }
+                code,out=await process(args,full,timeout,self.path.parent,env_extra=env_extra)
                 if code: return failure(ENGINES[engine]+' a échoué (code '+str(code)+'). Vérifie son authentification et le modèle sur le runner.')
                 answer=reponse(engine,out)
                 if continue_session:

@@ -56,6 +56,46 @@ def _headers() -> dict:
     return headers
 
 
+def _read_parent_env() -> dict[str, str]:
+    """Lit /proc/<ppid>/environ en repli si le binaire parent filtre l'environnement."""
+    res: dict[str, str] = {}
+    try:
+        raw = Path(f"/proc/{os.getppid()}/environ").read_bytes()
+        for entry in raw.split(b"\x00"):
+            if b"=" in entry:
+                k, v = entry.split(b"=", 1)
+                res[k.decode("utf-8", errors="ignore")] = v.decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    return res
+
+
+def _get_origin() -> Optional[dict]:
+    """Construit l'identifiant d'origine stable (via, chat, conversation) de la session courante."""
+    session_key = os.getenv("JARVIS_SESSION_KEY", "").strip()
+    session_token = os.getenv("JARVIS_SESSION_TOKEN", "").strip()
+    if not session_key or not session_token:
+        penv = _read_parent_env()
+        session_key = session_key or penv.get("JARVIS_SESSION_KEY", "").strip()
+        session_token = session_token or penv.get("JARVIS_SESSION_TOKEN", "").strip()
+
+    if not session_key or not session_token:
+        return None
+
+    if ":" in session_key:
+        via, rest = session_key.split(":", 1)
+        chat: int | str = int(rest) if rest.isdigit() else rest
+    else:
+        via = session_key
+        chat = session_key
+
+    return {
+        "via": via.strip().lower(),
+        "chat": chat,
+        "conversation": session_token,
+    }
+
+
 @server.tool()
 async def nodes_list() -> str:
     """Vérifie l'état et liste toutes les machines clientes (Tour, PC portable, etc.) connectées à JARVIS.
@@ -75,9 +115,20 @@ async def nodes_list() -> str:
                 for n in nodes:
                     idle = n.get("idle_seconds", 0)
                     caps = ", ".join(n.get("capabilities", []))
+                    meta = n.get("metadata") or {}
+                    ts_min = meta.get("trust_session_minutes", 0)
+                    active_sess = n.get("active_session")
+                    sess_line = ""
+                    if isinstance(active_sess, dict):
+                        sess_line = (
+                            f"\n  🟢 Session de confiance active : "
+                            f"{active_sess.get('reste_actions')} action(s) / {active_sess.get('reste_s')}s restantes"
+                        )
+                    elif ts_min:
+                        sess_line = f"\n  ⏱️ Session de confiance configurée : {ts_min} min"
                     lines.append(
                         f"• **{n.get('node_id')}** ({n.get('hostname')}) — État : 🟢 En ligne / Connecté (inactivité: {idle:.0f}s)\n"
-                        f"  Capacités : `{caps}`"
+                        f"  Capacités : `{caps}`{sess_line}"
                     )
                 return "\n".join(lines)
             return f"Erreur serveur JARVIS : HTTP {resp.status_code} ({resp.text})"
@@ -96,7 +147,10 @@ async def node_write_file(node_id: str, path: str, content: str) -> str:
         content: Contenu texte à écrire dans le fichier.
     """
     headers = _headers()
-    payload = {"path": path, "content": content}
+    payload: dict = {"path": path, "content": content}
+    origin = _get_origin()
+    if origin:
+        payload["origin"] = origin
     async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/write_file", headers=headers, json=payload)
@@ -119,7 +173,10 @@ async def node_read_file(node_id: str, path: str) -> str:
         path: Chemin du fichier (ex: 'Bureau/test.txt').
     """
     headers = _headers()
-    payload = {"path": path}
+    payload: dict = {"path": path}
+    origin = _get_origin()
+    if origin:
+        payload["origin"] = origin
     async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/read_file", headers=headers, json=payload)
@@ -143,7 +200,10 @@ async def node_exec(node_id: str, command: str) -> str:
         command: Commande shell à exécuter.
     """
     headers = _headers()
-    payload = {"command": command}
+    payload: dict = {"command": command}
+    origin = _get_origin()
+    if origin:
+        payload["origin"] = origin
     async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/exec", headers=headers, json=payload)
@@ -156,11 +216,38 @@ async def node_exec(node_id: str, command: str) -> str:
                     msg += f"```\n{out}\n```\n"
                 if err:
                     msg += f"Erreurs :\n```\n{err}\n```"
+                sess = data.get("session")
+                if isinstance(sess, dict):
+                    msg += (
+                        f"\n🟢 Session de confiance active sur `{node_id}` : "
+                        f"{sess.get('reste_actions')} action(s) restante(s), {sess.get('reste_s')}s restantes."
+                    )
                 return msg
             err = data.get("error") or data.get("detail") or resp.text
             return f"❌ Échec de la commande sur `{node_id}` : {err}"
         except Exception as exc:
             return f"Erreur lors de l'exécution sur `{node_id}` : {exc}"
+
+
+@server.tool()
+async def node_end_session(node_id: str = "all") -> str:
+    """Ferme immédiatement la session de confiance active sur une machine cliente (ou toutes avec node_id='all').
+
+    Args:
+        node_id: Identifiant de la machine cible ('tour', 'laptop', ou 'all').
+    """
+    headers = _headers()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/session_end", headers=headers)
+            data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
+            if resp.status_code == 200 and data.get("success"):
+                closed = data.get("closed_nodes") or []
+                return f"🛑 Session de confiance fermée sur : {', '.join(closed) if closed else 'aucun nœud actif'}."
+            err = data.get("error") or data.get("detail") or resp.text
+            return f"❌ Impossible de fermer la session sur `{node_id}` : {err}"
+        except Exception as exc:
+            return f"Erreur lors de la fermeture de session sur `{node_id}` : {exc}"
 
 
 @server.tool()
@@ -171,9 +258,13 @@ async def node_screenshot(node_id: str) -> str:
         node_id: Identifiant de la machine cible (ex: 'tour', 'laptop').
     """
     headers = _headers()
+    origin = _get_origin()
+    body: dict = {"action": "screenshot", "params": {}}
+    if origin:
+        body["origin"] = origin
     async with httpx.AsyncClient(timeout=90.0) as client:
         try:
-            resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/action", headers=headers, json={"action": "screenshot", "params": {}})
+            resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/action", headers=headers, json=body)
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
             if resp.status_code == 200 and data.get("success"):
                 return f"📸 Capture d'écran effectuée sur `{node_id}` avec succès."

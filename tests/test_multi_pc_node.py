@@ -576,5 +576,124 @@ class TestHardwareRelaySecurity(unittest.TestCase):
         p_auto.unlink(missing_ok=True)
 
 
+class TestTrustSessionOrigin(unittest.IsolatedAsyncioTestCase):
+    """Vérifie la gestion des sessions de confiance (origin, session, session_end) sur Telegram, Discord et Desktop."""
+
+    async def asyncSetUp(self):
+        self.hub = NodeHub()
+        self.ws_laptop = DummyWebSocket()
+        self.ws_tour = DummyWebSocket()
+        await self.hub.register_node(
+            "laptop",
+            self.ws_laptop,
+            info={"hostname": "laptop", "capabilities": ["exec", "remote_confirm", "trust_session"]},
+        )
+        await self.hub.register_node(
+            "tour",
+            self.ws_tour,
+            info={"hostname": "tour", "capabilities": ["exec", "remote_confirm", "trust_session"]},
+        )
+
+    def test_normalize_and_build_origin_multi_platform(self):
+        from core.node_hub import normalize_origin
+
+        # 1. Telegram
+        o_tg = self.hub.build_origin(session_key="telegram:8227462739")
+        self.assertIsNotNone(o_tg)
+        self.assertEqual(o_tg["via"], "telegram")
+        self.assertEqual(o_tg["chat"], 8227462739)
+        self.assertTrue(len(o_tg["conversation"]) >= 8)
+
+        # 2. Discord
+        o_dc = self.hub.build_origin(session_key="discord:123456789")
+        self.assertIsNotNone(o_dc)
+        self.assertEqual(o_dc["via"], "discord")
+        self.assertEqual(o_dc["chat"], 123456789)
+
+        # 3. Desktop (laptop & tour)
+        o_laptop = self.hub.build_origin(session_key="desktop:laptop")
+        o_tour = self.hub.build_origin(session_key="desktop:tour")
+        self.assertEqual(o_laptop["via"], "desktop")
+        self.assertEqual(o_laptop["chat"], "laptop")
+        self.assertEqual(o_tour["via"], "desktop")
+        self.assertEqual(o_tour["chat"], "tour")
+        self.assertNotEqual(o_laptop["conversation"], o_tour["conversation"])
+
+        # Stabilité dans la même conversation, rotation sur reset
+        o_laptop_2 = self.hub.build_origin(session_key="desktop:laptop")
+        self.assertEqual(o_laptop, o_laptop_2)
+        self.hub.rotate_conversation_token("desktop:laptop")
+        o_laptop_after_reset = self.hub.build_origin(session_key="desktop:laptop")
+        self.assertNotEqual(o_laptop["conversation"], o_laptop_after_reset["conversation"])
+
+        # Origines invalides rejetées
+        self.assertIsNone(normalize_origin(None))
+        self.assertIsNone(normalize_origin({}))
+        self.assertIsNone(normalize_origin({"via": "telegram", "chat": 123}))
+        self.assertIsNone(normalize_origin({"via": "", "chat": 123, "conversation": "abc"}))
+
+    def test_agy_bridge_session_token_rotation(self):
+        from agy_bridge import resume_conversation
+
+        s1 = get_session_info("desktop:laptop")
+        tok1 = s1["session_token"]
+        self.assertTrue(tok1)
+
+        # Même token tant que la session n'est pas réinitialisée
+        self.assertEqual(get_session_info("desktop:laptop")["session_token"], tok1)
+
+        # Rotation sur reset_session
+        s2 = reset_session("desktop:laptop")
+        self.assertNotEqual(s2["session_token"], tok1)
+
+        # Rotation sur resume_conversation
+        resumed = resume_conversation("conv-abc-12345", session_key="desktop:laptop")
+        self.assertNotEqual(resumed["session"]["session_token"], s2["session_token"])
+        self.assertTrue(resumed["session"]["session_token"].startswith("conv-abc-12345"))
+
+    async def test_exec_forwards_origin_and_tracks_active_session_and_session_end(self):
+        updates = []
+
+        def on_sess(nid, sess, orig):
+            updates.append((nid, sess, orig))
+
+        self.hub.on_session_update(on_sess)
+        origin = self.hub.build_origin(session_key="desktop:tour")
+
+        async def fake_tour_reply():
+            await asyncio.sleep(0.02)
+            msg = self.ws_tour.sent_messages[-1]
+            self.assertEqual(msg["action"], "exec")
+            self.assertEqual(msg["origin"], origin)
+            self.hub.handle_incoming_message("tour", {
+                "type": "response",
+                "req_id": msg["req_id"],
+                "success": True,
+                "stdout": "ok",
+                "session": {"reste_s": 895, "reste_actions": 19},
+            })
+
+        asyncio.create_task(fake_tour_reply())
+        with patch.dict(os.environ, {"ENABLE_NODE_EXEC": "1"}):
+            res = await self.hub.exec_cmd("uptime", node_id="tour", origin=origin, timeout=2.0)
+
+        self.assertTrue(res.get("success"))
+        self.assertEqual(res.get("session"), {"reste_s": 895, "reste_actions": 19})
+        active = self.hub.get_active_session("tour")
+        self.assertIsNotNone(active)
+        self.assertEqual(active["reste_actions"], 19)
+        self.assertEqual(active["origin"], origin)
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0][0], "tour")
+        self.assertEqual(updates[0][1], {"reste_s": 895, "reste_actions": 19})
+
+        # Fermeture explicite via send_session_end
+        closed = await self.hub.send_session_end("tour")
+        self.assertEqual(closed, ["tour"])
+        self.assertEqual(self.ws_tour.sent_messages[-1], {"type": "session_end"})
+        self.assertIsNone(self.hub.get_active_session("tour"))
+        self.assertIsNone(updates[-1][1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -669,6 +669,17 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await _cleanup_pending_totp_request(req_id, update_messages=True, result_status="❌ Demande refusée.")
         return
 
+    if data.startswith("node_session_end:"):
+        target_nid = data.split(":", 1)[1].strip() or "all"
+        from core.node_hub import NODE_HUB
+        closed = await NODE_HUB.send_session_end(node_id=target_nid)
+        label = ", ".join(closed) if closed else target_nid
+        try:
+            await query.edit_message_text(f"🛑 Session de confiance fermée sur {label}.", reply_markup=None)
+        except Exception:
+            pass
+        return
+
     if data.startswith("reminder:"):
         parts = data.split(":")
         chat_id = query.message.chat_id if query.message else None
@@ -719,24 +730,25 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text("❌ Action de rappel invalide.")
         return
 
+    s_key = f"telegram:{user.id}"
     if data.startswith("setmodel:"):
         model_id = data.split(":", 1)[1]
-        await update_session_remote(model=model_id)
+        await update_session_remote(model=model_id, session_key=s_key)
         await query.edit_message_text(f"✅ Modèle activé : `{model_id}`", parse_mode="Markdown")
 
     elif data.startswith("effort:"):
         eff = data.split(":", 1)[1]
-        await update_session_remote(effort=eff)
+        await update_session_remote(effort=eff, session_key=s_key)
         await query.edit_message_text(f"✅ Niveau d'effort réglé sur : `{eff}`", parse_mode="Markdown")
 
     elif data.startswith("mode:"):
         m = data.split(":", 1)[1]
-        await update_session_remote(mode=m)
+        await update_session_remote(mode=m, session_key=s_key)
         await query.edit_message_text(f"✅ Mode d'exécution réglé sur : `{m}`", parse_mode="Markdown")
 
     elif data.startswith("perm:"):
         p = data.split(":", 1)[1]
-        await update_session_remote(permission_mode=p)
+        await update_session_remote(permission_mode=p, session_key=s_key)
         await query.edit_message_text(f"✅ Politique de permissions : `{p}`", parse_mode="Markdown")
 
     elif data.startswith("resume:"):
@@ -749,13 +761,13 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         # 2. Nouvelle conversation
         if cid == "new":
-            await reset_session_remote()
+            await reset_session_remote(session_key=s_key)
             msg = await context.bot.send_message(chat_id=chat_id, text="✨ **Nouvelle conversation prête.**", parse_mode="Markdown")
             track_chat_message(chat_id, msg.message_id)
             return
 
         # 3. Ancienne conversation
-        res = await resume_conversation_remote(cid)
+        res = await resume_conversation_remote(cid, session_key=s_key)
         history = res.get("history", [])
         await replay_telegram_history(context.bot, chat_id, history)
 
@@ -859,17 +871,18 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     track_chat_message(chat_id, update.message.message_id)
 
     args = context.args
+    s_key = f"telegram:{user.id}"
     if args:
         cid = args[0].strip()
         await clear_telegram_chat(context.bot, chat_id, current_message_id=update.message.message_id)
 
         if cid.lower() in ("new", "nouvelle", "reset"):
-            await reset_session_remote()
+            await reset_session_remote(session_key=s_key)
             msg = await context.bot.send_message(chat_id=chat_id, text="✨ **Nouvelle conversation prête.**", parse_mode="Markdown")
             track_chat_message(chat_id, msg.message_id)
             return
 
-        res = await resume_conversation_remote(cid)
+        res = await resume_conversation_remote(cid, session_key=s_key)
         history = res.get("history", [])
         await replay_telegram_history(context.bot, chat_id, history)
         return
@@ -1179,8 +1192,9 @@ async def cmd_compact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
 
+    s_key = f"telegram:{user.id}"
     waiting_msg = await update.message.reply_text("🧹 Compactage de la mémoire de conversation...")
-    res = await forward_to_runner("/compact", continue_session=True, timeout=60)
+    res = await forward_to_runner("/compact", continue_session=True, timeout=60, session_key=s_key)
     output = res.get("output", "").strip() or "✅ Mémoire compactée avec succès."
     await send_or_edit_telegram_response(waiting_msg, output, update.message)
 
@@ -1228,11 +1242,25 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     current_mid = update.message.message_id
     track_chat_message(chat_id, current_mid)
-    await reset_session_remote()
+    await reset_session_remote(session_key=f"telegram:{user.id}")
     await clear_telegram_chat(context.bot, chat_id, current_message_id=current_mid)
     # Message discret pour garder la discussion active et visible dans Telegram
     msg = await context.bot.send_message(chat_id=chat_id, text="✨ **Nouvelle conversation prête.**", parse_mode="Markdown")
     track_chat_message(chat_id, msg.message_id)
+
+
+async def cmd_fin_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ferme immédiatement la session de confiance active sur une machine cliente (ou toutes)."""
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    target_nid = (context.args[0].strip() if context.args else "all") or "all"
+    from core.node_hub import NODE_HUB
+    closed = await NODE_HUB.send_session_end(node_id=target_nid)
+    label = ", ".join(closed) if closed else "aucun nœud actif"
+    await update.message.reply_text(f"🛑 Session de confiance fermée sur : `{label}`.", parse_mode="Markdown")
 
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1242,7 +1270,7 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("⛔ Accès non autorisé.")
         return
 
-    s = await fetch_session()
+    s = await fetch_session(session_key=f"telegram:{user.id}")
     text = (
         "⚙️ *Configuration de la session active :*\n\n"
         f"• *Modèle :* `{s.get('model', 'défaut')}`\n"
@@ -1251,6 +1279,19 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"• *Permissions :* `{s.get('permission_mode', 'always-proceed')}`\n"
         f"• *Conversation en cours :* `{'Oui' if s.get('has_active_session') else 'Non (vierge)'}`"
     )
+    try:
+        from core.node_hub import NODE_HUB
+        active_nodes = [n for n in NODE_HUB.list_nodes() if n.get("active_session")]
+        if active_nodes:
+            text += "\n\n🟢 *Sessions de confiance actives :*"
+            for n in active_nodes:
+                asess = n["active_session"]
+                text += (
+                    f"\n• `{n['node_id']}` : {asess.get('reste_actions')} action(s) / "
+                    f"{asess.get('reste_s')}s restantes (`/fin_session`)"
+                )
+    except Exception:
+        pass
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -1604,8 +1645,116 @@ async def handle_node_confirm_cancel(node_id: str, message: Dict[str, Any]) -> N
         await _cleanup_pending_totp_request(req_id, update_messages=True, result_status="❌ Annulé par la machine cliente.")
 
 
+_active_session_messages: Dict[Tuple[int, str], int] = {}
+
+
+async def _upsert_session_message_impl(
+    chat_id: int,
+    node_id: str,
+    text: str,
+    active: bool,
+) -> None:
+    try:
+        app = get_application()
+        kb = (
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛑 Fin de session", callback_data=f"node_session_end:{node_id}")]
+            ])
+            if active
+            else None
+        )
+        key = (chat_id, node_id)
+        existing_mid = _active_session_messages.get(key)
+        if not active:
+            _active_session_messages.pop(key, None)
+            if existing_mid:
+                try:
+                    await app.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=existing_mid,
+                        text=text,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+            return
+
+        if existing_mid:
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=existing_mid,
+                    text=text,
+                    reply_markup=kb,
+                )
+                return
+            except Exception:
+                _active_session_messages.pop(key, None)
+
+        msg = await app.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+        if msg and getattr(msg, "message_id", None):
+            _active_session_messages[key] = msg.message_id
+    except Exception as exc:
+        logger.debug("Erreur mise à jour message session Telegram (%s, %s): %s", chat_id, node_id, exc)
+
+
+async def handle_node_session_update(
+    node_id: str,
+    session_info: Optional[Dict[str, Any]],
+    origin: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Affiche ou met à jour l'état de la session de confiance dans Telegram avec le bouton Fin de session."""
+    target_chats: set[int] = set()
+    if isinstance(origin, dict) and origin.get("via") == "telegram":
+        raw_chat = origin.get("chat")
+        try:
+            cid = int(raw_chat)
+            if cid in ALLOWED_USER_IDS and cid > 0:
+                target_chats.add(cid)
+        except (ValueError, TypeError):
+            pass
+
+    if not target_chats:
+        if session_info is None:
+            for cid, nid in list(_active_session_messages.keys()):
+                if nid == node_id:
+                    target_chats.add(cid)
+        else:
+            target_chats = {cid for cid in ALLOWED_USER_IDS if cid > 0}
+
+    if not target_chats:
+        return
+
+    if isinstance(session_info, dict):
+        try:
+            reste_s = max(0, int(session_info.get("reste_s", 0)))
+            reste_actions = max(0, int(session_info.get("reste_actions", 0)))
+        except (ValueError, TypeError):
+            reste_s = 0
+            reste_actions = 0
+        if reste_s > 0 and reste_actions > 0:
+            mins, secs = divmod(reste_s, 60)
+            text = (
+                f"🟢 Session de confiance active sur {node_id}\n"
+                f"⏱ Temps restant : {mins}m {secs:02d}s ({reste_s}s)\n"
+                f"⚡ Actions couvertes restantes : {reste_actions}"
+            )
+            for cid in target_chats:
+                await _call_in_telegram_loop(_upsert_session_message_impl, cid, node_id, text, True)
+            return
+
+    text = f"🛑 Session de confiance terminée sur {node_id}."
+    for cid in target_chats:
+        await _call_in_telegram_loop(_upsert_session_message_impl, cid, node_id, text, False)
+
+
 def init_node_hub_confirm_handlers() -> None:
-    """Branche les handlers de confirmation distante sur le NODE_HUB."""
+    """Branche les handlers de confirmation distante et de session de confiance sur le NODE_HUB."""
     global _handlers_initialized
     if _handlers_initialized:
         return
@@ -1614,7 +1763,8 @@ def init_node_hub_confirm_handlers() -> None:
         from core.node_hub import NODE_HUB
         NODE_HUB.on_confirm_request(handle_node_confirm_request)
         NODE_HUB.on_confirm_cancel(handle_node_confirm_cancel)
-        logger.info("Handlers de confirmation TOTP enregistrés sur NODE_HUB.")
+        NODE_HUB.on_session_update(handle_node_session_update)
+        logger.info("Handlers de confirmation TOTP et de session enregistrés sur NODE_HUB.")
     except Exception as exc:
         logger.error("Erreur enregistrement handlers confirmation TOTP sur NODE_HUB: %s", exc)
 
@@ -2273,6 +2423,7 @@ BOT_COMMANDS = [
     BotCommand("models", "Choisir le modèle d'IA (boutons cliquables)"),
     BotCommand("new", "Démarrer une nouvelle discussion"),
     BotCommand("session", "Voir les réglages actifs"),
+    BotCommand("fin_session", "Fermer la session de confiance active"),
     BotCommand("effort", "Régler l'effort de réflexion"),
     BotCommand("mode", "Changer le mode d'action (auto, plan)"),
     BotCommand("permissions", "Régler les permissions (auto/manuel)"),
@@ -2346,6 +2497,8 @@ def get_application() -> Application:
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("clear", cmd_new))
     app.add_handler(CommandHandler("session", cmd_session))
+    app.add_handler(CommandHandler("fin_session", cmd_fin_session))
+    app.add_handler(CommandHandler("stop_session", cmd_fin_session))
     app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("quota", cmd_usage))
     app.add_handler(CommandHandler("skills", cmd_skills))

@@ -162,9 +162,10 @@ def identifier(value):
 
 async def dispatch(op, p, confirmed=False, session_key='default'):
     read = {'capabilities','models','session','memory','conversations','usage','conversation.history','services','logs','quick-settings','google.status','google.calendar'}
-    write = {'session.update','session.reset','conversation.resume','conversation.delete','memory.add','memory.delete','profile.set','profile.delete','config.update','config.clear','service.restart','notify','noctalia'}
+    write = {'session.update','session.reset','conversation.resume','conversation.delete','memory.add','memory.delete','profile.set','profile.delete','config.update','config.clear','service.restart','notify','noctalia','node.session_end'}
     if op not in read|write: raise ValueError
-    s_key = quote(str(session_key or p.get('session_key') or 'default').strip()[:120], safe=':_-')
+    raw_s_key = str(session_key or p.get('session_key') or 'default').strip()[:120]
+    s_key = quote(raw_s_key, safe=':_-')
     if op in ('google.status','google.calendar'):
         try:
             from gateway import nc_google
@@ -199,8 +200,41 @@ async def dispatch(op, p, confirmed=False, session_key='default'):
         if not clean_p or set(clean_p)-{'engine','model','effort','mode','permission_mode'} or any(not isinstance(v,str) or len(v)>200 for v in clean_p.values()): raise ValueError
         body_p = dict(clean_p, session_key=str(session_key or p.get('session_key') or 'default').strip()[:120])
         return await runner('POST','/nc/engine' if 'engine' in clean_p else '/session',body_p)
-    if op=='session.reset': return await runner('POST','/session/reset?session_key='+s_key)
-    if op=='conversation.resume': return await runner('POST','/conversation/resume',dict(conversation_id=identifier(p['id']), session_key=str(session_key or p.get('session_key') or 'default').strip()[:120]))
+    if op=='session.reset':
+        try:
+            from core.node_hub import NODE_HUB
+            NODE_HUB.rotate_conversation_token(raw_s_key)
+            await NODE_HUB.send_session_end()
+        except Exception:
+            pass
+        res = await runner('POST','/session/reset?session_key='+s_key)
+        if isinstance(res, dict) and isinstance(res.get('session'), dict) and res['session'].get('session_token'):
+            try:
+                from core.node_hub import NODE_HUB
+                NODE_HUB.set_conversation_token(raw_s_key, str(res['session']['session_token']))
+            except Exception:
+                pass
+        return res
+    if op=='conversation.resume':
+        try:
+            from core.node_hub import NODE_HUB
+            NODE_HUB.rotate_conversation_token(raw_s_key)
+            await NODE_HUB.send_session_end()
+        except Exception:
+            pass
+        res = await runner('POST','/conversation/resume',dict(conversation_id=identifier(p['id']), session_key=raw_s_key))
+        if isinstance(res, dict) and isinstance(res.get('session'), dict) and res['session'].get('session_token'):
+            try:
+                from core.node_hub import NODE_HUB
+                NODE_HUB.set_conversation_token(raw_s_key, str(res['session']['session_token']))
+            except Exception:
+                pass
+        return res
+    if op=='node.session_end':
+        from core.node_hub import NODE_HUB
+        target_nid = str(p.get('node_id') or 'all').strip()[:64]
+        closed = await NODE_HUB.send_session_end(node_id=target_nid)
+        return dict(success=True, closed_nodes=closed)
     if op=='conversation.delete': return await runner('DELETE','/conversation/'+identifier(p['id']))
     if op=='memory.add':
         text=p['text']

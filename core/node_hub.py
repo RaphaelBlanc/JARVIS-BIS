@@ -24,6 +24,40 @@ else:
 logger = logging.getLogger("core.node_hub")
 
 
+def normalize_origin(origin: Any) -> Optional[Dict[str, Any]]:
+    """Valide et normalise l'origine d'une action ({"via": ..., "chat": ..., "conversation": ...}).
+    Retourne None si l'origine est absente ou mal formée (la commande sera alors confirmée normalement).
+    """
+    if not isinstance(origin, dict) or not origin:
+        return None
+    via = origin.get("via")
+    chat = origin.get("chat")
+    conversation = origin.get("conversation")
+    if not isinstance(via, str) or not via.strip() or len(via.strip()) > 64:
+        return None
+    if isinstance(chat, bool) or chat is None:
+        return None
+    if isinstance(chat, int):
+        clean_chat: int | str = chat
+    elif isinstance(chat, str) and chat.strip() and len(chat.strip()) <= 128:
+        clean_chat = chat.strip()
+    else:
+        return None
+    if isinstance(conversation, bool) or conversation is None:
+        return None
+    if isinstance(conversation, int):
+        clean_conv: int | str = conversation
+    elif isinstance(conversation, str) and conversation.strip() and len(conversation.strip()) <= 128:
+        clean_conv = conversation.strip()
+    else:
+        return None
+    return {
+        "via": via.strip().lower(),
+        "chat": clean_chat,
+        "conversation": clean_conv,
+    }
+
+
 @dataclass
 class ConnectedNode:
     """Représente une machine cliente connectée via WebSocket."""
@@ -60,7 +94,133 @@ class NodeHub:
         self._pending_confirmations: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._confirm_request_callbacks: List[Callable[[str, Dict[str, Any]], Any]] = []
         self._confirm_cancel_callbacks: List[Callable[[str, Dict[str, Any]], Any]] = []
+        self._session_update_callbacks: List[Callable[[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]], Any]] = []
+        self._conversation_tokens: Dict[str, str] = {}
+        self._active_sessions: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
+
+    def get_conversation_token(self, session_key: str) -> str:
+        """Retourne l'identifiant stable de conversation pour session_key (le crée si absent)."""
+        key = (session_key or "default").strip() or "default"
+        token = self._conversation_tokens.get(key)
+        if not token:
+            token = uuid.uuid4().hex[:16]
+            self._conversation_tokens[key] = token
+        return token
+
+    def set_conversation_token(self, session_key: str, token: str) -> str:
+        """Synchronise l'identifiant de conversation avec celui du runner."""
+        key = (session_key or "default").strip() or "default"
+        clean_token = str(token).strip()
+        if clean_token:
+            self._conversation_tokens[key] = clean_token
+        return self.get_conversation_token(key)
+
+    def rotate_conversation_token(self, session_key: Optional[str] = None) -> str:
+        """Génère un nouvel identifiant de conversation (ex: /reset, /new, /resume)."""
+        if not session_key or session_key == "all":
+            self._conversation_tokens.clear()
+            return uuid.uuid4().hex[:16]
+        key = session_key.strip() or "default"
+        new_token = uuid.uuid4().hex[:16]
+        self._conversation_tokens[key] = new_token
+        return new_token
+
+    def build_origin(
+        self,
+        session_key: Optional[str] = None,
+        via: Optional[str] = None,
+        chat: Any = None,
+        conversation: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Construit un dictionnaire origin normalisé à partir d'une session_key ou de champs explicites."""
+        if session_key and (not via or chat is None):
+            if ":" in session_key:
+                prefix, rest = session_key.split(":", 1)
+                via = via or prefix
+                if chat is None:
+                    chat = int(rest) if rest.isdigit() else rest
+            else:
+                via = via or session_key
+                if chat is None:
+                    chat = session_key
+        if not conversation and session_key:
+            conversation = self.get_conversation_token(session_key)
+        return normalize_origin({"via": via, "chat": chat, "conversation": conversation})
+
+    def on_session_update(
+        self,
+        callback: Callable[[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]], Any],
+    ) -> None:
+        """Enregistre un callback appelé à l'ouverture, la mise à jour ou la fermeture d'une session."""
+        self._session_update_callbacks.append(callback)
+
+    def _notify_session_update(
+        self,
+        node_id: str,
+        session_info: Optional[Dict[str, Any]],
+        origin: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        for cb in self._session_update_callbacks:
+            try:
+                res = cb(node_id, session_info, origin)
+                if asyncio.iscoroutine(res):
+                    asyncio.create_task(res)
+            except Exception as exc:
+                logger.error("Erreur dans callback session_update: %s", exc)
+
+    def get_active_session(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """Retourne l'état de la session de confiance active sur ce nœud (ou None si expirée/absente)."""
+        sess = self._active_sessions.get(node_id)
+        if not sess:
+            return None
+        now = time.time()
+        expires_at = float(sess.get("expires_at", 0))
+        reste_actions = int(sess.get("reste_actions", 0))
+        if now >= expires_at or reste_actions <= 0:
+            self._active_sessions.pop(node_id, None)
+            return None
+        return {
+            "reste_s": max(0, int(expires_at - now)),
+            "reste_actions": reste_actions,
+            "origin": sess.get("origin"),
+        }
+
+    async def send_session_end(self, node_id: Optional[str] = None) -> List[str]:
+        """Envoie {"type": "session_end"} au nœud cible (ou à tous les nœuds si node_id est None/'all')
+        pour fermer immédiatement toute session de confiance active.
+        """
+        targets: List[ConnectedNode] = []
+        if not node_id or str(node_id).strip().lower() in ("", "all", "*"):
+            targets = list(self._nodes.values())
+        else:
+            resolved = self.get_node(node_id)
+            if resolved:
+                targets = [resolved]
+
+        closed_nodes: List[str] = []
+        payload = {"type": "session_end"}
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        for node in targets:
+            prev_sess = self._active_sessions.pop(node.node_id, None)
+            prev_origin = prev_sess.get("origin") if isinstance(prev_sess, dict) else None
+            try:
+                if node.loop is not None and node.loop.is_running() and node.loop is not current_loop:
+                    fut = asyncio.run_coroutine_threadsafe(node.websocket.send_json(payload), node.loop)
+                    await asyncio.wrap_future(fut)
+                else:
+                    await node.websocket.send_json(payload)
+                closed_nodes.append(node.node_id)
+                logger.info("session_end envoyé au nœud %s", node.node_id)
+            except Exception as exc:
+                logger.error("Erreur envoi session_end au nœud %s : %s", node.node_id, exc)
+            self._notify_session_update(node.node_id, None, prev_origin)
+
+        return closed_nodes
 
     def _purge_expired_confirmations(self) -> None:
         now = time.time()
@@ -90,6 +250,7 @@ class NodeHub:
             if node_id in self._nodes:
                 old = self._nodes[node_id]
                 logger.info("Remplacement du nœud existant %s", node_id)
+                self._active_sessions.pop(node_id, None)
                 try:
                     await old.websocket.close(code=1000, reason="Superseeded by new connection")
                 except Exception:
@@ -110,17 +271,28 @@ class NodeHub:
 
     async def unregister_node(self, node_id: str, websocket: Optional[WebSocket] = None) -> None:
         """Désenregistre un nœud déconnecté et purge ses confirmations en attente."""
+        prev_sess = None
         async with self._lock:
             node = self._nodes.get(node_id)
             if node and (websocket is None or node.websocket == websocket):
                 del self._nodes[node_id]
                 for k in [k for k in self._pending_confirmations if k[0] == node_id]:
                     self._pending_confirmations.pop(k, None)
+                prev_sess = self._active_sessions.pop(node_id, None)
                 logger.info("Nœud client déconnecté : %s", node_id)
+        if prev_sess is not None:
+            self._notify_session_update(node_id, None, prev_sess.get("origin"))
 
     def list_nodes(self) -> List[Dict[str, Any]]:
         """Retourne la liste des nœuds connectés."""
-        return [node.to_dict() for node in self._nodes.values()]
+        out: List[Dict[str, Any]] = []
+        for node in self._nodes.values():
+            d = node.to_dict()
+            active_sess = self.get_active_session(node.node_id)
+            if active_sess:
+                d["active_session"] = active_sess
+            out.append(d)
+        return out
 
     def get_node(self, node_identifier: Optional[str] = None) -> Optional[ConnectedNode]:
         """Résout un nœud par son ID, son hostname ou sélectionne l'unique nœud connecté."""
@@ -308,6 +480,10 @@ class NodeHub:
                 logger.warning("confirm_response 'allow' refusée : code TOTP manquant ou invalide")
                 return False
             payload["code"] = clean_code
+        else:
+            prev_sess = self._active_sessions.pop(target_node_id, None)
+            if prev_sess is not None:
+                self._notify_session_update(target_node_id, None, prev_sess.get("origin"))
 
         try:
             try:
@@ -347,6 +523,7 @@ class NodeHub:
         action: str,
         params: Optional[Dict[str, Any]] = None,
         timeout: float = 80.0,
+        origin: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Envoie une requête d'action au nœud cible et attend la réponse."""
         if action in ("exec", "write_file"):
@@ -376,18 +553,48 @@ class NodeHub:
         self._pending_requests[req_id] = future
         self._pending_request_nodes[req_id] = node.node_id
 
-        payload = {
+        clean_origin = normalize_origin(origin)
+        payload: Dict[str, Any] = {
             "req_id": req_id,
             "type": "action",
             "action": action,
             "params": params or {},
             "timeout": timeout,
         }
+        if clean_origin is not None:
+            payload["origin"] = clean_origin
 
         try:
             await node.websocket.send_json(payload)
             res = await asyncio.wait_for(future, timeout=timeout)
             node.last_seen = time.time()
+            if isinstance(res, dict):
+                sess = res.get("session")
+                if isinstance(sess, dict):
+                    try:
+                        reste_s = max(0, int(sess.get("reste_s", 0)))
+                        reste_actions = max(0, int(sess.get("reste_actions", 0)))
+                    except (ValueError, TypeError):
+                        reste_s = 0
+                        reste_actions = 0
+                    if reste_s > 0 and reste_actions > 0:
+                        self._active_sessions[node.node_id] = {
+                            "expires_at": time.time() + reste_s,
+                            "reste_s": reste_s,
+                            "reste_actions": reste_actions,
+                            "origin": clean_origin,
+                        }
+                        self._notify_session_update(node.node_id, sess, clean_origin)
+                    else:
+                        self._active_sessions.pop(node.node_id, None)
+                        self._notify_session_update(node.node_id, None, clean_origin)
+                elif action == "exec" and node.node_id in self._active_sessions:
+                    prev_sess = self._active_sessions.pop(node.node_id, None)
+                    self._notify_session_update(
+                        node.node_id,
+                        None,
+                        clean_origin or (prev_sess.get("origin") if isinstance(prev_sess, dict) else None),
+                    )
             return res
         except asyncio.TimeoutError:
             logger.warning("Timeout (%ss) sur action '%s' envoyée au nœud %s", timeout, action, node.node_id)
@@ -408,6 +615,7 @@ class NodeHub:
         command: str,
         node_id: Optional[str] = None,
         timeout: float = 75.0,
+        origin: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Exécute une commande shell sécurisée sur le nœud distant (node_id explicite requis)."""
         if not node_id or str(node_id).strip().lower() in ("", "auto", "default", "any"):
@@ -425,6 +633,7 @@ class NodeHub:
             action="exec",
             params={"command": command, "timeout": timeout},
             timeout=timeout + 5.0,
+            origin=origin,
         )
 
     async def read_file(
@@ -432,6 +641,7 @@ class NodeHub:
         path: str,
         node_id: Optional[str] = None,
         timeout: float = 80.0,
+        origin: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Lit un fichier sur le nœud distant."""
         return await self.send_action(
@@ -439,6 +649,7 @@ class NodeHub:
             action="read_file",
             params={"path": path},
             timeout=timeout,
+            origin=origin,
         )
 
     async def write_file(
@@ -447,6 +658,7 @@ class NodeHub:
         content: str,
         node_id: Optional[str] = None,
         timeout: float = 80.0,
+        origin: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Écrit un fichier sur le nœud distant (node_id explicite requis)."""
         if not node_id or str(node_id).strip().lower() in ("", "auto", "default", "any"):
@@ -459,6 +671,7 @@ class NodeHub:
             action="write_file",
             params={"path": path, "content": content},
             timeout=timeout,
+            origin=origin,
         )
 
 

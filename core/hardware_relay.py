@@ -110,7 +110,12 @@ class HardwareRelay:
                 if remote_action == "exec":
                     if os.getenv("ENABLE_NODE_EXEC", "0").lower() not in ("1", "true", "yes"):
                         return False, "L'exécution distante de commandes (exec) sur les nœuds clients requiert ENABLE_NODE_EXEC=1 côté serveur.", None
-                res = await NODE_HUB.send_action(target_node.node_id, remote_action, params, timeout=timeout)
+                origin = params.get("origin") or (
+                    NODE_HUB.build_origin(session_key=params.get("session_key"))
+                    if params.get("session_key")
+                    else None
+                )
+                res = await NODE_HUB.send_action(target_node.node_id, remote_action, params, timeout=timeout, origin=origin)
                 if action == "screenshot" and res.get("success") and res.get("image_base64"):
                     user_out = params.get("output_path")
                     if user_out:

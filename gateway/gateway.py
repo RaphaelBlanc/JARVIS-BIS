@@ -76,7 +76,16 @@ async def forward_to_runner(
         logger.error("HOME_SERVER_URL n'est pas configuré.")
         return {"success": False, "output": "", "error": "HOME_SERVER_URL non configuré"}
 
-    logger.info("Transmission au home-runner [%s]: prompt=%.60s… (continue=%s, timeout=%ds, image=%s)", session_key or "default", prompt, continue_session, timeout, bool(image_base64))
+    eff_key = (session_key or "default").strip() or "default"
+    if reset_session or prompt.strip() in ("/reset", "/new", "/clear"):
+        try:
+            from core.node_hub import NODE_HUB
+            NODE_HUB.rotate_conversation_token(eff_key)
+            await NODE_HUB.send_session_end()
+        except Exception:
+            pass
+
+    logger.info("Transmission au home-runner [%s]: prompt=%.60s… (continue=%s, timeout=%ds, image=%s)", eff_key, prompt, continue_session, timeout, bool(image_base64))
 
     # Marge de 15s pour que httpx ne coupe pas avant que le runner ait renvoyé son diagnostic
     client_timeout = float(timeout + 15)
@@ -111,6 +120,14 @@ async def forward_to_runner(
         )
         resp.raise_for_status()
         data: dict = resp.json()
+
+        sess_obj = data.get("session")
+        if isinstance(sess_obj, dict) and sess_obj.get("session_token"):
+            try:
+                from core.node_hub import NODE_HUB
+                NODE_HUB.set_conversation_token(eff_key, str(sess_obj["session_token"]))
+            except Exception:
+                pass
 
         output: str = data.get("output", "")
         if MAX_RESPONSE_LENGTH > 0 and len(output) > MAX_RESPONSE_LENGTH:
@@ -243,6 +260,12 @@ def invalidate_conversations_cache() -> None:
 async def reset_session_remote(session_key: str = "default") -> dict:
     """Réinitialise la session active sur le home-runner."""
     invalidate_conversations_cache()
+    try:
+        from core.node_hub import NODE_HUB
+        NODE_HUB.rotate_conversation_token(session_key)
+        await NODE_HUB.send_session_end()
+    except Exception:
+        pass
     if not HOME_SERVER_URL:
         return {"error": "HOME_SERVER_URL non configuré"}
     try:
@@ -254,7 +277,15 @@ async def reset_session_remote(session_key: str = "default") -> dict:
             timeout=10.0,
         )
         resp.raise_for_status()
-        return resp.json()
+        res = resp.json()
+        sess_obj = res.get("session") if isinstance(res, dict) else None
+        if isinstance(sess_obj, dict) and sess_obj.get("session_token"):
+            try:
+                from core.node_hub import NODE_HUB
+                NODE_HUB.set_conversation_token(session_key, str(sess_obj["session_token"]))
+            except Exception:
+                pass
+        return res
     except Exception as e:
         logger.error("Erreur reset_session_remote: %s", e)
         return {"error": str(e)}
@@ -291,6 +322,12 @@ async def fetch_conversations(limit: int = 8, use_cache: bool = True) -> list[di
 async def resume_conversation_remote(conversation_id: str, session_key: str = "default") -> dict:
     """Demande au home-runner de reprendre une conversation spécifique."""
     invalidate_conversations_cache()
+    try:
+        from core.node_hub import NODE_HUB
+        NODE_HUB.rotate_conversation_token(session_key)
+        await NODE_HUB.send_session_end()
+    except Exception:
+        pass
     if not HOME_SERVER_URL:
         return {"error": "HOME_SERVER_URL non configuré"}
     try:
@@ -302,7 +339,15 @@ async def resume_conversation_remote(conversation_id: str, session_key: str = "d
             timeout=10.0,
         )
         resp.raise_for_status()
-        return resp.json()
+        res = resp.json()
+        sess_obj = res.get("session") if isinstance(res, dict) else None
+        if isinstance(sess_obj, dict) and sess_obj.get("session_token"):
+            try:
+                from core.node_hub import NODE_HUB
+                NODE_HUB.set_conversation_token(session_key, str(sess_obj["session_token"]))
+            except Exception:
+                pass
+        return res
     except Exception as e:
         logger.error("Erreur resume_conversation_remote: %s", e)
         return {"error": str(e)}
