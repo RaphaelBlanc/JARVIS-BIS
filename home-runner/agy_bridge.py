@@ -373,32 +373,38 @@ def resume_conversation(conv_id: str, session_key: str = "default") -> dict:
         "session": dict(cfg),
         "history": history,
     }
-    history = get_conversation_history(clean_id)
-    return {
-        "session": dict(SESSION_CONFIG),
-        "history": history,
-    }
 
 
 def list_recent_conversations(limit: int = 8) -> list[dict]:
     """Scanne le répertoire brain d'Antigravity et retourne les conversations récentes avec leur résumé."""
     brain_dir = Path.home() / ".gemini" / "antigravity-cli" / "brain"
-    if not brain_dir.exists():
+    if not brain_dir.exists() or limit <= 0:
         return []
 
     # Ignore la session de développement en cours
     excluded_ids = {"0e02609b-e140-4ca5-a760-247d880dfa5c"}
 
-    conversations = []
+    # 1. Tri rapide par mtime (stat uniquement) avant d'ouvrir les fichiers JSONL
+    candidates: list[tuple[float, Path, Path]] = []
     for item in brain_dir.iterdir():
         if not item.is_dir() or item.name in excluded_ids:
             continue
         transcript_file = item / ".system_generated" / "logs" / "transcript.jsonl"
-        if not transcript_file.exists():
+        try:
+            st = transcript_file.stat()
+            if st.st_size > 0:
+                candidates.append((st.st_mtime, item, transcript_file))
+        except OSError:
             continue
 
+    candidates.sort(key=lambda c: c[0], reverse=True)
+
+    # 2. Lecture uniquement des fichiers nécessaires jusqu'à atteindre `limit`
+    conversations = []
+    for mtime, item, transcript_file in candidates:
+        if len(conversations) >= limit:
+            break
         try:
-            mtime = transcript_file.stat().st_mtime
             date_str = datetime.datetime.fromtimestamp(mtime).strftime("%d/%m %H:%M")
             title = "Discussion sans titre"
             first_user_text = ""
@@ -430,8 +436,7 @@ def list_recent_conversations(limit: int = 8) -> list[dict]:
         except Exception:
             continue
 
-    conversations.sort(key=lambda c: c["timestamp"], reverse=True)
-    return conversations[:limit]
+    return conversations
 
 
 def delete_conversation(conv_id: str) -> dict:
@@ -1029,7 +1034,10 @@ async def _run_agy_persistent(
 
     is_slash = prompt.lstrip().startswith("/")
     if not continue_session or is_slash:
-        await _stop_worker(session_key)
+        # Ne tue le worker persistant que si la commande slash modifie la session active.
+        # Une requête one-shot stateless (continue_session=False) préserve le worker chaud.
+        if continue_session:
+            await _stop_worker(session_key)
         return await _run_agy_oneshot(
             prompt=prompt,
             timeout=timeout,
@@ -1174,6 +1182,21 @@ async def run_agy(
     tout en permettant à plusieurs machines de converser simultanément.
     """
     key = (session_key or "default").strip()
+    if not continue_session and not reset_session_flag:
+        async with _GLOBAL_SEMAPHORE:
+            return await _run_agy_oneshot(
+                prompt=prompt,
+                timeout=timeout,
+                model=model,
+                effort=effort,
+                mode=mode,
+                continue_session=False,
+                reset_session_flag=False,
+                permission_mode=permission_mode,
+                update_session=False,
+                session_key=key,
+            )
+
     session_lock = _get_session_lock(key)
 
     if session_lock.locked():

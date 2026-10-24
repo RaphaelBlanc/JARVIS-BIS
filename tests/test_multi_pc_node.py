@@ -12,6 +12,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 # Ajoute la racine du projet au sys.path
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -152,7 +153,8 @@ class TestNodeHub(unittest.IsolatedAsyncioTestCase):
 
         asyncio.create_task(fake_node_reply())
 
-        res = await self.hub.send_action("laptop", "exec", {"command": "uname -a"}, timeout=2.0)
+        with patch.dict(os.environ, {"ENABLE_NODE_EXEC": "1"}):
+            res = await self.hub.send_action("laptop", "exec", {"command": "uname -a"}, timeout=2.0)
         self.assertTrue(res.get("success"))
         self.assertEqual(res.get("stdout"), "Linux 6.12 arch-laptop")
 
@@ -488,9 +490,55 @@ class TestRemoteConfirmRelay(unittest.IsolatedAsyncioTestCase):
 
         asyncio.create_task(fake_node_behavior())
 
-        res = await self.hub.send_action("pc-remote", "exec", {"command": "discord"}, timeout=2.0)
+        with patch.dict(os.environ, {"ENABLE_NODE_EXEC": "1"}):
+            res = await self.hub.send_action("pc-remote", "exec", {"command": "discord"}, timeout=2.0)
         self.assertTrue(res.get("success"))
         self.assertEqual(res.get("stdout"), "discord launched")
+
+    async def test_send_action_enforces_enable_node_exec_and_explicit_node_id(self):
+        with patch.dict(os.environ, {"ENABLE_NODE_EXEC": "0"}):
+            res_disabled = await self.hub.send_action("pc-remote", "exec", {"command": "id"}, timeout=2.0)
+            self.assertFalse(res_disabled.get("success"))
+            self.assertIn("ENABLE_NODE_EXEC", res_disabled.get("error", ""))
+
+        with patch.dict(os.environ, {"ENABLE_NODE_EXEC": "1"}):
+            res_auto_exec = await self.hub.send_action("auto", "exec", {"command": "id"}, timeout=2.0)
+            self.assertFalse(res_auto_exec.get("success"))
+            res_auto_write = await self.hub.send_action("auto", "write_file", {"path": "a.txt", "content": "x"}, timeout=2.0)
+            self.assertFalse(res_auto_write.get("success"))
+
+    async def test_confirm_request_rejects_other_node_hijack(self):
+        self.hub._pending_request_nodes["req_owned_by_remote"] = "pc-remote"
+        try:
+            await self.hub.register_node("pc-other", DummyWebSocket(), {
+                "hostname": "other-station",
+                "capabilities": ["exec", "remote_confirm"],
+            })
+            self.hub.handle_incoming_message("pc-other", {
+                "type": "confirm_request",
+                "req_id": "req_owned_by_remote",
+                "summary": "tentative usurpation",
+                "expires_in": 30,
+            })
+            self.assertIsNone(self.hub.get_pending_confirmation("req_owned_by_remote"))
+        finally:
+            self.hub._pending_request_nodes.clear()
+
+    def test_totp_code_normalization(self):
+        import re
+        def extract(raw: str):
+            cleaned = re.sub(r"[\s\u00a0\u202f.\-]+", "", raw or "")
+            if re.fullmatch(r"[0-9]{6}", cleaned, flags=re.ASCII):
+                return cleaned
+            return None
+
+        self.assertEqual(extract("123456"), "123456")
+        self.assertEqual(extract("123 456"), "123456")
+        self.assertEqual(extract("123\u00a0456."), "123456")
+        self.assertEqual(extract("123-456"), "123456")
+        self.assertIsNone(extract("12345"))
+        self.assertIsNone(extract("1234567"))
+        self.assertIsNone(extract("١٢٣٤٥٦"))  # Non-ASCII digits rejected
 
 
 class TestHardwareRelaySecurity(unittest.TestCase):
@@ -499,8 +547,16 @@ class TestHardwareRelaySecurity(unittest.TestCase):
     def test_sanitize_forbidden_paths(self):
         from core.hardware_relay import _sanitize_output_path
 
-        # Chemins interdits
-        for bad in ["/etc/passwd", "/root/.bashrc", "/usr/bin/python", "/boot/grub"]:
+        # Chemins interdits (système + dotfiles utilisateur)
+        for bad in [
+            "/etc/passwd",
+            "/root/.bashrc",
+            "/usr/bin/python",
+            "/boot/grub",
+            "~/.bashrc",
+            "~/.ssh/authorized_keys",
+            "~/.config/autostart/evil.desktop",
+        ]:
             p, err = _sanitize_output_path(bad)
             self.assertIsNone(p)
             self.assertIn("interdit", err)
@@ -509,6 +565,7 @@ class TestHardwareRelaySecurity(unittest.TestCase):
         p_ok, err_ok = _sanitize_output_path("/tmp/safe_shot.png")
         self.assertIsNone(err_ok)
         self.assertEqual(str(p_ok), "/tmp/safe_shot.png")
+        p_ok.unlink(missing_ok=True)
 
         # Génération automatique si None
         p_auto, err_auto = _sanitize_output_path(None)

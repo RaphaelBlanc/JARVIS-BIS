@@ -55,6 +55,7 @@ from gateway import (
     fetch_memory,
     fetch_models,
     fetch_session,
+    fetch_weather_direct,
     forward_to_runner,
     reset_session_remote,
     resume_conversation_remote,
@@ -1133,16 +1134,20 @@ async def meteo_slash(interaction: discord.Interaction, ville: str = "Paris") ->
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
     await _fast_ack(interaction, f"⏳ Consultation de la météo pour {ville}...")
-    prompt = (
-        f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}'.\n"
-        "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
-        "Ne lance aucune commande bash ni script python."
-    )
-    res = await forward_to_runner(prompt, continue_session=False, timeout=120)
-    if not res.get("success"):
-        out = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu.')}"
+    direct = await fetch_weather_direct(ville)
+    if direct:
+        out = direct
     else:
-        out = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
+        prompt = (
+            f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}'.\n"
+            "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
+            "Ne lance aucune commande bash ni script python."
+        )
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            out = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu.')}"
+        else:
+            out = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
     await send_discord_long_response(interaction, out)
 
 
@@ -1192,8 +1197,7 @@ async def status_slash(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("⛔ Accès non autorisé.", ephemeral=True)
         return
     await _fast_ack(interaction, "⏳ Récupération de l'état du système...")
-    health = await fetch_health()
-    session = await fetch_session()
+    health, session = await asyncio.gather(fetch_health(), fetch_session())
 
     runner_ok = health.get("status") == "ok"
     agy_ok = health.get("agy_available", False)
@@ -1875,16 +1879,20 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         if not _is_allowed(ctx.author.id):
             return
         waiting = await ctx.send(f"⏳ Consultation météo pour {ville}...")
-        prompt = (
-            f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}'.\n"
-            "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
-            "Ne lance aucune commande bash ni script python."
-        )
-        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
-        if not res.get("success"):
-            out = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        direct = await fetch_weather_direct(ville)
+        if direct:
+            out = direct
         else:
-            out = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
+            prompt = (
+                f"Consulte la météo actuelle et les prévisions pour la ville de '{ville}'.\n"
+                "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
+                "Ne lance aucune commande bash ni script python."
+            )
+            res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+            if not res.get("success"):
+                out = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+            else:
+                out = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
         if len(out) > 2000:
             out = out[:1990] + "..."
         await waiting.edit(content=out)
@@ -1938,8 +1946,7 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         if not _is_allowed(ctx.author.id):
             return
         waiting = await ctx.send("⏳ Vérification des composants...")
-        health = await fetch_health()
-        session = await fetch_session()
+        health, session = await asyncio.gather(fetch_health(), fetch_session())
 
         runner_ok = health.get("status") == "ok"
         agy_ok = health.get("agy_available", False)

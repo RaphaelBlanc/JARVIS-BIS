@@ -69,14 +69,7 @@ async def nodes_list() -> str:
                 data = resp.json()
                 nodes = data.get("nodes", [])
                 if not nodes:
-                    tailscale_info = ""
-                    try:
-                        ts = subprocess.run(["tailscale", "status"], capture_output=True, text=True, timeout=3)
-                        if ts.returncode == 0:
-                            tailscale_info = f"\nStatut Tailscale :\n{ts.stdout.strip()}"
-                    except Exception:
-                        pass
-                    return f"Aucune machine n'est connectée au hub JARVIS actuellement (machines éteintes ou nc-noeud inactif).{tailscale_info}"
+                    return "Aucune machine n'est connectée au hub JARVIS actuellement (machines éteintes ou nc-noeud inactif)."
 
                 lines = [f"🖥️ **Machines connectées à JARVIS ({len(nodes)}) :**"]
                 for n in nodes:
@@ -104,7 +97,7 @@ async def node_write_file(node_id: str, path: str, content: str) -> str:
     """
     headers = _headers()
     payload = {"path": path, "content": content}
-    async with httpx.AsyncClient(timeout=75.0) as client:
+    async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/write_file", headers=headers, json=payload)
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
@@ -127,7 +120,7 @@ async def node_read_file(node_id: str, path: str) -> str:
     """
     headers = _headers()
     payload = {"path": path}
-    async with httpx.AsyncClient(timeout=75.0) as client:
+    async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/read_file", headers=headers, json=payload)
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
@@ -142,9 +135,8 @@ async def node_read_file(node_id: str, path: str) -> str:
 @server.tool()
 async def node_exec(node_id: str, command: str) -> str:
     """Exécute une commande shell sur une machine cliente connectée (ex: node_id='tour').
-    IMPORTANT : Pour éviter de multiplier les demandes d'autorisation à l'utilisateur, ne lance JAMAIS
-    de micro-commandes de sondage séparées (évite les 'which', 'pgrep' isolés).
-    Regroupe ta logique en une commande autonome complète (ex: `nohup discord >/dev/null 2>&1 &` ou `flatpak run com.discordapp.Discord &`).
+    IMPORTANT : Rédige une commande claire, lisible par l'utilisateur lors de la confirmation,
+    sans détachement opaque (`nohup` / `disown`) et sans micro-sondages préalables inutiles.
 
     Args:
         node_id: Identifiant de la machine cible (ex: 'tour', 'laptop').
@@ -152,7 +144,7 @@ async def node_exec(node_id: str, command: str) -> str:
     """
     headers = _headers()
     payload = {"command": command}
-    async with httpx.AsyncClient(timeout=75.0) as client:
+    async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/exec", headers=headers, json=payload)
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}
@@ -179,7 +171,7 @@ async def node_screenshot(node_id: str) -> str:
         node_id: Identifiant de la machine cible (ex: 'tour', 'laptop').
     """
     headers = _headers()
-    async with httpx.AsyncClient(timeout=75.0) as client:
+    async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/action", headers=headers, json={"action": "screenshot", "params": {}})
             data = resp.json() if resp.status_code in (200, 400, 403, 404, 500) else {}

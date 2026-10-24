@@ -394,6 +394,11 @@ async def lifespan(app: FastAPI):
         await stop_discord_bot()
     except Exception as exc:
         logger.error("Erreur lors de l'arrêt du bot Discord: %s", exc)
+    try:
+        from gateway import close_http_client
+        await close_http_client()
+    except Exception as exc:
+        logger.error("Erreur lors de la fermeture du client HTTP: %s", exc)
 
 
 
@@ -595,8 +600,9 @@ async def api_status() -> dict:
     """
     from gateway import fetch_health, fetch_session
 
-    runner_health = await fetch_health()
-    session_info = await fetch_session()
+    runner_health, session_info = await asyncio.gather(
+        fetch_health(), fetch_session()
+    )
 
     runner_alive = runner_health.get("status") == "ok"
     discord_token = os.getenv("DISCORD_TOKEN", "")
@@ -660,20 +666,20 @@ async def api_action(payload: ActionRequest) -> dict:
 class NodeActionRequest(BaseModel):
     action: str = Field(..., description="Action à exécuter (exec, read_file, write_file, screenshot, lock, etc.)")
     params: Optional[dict] = Field(default_factory=dict, description="Paramètres de l'action")
-    timeout: float = Field(default=65.0, description="Délai maximum en secondes")
+    timeout: float = Field(default=80.0, gt=5.0, le=600.0, allow_inf_nan=False, description="Délai maximum en secondes")
 
 class NodeExecRequest(BaseModel):
     command: str = Field(..., description="Commande shell à exécuter")
-    timeout: float = Field(default=60.0, description="Délai maximum en secondes")
+    timeout: float = Field(default=75.0, gt=5.0, le=600.0, allow_inf_nan=False, description="Délai maximum en secondes")
 
 class NodeReadFileRequest(BaseModel):
     path: str = Field(..., description="Chemin absolu ou relatif du fichier à lire")
-    timeout: float = Field(default=65.0, description="Délai maximum en secondes")
+    timeout: float = Field(default=80.0, gt=5.0, le=600.0, allow_inf_nan=False, description="Délai maximum en secondes")
 
 class NodeWriteFileRequest(BaseModel):
     path: str = Field(..., description="Chemin du fichier à écrire")
     content: str = Field(..., description="Contenu du fichier")
-    timeout: float = Field(default=65.0, description="Délai maximum en secondes")
+    timeout: float = Field(default=80.0, gt=5.0, le=600.0, allow_inf_nan=False, description="Délai maximum en secondes")
 
 
 @app.get(
@@ -1054,7 +1060,8 @@ async def nc_manage(request: Request):
             from gateway.nc_management import dispatch
         except ImportError:
             from nc_management import dispatch
-        return await dispatch(body.get("op"), body.get("params", {}), body.get("confirmed") is True)
+        s_key = body.get("session_key") or body.get("params", {}).get("session_key") or "default"
+        return await dispatch(body.get("op"), body.get("params", {}), body.get("confirmed") is True, session_key=s_key)
     except (ValueError, TypeError, KeyError):
         raise HTTPException(status_code=400, detail="Paramètres invalides") from None
 

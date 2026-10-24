@@ -112,7 +112,11 @@ async def try_nlp_route(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         if sub == "stop":
             await update.message.reply_text("🛑 Session Focus terminée.", parse_mode=ParseMode.HTML)
             return True
-    elif intent == "focus_stats":
+        res = await execute_tool_action("focus", "start", {"raw_text": sub}, platform="telegram")
+        if res.get("success"):
+            await update.message.reply_text(res["message"], parse_mode=ParseMode.HTML)
+            return True
+    elif intent in ("focus_stats", "productivity_stats"):
         res = await execute_tool_action("focus", "stats", platform="telegram")
         if res.get("success"):
             await update.message.reply_text(res["message"], parse_mode=ParseMode.HTML)
@@ -140,15 +144,25 @@ async def try_nlp_route(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
             await update.message.reply_text(res["message"], parse_mode=ParseMode.HTML)
             return True
 
-    # 6. Tech & Cyber Radar
-    elif intent == "tech_radar":
+    # 6. Tech & Cyber Radar + Universal Inbox
+    elif intent in ("tech_radar", "radar"):
         wait_msg = await update.message.reply_text("🔍 Récupération des tendances tech & cyber...")
         res = await execute_tool_action("inbox", "radar", {"topic": classification.get("topic", "cyber")}, platform="telegram")
         await wait_msg.edit_text(res.get("message", "Actualités récupérées."), parse_mode=ParseMode.HTML)
         return True
+    elif intent == "inbox_link":
+        wait_msg = await update.message.reply_text("📥 Capture et analyse du lien...")
+        res = await execute_tool_action(
+            "inbox",
+            "capture",
+            {"url": classification.get("url", ""), "note": classification.get("note", "")},
+            platform="telegram",
+        )
+        await wait_msg.edit_text(res.get("message", "Lien capturé."), parse_mode=ParseMode.HTML)
+        return True
 
     # 7. Contrôle PC & Matériel
-    elif intent == "pc_screenshot":
+    elif intent in ("pc_screenshot", "system_screenshot"):
         wait_msg = await update.message.reply_text("📸 Prise de capture d'écran...")
         res = await execute_tool_action("system_pc", "screenshot", platform="telegram")
         if res.get("success"):
@@ -172,7 +186,7 @@ async def try_nlp_route(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         await wait_msg.edit_text(res.get("message", "Échec de la capture."), parse_mode=ParseMode.HTML)
         return True
 
-    elif intent == "pc_cam":
+    elif intent in ("pc_cam", "system_cam"):
         wait_msg = await update.message.reply_text("📷 Capture webcam discrète...")
         res = await execute_tool_action("system_pc", "cam", platform="telegram")
         if res.get("success"):
@@ -185,35 +199,40 @@ async def try_nlp_route(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
                 await wait_msg.delete()
                 return True
             elif file_path and Path(file_path).exists():
-                with open(file_path, "rb") as fp:
-                    await update.message.reply_photo(photo=fp, caption="📷 Capture Webcam")
+                try:
+                    with open(file_path, "rb") as fp:
+                        await update.message.reply_photo(photo=fp, caption="📷 Capture Webcam")
+                finally:
+                    if "nc_cam_" in str(file_path):
+                        Path(file_path).unlink(missing_ok=True)
                 await wait_msg.delete()
                 return True
         await wait_msg.edit_text(res.get("message", "Échec webcam."), parse_mode=ParseMode.HTML)
         return True
 
-    elif intent == "pc_lock":
+    elif intent in ("pc_lock", "system_lock"):
         res = await execute_tool_action("system_pc", "lock", platform="telegram")
         await update.message.reply_text(res.get("message", "Session verrouillée."), parse_mode=ParseMode.HTML)
         return True
 
-    elif intent == "pc_status":
+    elif intent in ("pc_status", "system_pc"):
         res = await execute_tool_action("system_pc", "hardware_health", platform="telegram")
         await update.message.reply_text(res.get("message", "Statut PC récupéré."), parse_mode=ParseMode.HTML)
         return True
 
-    elif intent == "git_summary":
+    elif intent in ("git_summary", "system_git"):
         wait_msg = await update.message.reply_text("🔍 Scan des dépôts Git...")
         res = await execute_tool_action("system_pc", "git_scan", platform="telegram")
         await wait_msg.edit_text(res.get("message", "Scan terminé."), parse_mode=ParseMode.HTML)
         return True
 
     # 8. Conseiller Départs
-    elif intent == "travel_depart":
+    elif intent in ("travel_depart", "depart"):
         res = await execute_tool_action(
             "travel",
             "plan",
             {
+                "text": classification.get("text"),
                 "destination": classification.get("destination", "Paris"),
                 "time": classification.get("time", "08:00"),
             },
@@ -363,20 +382,20 @@ async def cmd_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         data = res.get("data", {})
         img_b64 = data.get("image_base64")
         file_path = data.get("file_path")
-        if img_b64:
-            img_bytes = base64.b64decode(img_b64)
-            await update.message.reply_photo(photo=io.BytesIO(img_bytes), caption="📸 Capture d'écran PC")
-            await wait_msg.delete()
-            return
-        elif file_path and Path(file_path).exists():
-            try:
+        try:
+            if img_b64:
+                img_bytes = base64.b64decode(img_b64)
+                await update.message.reply_photo(photo=io.BytesIO(img_bytes), caption="📸 Capture d'écran PC")
+                await wait_msg.delete()
+                return
+            elif file_path and Path(file_path).exists():
                 with open(file_path, "rb") as fp:
                     await update.message.reply_photo(photo=fp, caption="📸 Capture d'écran PC")
-            finally:
-                if "nc_screenshot_" in str(file_path):
-                    Path(file_path).unlink(missing_ok=True)
-            await wait_msg.delete()
-            return
+                await wait_msg.delete()
+                return
+        finally:
+            if file_path and "nc_screenshot_" in str(file_path):
+                Path(file_path).unlink(missing_ok=True)
 
     await wait_msg.edit_text(res.get("message", "Échec de la capture."), parse_mode=ParseMode.HTML)
 
@@ -389,16 +408,20 @@ async def cmd_cam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         data = res.get("data", {})
         img_b64 = data.get("image_base64")
         file_path = data.get("file_path")
-        if img_b64:
-            img_bytes = base64.b64decode(img_b64)
-            await update.message.reply_photo(photo=io.BytesIO(img_bytes), caption="📷 Capture Webcam")
-            await wait_msg.delete()
-            return
-        elif file_path and Path(file_path).exists():
-            with open(file_path, "rb") as fp:
-                await update.message.reply_photo(photo=fp, caption="📷 Capture Webcam")
-            await wait_msg.delete()
-            return
+        try:
+            if img_b64:
+                img_bytes = base64.b64decode(img_b64)
+                await update.message.reply_photo(photo=io.BytesIO(img_bytes), caption="📷 Capture Webcam")
+                await wait_msg.delete()
+                return
+            elif file_path and Path(file_path).exists():
+                with open(file_path, "rb") as fp:
+                    await update.message.reply_photo(photo=fp, caption="📷 Capture Webcam")
+                await wait_msg.delete()
+                return
+        finally:
+            if file_path and "nc_cam_" in str(file_path):
+                Path(file_path).unlink(missing_ok=True)
 
     await wait_msg.edit_text(res.get("message", "Échec webcam."), parse_mode=ParseMode.HTML)
 

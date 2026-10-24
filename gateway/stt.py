@@ -158,10 +158,12 @@ async def warmup_stt() -> None:
 
 def _resolve_language(language: Optional[str]) -> Optional[str]:
     """Résout la langue demandée ; fallback sur STT_LANGUAGE ou 'fr'."""
+    if language is not None and not language.strip():
+        return None
     value = (language if language is not None else STT_LANGUAGE).strip().lower()
     if value in {"auto", "automatic", "détection", "detection"}:
         return None
-    return value or "fr"
+    return value or None
 
 
 async def transcribe_audio(

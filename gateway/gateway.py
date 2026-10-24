@@ -5,6 +5,7 @@ Fournit `forward_to_runner()`, qui envoie une requête POST au serveur maison
 exposé via Cloudflare Tunnel et retourne la réponse normalisée.
 """
 
+import asyncio
 import httpx
 import os
 import logging
@@ -18,6 +19,43 @@ SECRET_KEY: str = os.getenv("SECRET_KEY", "")
 # 0 (ou une valeur négative) désactive la troncature. La valeur par défaut
 # laisse passer les réponses longues ; les bots se chargent du découpage.
 MAX_RESPONSE_LENGTH: int = int(os.getenv("MAX_RESPONSE_LENGTH", "50000"))
+
+_SHARED_CLIENT: Optional[httpx.AsyncClient] = None
+_SHARED_CLIENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Retourne un client HTTP partagé avec pool de connexions keep-alive."""
+    global _SHARED_CLIENT, _SHARED_CLIENT_LOOP
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if (
+        _SHARED_CLIENT is None
+        or _SHARED_CLIENT.is_closed
+        or _SHARED_CLIENT_LOOP is not current_loop
+    ):
+        _SHARED_CLIENT = httpx.AsyncClient(
+            timeout=10.0,
+            limits=httpx.Limits(
+                max_keepalive_connections=10,
+                max_connections=25,
+                keepalive_expiry=60.0,
+            ),
+        )
+        _SHARED_CLIENT_LOOP = current_loop
+    return _SHARED_CLIENT
+
+
+async def close_http_client() -> None:
+    """Ferme proprement le client HTTP partagé à l'arrêt de la Gateway."""
+    global _SHARED_CLIENT, _SHARED_CLIENT_LOOP
+    if _SHARED_CLIENT is not None and not _SHARED_CLIENT.is_closed:
+        await _SHARED_CLIENT.aclose()
+    _SHARED_CLIENT = None
+    _SHARED_CLIENT_LOOP = None
 
 
 async def forward_to_runner(
@@ -44,44 +82,45 @@ async def forward_to_runner(
     client_timeout = float(timeout + 15)
 
     try:
-        async with httpx.AsyncClient(timeout=client_timeout) as client:
-            payload = {
-                "prompt": prompt,
-                "timeout": timeout,
-                "continue_session": continue_session,
-                "reset_session": reset_session,
-            }
-            if session_key:
-                payload["session_key"] = session_key
-            if model:
-                payload["model"] = model
-            if effort:
-                payload["effort"] = effort
-            if mode:
-                payload["mode"] = mode
-            if permission_mode:
-                payload["permission_mode"] = permission_mode
-            if image_base64:
-                payload["image_base64"] = image_base64
-                payload["image_filename"] = image_filename or "upload.png"
+        client = _get_http_client()
+        payload = {
+            "prompt": prompt,
+            "timeout": timeout,
+            "continue_session": continue_session,
+            "reset_session": reset_session,
+        }
+        if session_key:
+            payload["session_key"] = session_key
+        if model:
+            payload["model"] = model
+        if effort:
+            payload["effort"] = effort
+        if mode:
+            payload["mode"] = mode
+        if permission_mode:
+            payload["permission_mode"] = permission_mode
+        if image_base64:
+            payload["image_base64"] = image_base64
+            payload["image_filename"] = image_filename or "upload.png"
 
-            resp = await client.post(
-                f"{HOME_SERVER_URL}/run",
-                json=payload,
-                headers={"X-Secret-Key": SECRET_KEY},
+        resp = await client.post(
+            f"{HOME_SERVER_URL}/run",
+            json=payload,
+            headers={"X-Secret-Key": SECRET_KEY},
+            timeout=client_timeout,
+        )
+        resp.raise_for_status()
+        data: dict = resp.json()
+
+        output: str = data.get("output", "")
+        if MAX_RESPONSE_LENGTH > 0 and len(output) > MAX_RESPONSE_LENGTH:
+            logger.info(
+                "Réponse tronquée: %d → %d chars.", len(output), MAX_RESPONSE_LENGTH
             )
-            resp.raise_for_status()
-            data: dict = resp.json()
+            data["output"] = output[:MAX_RESPONSE_LENGTH] + "\n\n...(réponse tronquée)"
 
-            output: str = data.get("output", "")
-            if MAX_RESPONSE_LENGTH > 0 and len(output) > MAX_RESPONSE_LENGTH:
-                logger.info(
-                    "Réponse tronquée: %d → %d chars.", len(output), MAX_RESPONSE_LENGTH
-                )
-                data["output"] = output[:MAX_RESPONSE_LENGTH] + "\n\n...(réponse tronquée)"
-
-            logger.info("Réponse reçue — succès: %s.", data.get("success"))
-            return data
+        logger.info("Réponse reçue — succès: %s.", data.get("success"))
+        return data
 
     except httpx.TimeoutException:
         logger.warning("Timeout atteint (%ds) en attendant la réponse du home-runner.", timeout)
@@ -109,10 +148,10 @@ async def fetch_health() -> dict:
     if not HOME_SERVER_URL:
         return {"status": "error", "error": "HOME_SERVER_URL non configuré"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{HOME_SERVER_URL}/health")
-            resp.raise_for_status()
-            return resp.json()
+        client = _get_http_client()
+        resp = await client.get(f"{HOME_SERVER_URL}/health", timeout=10.0)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
         logger.error("Erreur fetch_health: %s", e)
         return {"status": "error", "error": str(e)}
@@ -123,13 +162,14 @@ async def fetch_models() -> dict:
     if not HOME_SERVER_URL:
         return {"success": False, "models": [], "error": "HOME_SERVER_URL non configuré"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{HOME_SERVER_URL}/models",
-                headers={"X-Secret-Key": SECRET_KEY},
-            )
-            resp.raise_for_status()
-            return resp.json()
+        client = _get_http_client()
+        resp = await client.get(
+            f"{HOME_SERVER_URL}/models",
+            headers={"X-Secret-Key": SECRET_KEY},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
         logger.error("Erreur fetch_models: %s", e)
         return {"success": False, "models": [], "error": str(e)}
@@ -140,13 +180,15 @@ async def fetch_session(session_key: str = "default") -> dict:
     if not HOME_SERVER_URL:
         return {"error": "HOME_SERVER_URL non configuré"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{HOME_SERVER_URL}/session?session_key={session_key}",
-                headers={"X-Secret-Key": SECRET_KEY},
-            )
-            resp.raise_for_status()
-            return resp.json()
+        client = _get_http_client()
+        resp = await client.get(
+            f"{HOME_SERVER_URL}/session",
+            params={"session_key": session_key},
+            headers={"X-Secret-Key": SECRET_KEY},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
         logger.error("Erreur fetch_session: %s", e)
         return {"error": str(e)}
@@ -173,14 +215,15 @@ async def update_session_remote(
         if permission_mode:
             payload["permission_mode"] = permission_mode
 
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"{HOME_SERVER_URL}/session",
-                json=payload,
-                headers={"X-Secret-Key": SECRET_KEY},
-            )
-            resp.raise_for_status()
-            return resp.json()
+        client = _get_http_client()
+        resp = await client.post(
+            f"{HOME_SERVER_URL}/session",
+            json=payload,
+            headers={"X-Secret-Key": SECRET_KEY},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
         logger.error("Erreur update_session_remote: %s", e)
         return {"error": str(e)}
@@ -203,13 +246,15 @@ async def reset_session_remote(session_key: str = "default") -> dict:
     if not HOME_SERVER_URL:
         return {"error": "HOME_SERVER_URL non configuré"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"{HOME_SERVER_URL}/session/reset?session_key={session_key}",
-                headers={"X-Secret-Key": SECRET_KEY},
-            )
-            resp.raise_for_status()
-            return resp.json()
+        client = _get_http_client()
+        resp = await client.post(
+            f"{HOME_SERVER_URL}/session/reset",
+            params={"session_key": session_key},
+            headers={"X-Secret-Key": SECRET_KEY},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
         logger.error("Erreur reset_session_remote: %s", e)
         return {"error": str(e)}
@@ -225,17 +270,19 @@ async def fetch_conversations(limit: int = 8, use_cache: bool = True) -> list[di
     if not HOME_SERVER_URL:
         return []
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{HOME_SERVER_URL}/conversations?limit={max(limit, 25)}",
-                headers={"X-Secret-Key": SECRET_KEY},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            convs = data.get("conversations", [])
-            _CONV_CACHE = convs
-            _CONV_CACHE_EXPIRY = now + 15.0
-            return convs[:limit]
+        client = _get_http_client()
+        resp = await client.get(
+            f"{HOME_SERVER_URL}/conversations",
+            params={"limit": max(limit, 25)},
+            headers={"X-Secret-Key": SECRET_KEY},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        convs = data.get("conversations", [])
+        _CONV_CACHE = convs
+        _CONV_CACHE_EXPIRY = now + 15.0
+        return convs[:limit]
     except Exception as e:
         logger.error("Erreur fetch_conversations: %s", e)
         return _CONV_CACHE[:limit] if _CONV_CACHE else []
@@ -247,14 +294,15 @@ async def resume_conversation_remote(conversation_id: str, session_key: str = "d
     if not HOME_SERVER_URL:
         return {"error": "HOME_SERVER_URL non configuré"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"{HOME_SERVER_URL}/conversation/resume",
-                json={"conversation_id": conversation_id, "session_key": session_key},
-                headers={"X-Secret-Key": SECRET_KEY},
-            )
-            resp.raise_for_status()
-            return resp.json()
+        client = _get_http_client()
+        resp = await client.post(
+            f"{HOME_SERVER_URL}/conversation/resume",
+            json={"conversation_id": conversation_id, "session_key": session_key},
+            headers={"X-Secret-Key": SECRET_KEY},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
         logger.error("Erreur resume_conversation_remote: %s", e)
         return {"error": str(e)}
@@ -266,13 +314,14 @@ async def delete_conversation_remote(conversation_id: str) -> dict:
     if not HOME_SERVER_URL:
         return {"success": False, "error": "HOME_SERVER_URL non configuré"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.delete(
-                f"{HOME_SERVER_URL}/conversation/{conversation_id}",
-                headers={"X-Secret-Key": SECRET_KEY},
-            )
-            resp.raise_for_status()
-            return resp.json()
+        client = _get_http_client()
+        resp = await client.delete(
+            f"{HOME_SERVER_URL}/conversation/{conversation_id}",
+            headers={"X-Secret-Key": SECRET_KEY},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
     except httpx.HTTPStatusError as e:
         detail = "Erreur de suppression"
         try:
@@ -294,15 +343,16 @@ async def _memory_request(
     if not HOME_SERVER_URL:
         return {"success": False, "error": "HOME_SERVER_URL non configuré"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.request(
-                method,
-                f"{HOME_SERVER_URL}{path}",
-                headers={"X-Secret-Key": SECRET_KEY},
-                json=json_body,
-            )
-            resp.raise_for_status()
-            return resp.json()
+        client = _get_http_client()
+        resp = await client.request(
+            method,
+            f"{HOME_SERVER_URL}{path}",
+            headers={"X-Secret-Key": SECRET_KEY},
+            json=json_body,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
     except httpx.HTTPStatusError as exc:
         detail = "Erreur mémoire"
         try:
@@ -349,3 +399,172 @@ async def delete_memory_profile(key: str) -> dict:
     return await _memory_request("DELETE", f"/memory/profile/{key}")
 
 
+# ── Météo directe 0-token (Open-Meteo + cache 5 min) ──────────────────────────
+
+_WEATHER_CACHE: dict[str, tuple[float, str]] = {}
+_WEATHER_CACHE_TTL: float = 300.0
+
+_KNOWN_CITIES: dict[str, tuple[float, float, str, str]] = {
+    "paris": (48.8566, 2.3522, "Paris", "France"),
+    "toulouse": (43.6047, 1.4442, "Toulouse", "France"),
+    "lyon": (45.7640, 4.8357, "Lyon", "France"),
+    "marseille": (43.2965, 5.3698, "Marseille", "France"),
+    "bordeaux": (44.8378, -0.5792, "Bordeaux", "France"),
+    "lille": (50.6292, 3.0573, "Lille", "France"),
+    "nantes": (47.2184, -1.5536, "Nantes", "France"),
+    "nice": (43.7102, 7.2620, "Nice", "France"),
+    "strasbourg": (48.5734, 7.7521, "Strasbourg", "France"),
+    "montpellier": (43.6108, 3.8767, "Montpellier", "France"),
+    "rennes": (48.1173, -1.6778, "Rennes", "France"),
+    "grenoble": (45.1885, 5.7245, "Grenoble", "France"),
+    "tokyo": (35.6762, 139.6503, "Tokyo", "Japon"),
+    "london": (51.5074, -0.1278, "Londres", "Royaume-Uni"),
+    "londres": (51.5074, -0.1278, "Londres", "Royaume-Uni"),
+    "new york": (40.7128, -74.0060, "New York", "États-Unis"),
+}
+
+_WMO_CODES: dict[int, tuple[str, str]] = {
+    0: ("☀️", "Ciel dégagé"),
+    1: ("🌤️", "Principalement dégagé"),
+    2: ("⛅", "Partiellement nuageux"),
+    3: ("☁️", "Couvert"),
+    45: ("🌫️", "Brouillard"),
+    48: ("🌫️", "Brouillard givrant"),
+    51: ("🌦️", "Bruine légère"),
+    53: ("🌦️", "Bruine modérée"),
+    55: ("🌧️", "Bruine dense"),
+    56: ("🌧️", "Bruine verglaçante légère"),
+    57: ("🌧️", "Bruine verglaçante dense"),
+    61: ("🌦️", "Pluie faible"),
+    63: ("🌧️", "Pluie modérée"),
+    65: ("🌧️", "Pluie forte"),
+    66: ("🌨️", "Pluie verglaçante légère"),
+    67: ("🌨️", "Pluie verglaçante forte"),
+    71: ("🌨️", "Chute de neige faible"),
+    73: ("❄️", "Chute de neige modérée"),
+    75: ("❄️", "Chute de neige forte"),
+    77: ("❄️", "Grains de neige"),
+    80: ("🌦️", "Averses de pluie faibles"),
+    81: ("🌧️", "Averses de pluie modérées"),
+    82: ("⛈️", "Averses de pluie violentes"),
+    85: ("🌨️", "Averses de neige faibles"),
+    86: ("❄️", "Averses de neige fortes"),
+    95: ("⛈️", "Orage"),
+    96: ("⛈️", "Orage avec grêle faible"),
+    99: ("⛈️", "Orage avec forte grêle"),
+}
+
+
+def _weather_advice(temp: float, precip: float, wind: float, code: int) -> str:
+    tips: list[str] = []
+    if code >= 51 or precip > 0.2:
+        tips.append("prenez un parapluie ☂️")
+    elif code in (0, 1) and temp >= 22:
+        tips.append("lunettes de soleil conseillées 😎")
+    if temp < 6:
+        tips.append("couvrez-vous bien (manteau chaud) 🧥")
+    elif temp < 14:
+        tips.append("prévoyez une veste ou un pull 🧥")
+    elif temp >= 28:
+        tips.append("hydratez-vous régulièrement 💧")
+    if wind >= 45:
+        tips.append("attention aux rafales de vent 💨")
+    if not tips:
+        return "conditions agréables pour sortir 👍"
+    return ", ".join(tips).capitalize() + "."
+
+
+async def fetch_weather_direct(city: str) -> Optional[str]:
+    """Récupère la météo Open-Meteo en direct (0 token LLM, ~80ms, cache 5 min).
+
+    Retourne None en cas d'erreur ou de ville introuvable pour laisser le
+    fallback LLM prendre le relais.
+    """
+    clean_city = (city or "").strip()
+    if not clean_city:
+        return None
+
+    key = clean_city.lower()
+    now = time.time()
+    cached = _WEATHER_CACHE.get(key)
+    if cached and now < cached[0]:
+        return cached[1]
+
+    client = _get_http_client()
+    try:
+        if key in _KNOWN_CITIES:
+            lat, lon, display_name, country = _KNOWN_CITIES[key]
+        else:
+            geo_resp = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": clean_city, "count": 1, "language": "fr", "format": "json"},
+                timeout=5.0,
+            )
+            geo_resp.raise_for_status()
+            results = (geo_resp.json() or {}).get("results") or []
+            if not results:
+                return None
+            top = results[0]
+            lat = float(top["latitude"])
+            lon = float(top["longitude"])
+            display_name = top.get("name") or clean_city
+            country = top.get("country") or ""
+            _KNOWN_CITIES[key] = (lat, lon, display_name, country)
+
+        wx_resp = await client.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                "timezone": "auto",
+                "forecast_days": 2,
+            },
+            timeout=5.0,
+        )
+        wx_resp.raise_for_status()
+        wx = wx_resp.json() or {}
+        cur = wx.get("current") or {}
+        daily = wx.get("daily") or {}
+
+        temp = float(cur.get("temperature_2m", 0.0))
+        feels = float(cur.get("apparent_temperature", temp))
+        hum = int(cur.get("relative_humidity_2m", 0))
+        precip = float(cur.get("precipitation", 0.0))
+        wind = float(cur.get("wind_speed_10m", 0.0))
+        code = int(cur.get("weather_code", 0))
+        emoji, desc = _WMO_CODES.get(code, ("🌤️", "Conditions variables"))
+
+        loc_label = f"{display_name} ({country})" if country else display_name
+        lines = [
+            f"{emoji} **Météo à {loc_label}**",
+            f"• **Actuellement :** `{temp:.1f}°C` (ressenti `{feels:.1f}°C`) — {desc}",
+            f"• **Humidité :** `{hum}%` | **Vent :** `{wind:.0f} km/h` | **Précipitations :** `{precip:.1f} mm`",
+        ]
+
+        t_max_list = daily.get("temperature_2m_max") or []
+        t_min_list = daily.get("temperature_2m_min") or []
+        p_prob_list = daily.get("precipitation_probability_max") or []
+        d_codes = daily.get("weather_code") or []
+
+        if t_max_list and t_min_list:
+            p0 = f" (pluie `{p_prob_list[0]}%`)" if p_prob_list and p_prob_list[0] is not None else ""
+            lines.append(
+                f"• **Aujourd'hui :** min `{t_min_list[0]:.1f}°C` / max `{t_max_list[0]:.1f}°C`{p0}"
+            )
+        if len(t_max_list) > 1 and len(t_min_list) > 1:
+            c1 = int(d_codes[1]) if len(d_codes) > 1 and d_codes[1] is not None else 0
+            e1, d1 = _WMO_CODES.get(c1, ("🌤️", ""))
+            p1 = f", pluie `{p_prob_list[1]}%`" if len(p_prob_list) > 1 and p_prob_list[1] is not None else ""
+            lines.append(
+                f"• **Demain :** {e1} {d1} — min `{t_min_list[1]:.1f}°C` / max `{t_max_list[1]:.1f}°C`{p1}"
+            )
+
+        lines.append(f"💡 **Conseil :** {_weather_advice(temp, precip, wind, code)}")
+        report = "\n".join(lines)
+        _WEATHER_CACHE[key] = (now + _WEATHER_CACHE_TTL, report)
+        return report
+    except Exception as exc:
+        logger.debug("Météo directe indisponible pour %r (%s), repli sur runner.", clean_city, exc)
+        return None

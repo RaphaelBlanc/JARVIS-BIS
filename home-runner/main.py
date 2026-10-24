@@ -401,9 +401,9 @@ async def health():
 
 
 @app.get("/nc/engines", summary="Réglages et moteurs IA pour Noctalia")
-async def nc_get_engines(request: Request):
+async def nc_get_engines(request: Request, session_key: str = "default"):
     _check_secret(request)
-    return engines.snapshot()
+    return engines.snapshot(session_key=session_key)
 
 
 @app.post("/nc/engine", summary="Changer le moteur ou modèle IA")
@@ -643,11 +643,12 @@ async def run(request: Request, body: RunRequest):
 
     s_key = (body.session_key or "default").strip()
 
-    # Injecte la mémoire durable dans les prompts normaux, uniquement pour une
-    # nouvelle session ou lorsque son contenu a changé. Les commandes slash
-    # d'agy ne doivent pas être préfixées par du contexte.
+    # Injecte la mémoire durable dans les prompts conversationnels normaux,
+    # uniquement pour une nouvelle session ou lorsque son contenu a changé.
+    # Les requêtes one-shot sans session (continue_session=False) et les commandes
+    # slash ne sont pas préfixées pour économiser des tokens et préserver l'état.
     memory_version_value: str | None = None
-    if not active_prompt.lstrip().startswith("/"):
+    if body.continue_session and not active_prompt.lstrip().startswith("/"):
         memory_version_value = memory_version()
         if _should_inject_memory(memory_version_value, session_key=s_key):
             memory_context = render_memory_prompt()

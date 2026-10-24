@@ -69,6 +69,7 @@ from gateway import (
     fetch_memory,
     fetch_models,
     fetch_session,
+    fetch_weather_direct,
     forward_to_runner,
     reset_session_remote,
     resume_conversation_remote,
@@ -830,16 +831,20 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     elif data.startswith("meteo:"):
         city = data.split(":", 1)[1]
         waiting_msg = await query.message.reply_text(f"⏳ Consultation météo pour {city}...")
-        prompt = (
-            f"Consulte la météo actuelle et les prévisions pour la ville de '{city}'.\n"
-            "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
-            "Ne lance aucune commande bash ni script python."
-        )
-        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
-        if not res.get("success"):
-            output = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        direct = await fetch_weather_direct(city)
+        if direct:
+            output = direct
         else:
-            output = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
+            prompt = (
+                f"Consulte la météo actuelle et les prévisions pour la ville de '{city}'.\n"
+                "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
+                "Ne lance aucune commande bash ni script python."
+            )
+            res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+            if not res.get("success"):
+                output = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+            else:
+                output = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
         await send_or_edit_telegram_response(waiting_msg, output, query.message)
 
 
@@ -1096,16 +1101,20 @@ async def cmd_meteo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     city = " ".join(args).strip()
     waiting_msg = await update.message.reply_text(f"⏳ Consultation de la météo pour {city}...")
-    prompt = (
-        f"Consulte la météo actuelle et les prévisions pour la ville de '{city}'.\n"
-        "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
-        "Ne lance aucune commande bash ni script python."
-    )
-    res = await forward_to_runner(prompt, continue_session=False, timeout=120)
-    if not res.get("success"):
-        output = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+    direct = await fetch_weather_direct(city)
+    if direct:
+        output = direct
     else:
-        output = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
+        prompt = (
+            f"Consulte la météo actuelle et les prévisions pour la ville de '{city}'.\n"
+            "RÈGLE STRICTE : Utilise l'outil météo et donne immédiatement la température actuelle, le ressenti, l'état du ciel, les précipitations éventuelles et un conseil adapté. "
+            "Ne lance aucune commande bash ni script python."
+        )
+        res = await forward_to_runner(prompt, continue_session=False, timeout=120)
+        if not res.get("success"):
+            output = f"❌ Erreur météo : {res.get('error', 'Le serveur maison n\'a pas répondu à temps.')}"
+        else:
+            output = res.get("output", "").strip() or "⚠️ Aucune information météo trouvée."
     await send_or_edit_telegram_response(waiting_msg, output, update.message)
 
 
@@ -1184,8 +1193,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     waiting_msg = await update.message.reply_text("⏳ Vérification des composants...")
-    health = await fetch_health()
-    session = await fetch_session()
+    health, session = await asyncio.gather(fetch_health(), fetch_session())
 
     runner_ok = health.get("status") == "ok"
     agy_ok = health.get("agy_available", False)
@@ -1411,10 +1419,18 @@ async def send_telegram_reminder(reminder: dict) -> None:
 
 # ── Confirmation TOTP distante pour les nœuds clients (nc-noeud) ─────────────
 
-_pending_totp_by_chat: Dict[int, str] = {}
+_pending_totp_by_chat: Dict[int, Dict[str, Any]] = {}
 _pending_totp_prompts: Dict[str, List[Tuple[int, int, str]]] = {}
 _pending_totp_tasks: Dict[str, asyncio.Task] = {}
 _handlers_initialized = False
+
+
+def _extract_totp_code(raw: str) -> Optional[str]:
+    """Normalise et extrait un code TOTP à 6 chiffres ASCII (ignore espaces, espaces insécables, tirets, points)."""
+    cleaned = re.sub(r"[\s\u00a0\u202f.\-]+", "", raw or "")
+    if re.fullmatch(r"[0-9]{6}", cleaned, flags=re.ASCII):
+        return cleaned
+    return None
 
 
 async def _call_in_telegram_loop(coro_fn, *args, **kwargs) -> Any:
@@ -1464,9 +1480,31 @@ async def _edit_totp_message_impl(chat_id: int, message_id: int, text: str) -> N
         logger.debug("Impossible d'éditer le message TOTP %s:%s : %s", chat_id, message_id, exc)
 
 
+async def _delete_message_safe_impl(chat_id: int, message_id: int) -> None:
+    """Supprime un message (ex: code TOTP saisi) sans lever d'exception."""
+    try:
+        app = get_application()
+        await app.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+def _get_pending_totp_entry_for_chat(chat_id: int) -> Optional[Dict[str, Any]]:
+    """Retourne l'entrée TOTP active pour un chat donné si non expirée."""
+    import time as _time
+    entry = _pending_totp_by_chat.get(chat_id)
+    if not entry:
+        return None
+    if _time.time() > entry.get("expires_at", 0):
+        _pending_totp_by_chat.pop(chat_id, None)
+        return None
+    return entry
+
+
 def _get_pending_totp_for_chat(chat_id: int) -> Optional[str]:
     """Retourne l'identifiant de la requête TOTP en attente pour un chat donné."""
-    return _pending_totp_by_chat.get(chat_id)
+    entry = _get_pending_totp_entry_for_chat(chat_id)
+    return entry["req_id"] if entry else None
 
 
 async def _cleanup_pending_totp_request(req_id: str, update_messages: bool = True, result_status: str = "") -> None:
@@ -1476,8 +1514,8 @@ async def _cleanup_pending_totp_request(req_id: str, update_messages: bool = Tru
         task.cancel()
 
     prompts = _pending_totp_prompts.pop(req_id, [])
-    for cid, rid in list(_pending_totp_by_chat.items()):
-        if rid == req_id:
+    for cid, entry in list(_pending_totp_by_chat.items()):
+        if entry.get("req_id") == req_id:
             del _pending_totp_by_chat[cid]
 
     if update_messages:
@@ -1490,8 +1528,8 @@ async def _expire_pending_totp(req_id: str) -> None:
     """Gère l'expiration d'une requête de confirmation."""
     _pending_totp_tasks.pop(req_id, None)
     prompts = _pending_totp_prompts.pop(req_id, [])
-    for cid, rid in list(_pending_totp_by_chat.items()):
-        if rid == req_id:
+    for cid, entry in list(_pending_totp_by_chat.items()):
+        if entry.get("req_id") == req_id:
             del _pending_totp_by_chat[cid]
 
     for cid, mid, text in prompts:
@@ -1500,57 +1538,63 @@ async def _expire_pending_totp(req_id: str) -> None:
 
 async def handle_node_confirm_request(node_id: str, message: Dict[str, Any]) -> None:
     """Relaye une demande de confirmation sensible vers Telegram."""
+    import time as _time
     req_id = message.get("req_id")
-    if not req_id:
+    if not req_id or not isinstance(req_id, str):
         return
 
-    summary = message.get("summary", "")
-    expires_in = int(message.get("expires_in") or 32)
+    summary = str(message.get("summary") or "")
+    try:
+        raw_exp = message.get("expires_in")
+        expires_in = max(1, min(int(float(raw_exp if raw_exp is not None else 32)), 120))
+    except (ValueError, TypeError, OverflowError):
+        expires_in = 32
     code_required = bool(message.get("code_required", True))
 
     # Texte brut sans mise en page HTML/Markdown pour préserver fidèlement le résumé
     text = summary
     if code_required:
-        text += "\n\n🔐 Réponds avec le code de ton appli (6 chiffres)."
+        text += "\n\n🔐 Réponds à ce message avec le code de ton appli (6 chiffres)."
 
-    # Ciblage strict des utilisateurs autorisés, jamais dans un groupe
-    target_chats: set[int] = set()
-    if ALLOWED_USER_IDS:
-        target_chats.update(ALLOWED_USER_IDS)
-    else:
-        for cid in get_saved_chat_ids():
-            try:
-                icid = int(cid)
-                if icid > 0:
-                    target_chats.add(icid)
-            except Exception:
-                pass
-
+    # Ciblage strict des utilisateurs explicitement autorisés (TELEGRAM_ALLOWED_USER_IDS), jamais saved_chats ni groupes
+    target_chats: set[int] = {cid for cid in ALLOWED_USER_IDS if cid > 0}
     if not target_chats:
-        logger.warning("confirm_request : aucun chat privé autorisé trouvé pour relayer la demande.")
+        logger.warning("confirm_request : TELEGRAM_ALLOWED_USER_IDS est vide, aucun relais effectué.")
+        from core.node_hub import NODE_HUB
+        await NODE_HUB.send_confirm_response(req_id, decision="deny", node_id=node_id)
         return
 
     prompts_list: List[Tuple[int, int, str]] = []
+    expires_at = _time.time() + expires_in
 
     for cid in target_chats:
-        # Une seule demande active à la fois par conversation
-        old_req = _pending_totp_by_chat.get(cid)
-        if old_req:
-            await _cleanup_pending_totp_request(old_req, update_messages=True, result_status="⏱ Remplacé par une nouvelle demande.")
+        # Une seule demande active à la fois par conversation : ne JAMAIS remplacer une demande en cours
+        if _get_pending_totp_entry_for_chat(cid) is not None:
+            logger.warning("confirm_request (%s) refusée dans le chat %s : une demande est déjà en attente.", req_id, cid)
+            continue
 
         msg_id = await _call_in_telegram_loop(_send_totp_request_impl, cid, text, req_id)
         if msg_id:
-            _pending_totp_by_chat[cid] = req_id
+            _pending_totp_by_chat[cid] = {
+                "node_id": node_id,
+                "req_id": req_id,
+                "message_id": msg_id,
+                "expires_at": expires_at,
+            }
             prompts_list.append((cid, msg_id, text))
 
-    if prompts_list:
-        _pending_totp_prompts[req_id] = prompts_list
+    if not prompts_list:
+        from core.node_hub import NODE_HUB
+        await NODE_HUB.send_confirm_response(req_id, decision="deny", node_id=node_id)
+        return
 
-        async def _expire_task():
-            await asyncio.sleep(expires_in)
-            await _expire_pending_totp(req_id)
+    _pending_totp_prompts[req_id] = prompts_list
 
-        _pending_totp_tasks[req_id] = asyncio.create_task(_expire_task())
+    async def _expire_task():
+        await asyncio.sleep(expires_in)
+        await _expire_pending_totp(req_id)
+
+    _pending_totp_tasks[req_id] = asyncio.create_task(_expire_task())
 
 
 async def handle_node_confirm_cancel(node_id: str, message: Dict[str, Any]) -> None:
@@ -2001,13 +2045,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not prompt:
         return
 
-    # Vérification code TOTP à 6 chiffres pour confirmation d'action sur nœud distant
-    # Traiter immédiatement SANS journaliser le code, SANS l'envoyer au runner/LLM
-    if re.fullmatch(r"^\d{6}$", prompt):
-        req_id = _get_pending_totp_for_chat(chat_id)
-        if req_id:
+    # Vérification code TOTP à 6 chiffres (normalisé : espaces, insécables, tirets, points)
+    # Traiter immédiatement SANS journaliser le code, SANS l'envoyer au runner/LLM, et supprimer le message du code
+    totp_code = _extract_totp_code(prompt)
+    pending_entry = _get_pending_totp_entry_for_chat(chat_id)
+    if totp_code is not None:
+        try:
+            await update.message.delete()
+        except Exception:
+            await _call_in_telegram_loop(_delete_message_safe_impl, chat_id, update.message.message_id)
+
+        if pending_entry is not None:
+            reply_msg = getattr(update.message, "reply_to_message", None)
+            reply_id = getattr(reply_msg, "message_id", None)
+            expected_mid = pending_entry.get("message_id")
+            if expected_mid and reply_id != expected_mid:
+                await update.message.reply_text(
+                    "↩️ Pour lier ton code à la demande lue, réponds directement au message de la demande "
+                    "(« Répondre » / glisser vers la gauche) avec tes 6 chiffres."
+                )
+                return
+
+            req_id = pending_entry["req_id"]
+            node_id = pending_entry.get("node_id")
             from core.node_hub import NODE_HUB
-            success = await NODE_HUB.send_confirm_response(req_id, decision="allow", code=prompt)
+            success = await NODE_HUB.send_confirm_response(req_id, decision="allow", code=totp_code, node_id=node_id)
             await _cleanup_pending_totp_request(req_id, update_messages=True, result_status="✅ Code transmis.")
             if success:
                 await update.message.reply_text("✅ Code transmis au nœud client.")
@@ -2015,6 +2077,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text("❌ Échec de transmission du code (demande expirée ou nœud déconnecté).")
         else:
             await update.message.reply_text("⏱ Aucun code n'est attendu actuellement (la demande a expiré ou a déjà été traitée).")
+        return
+
+    # Tant qu'une demande de confirmation attend dans ce chat, ne rien envoyer ni journaliser vers le runner
+    if pending_entry is not None:
+        await update.message.reply_text(
+            "🔐 Une demande de confirmation est en attente dans ce chat. "
+            "Réponds directement au message de la demande avec ton code à 6 chiffres ou clique sur « ❌ Refuser »."
+        )
         return
 
     logger.info("Message Telegram reçu de %d: '%s'", user.id, prompt[:80])
@@ -2042,6 +2112,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.effective_chat.id
     _save_chat_id(chat_id)
     track_chat_message(chat_id, update.message.message_id)
+
+    caption_raw = (update.message.caption or "").strip()
+    if _extract_totp_code(caption_raw) is not None or _get_pending_totp_entry_for_chat(chat_id) is not None:
+        await update.message.reply_text(
+            "🔐 Une demande de confirmation est en attente dans ce chat. "
+            "Réponds en texte au message de la demande avec ton code à 6 chiffres ou clique sur « ❌ Refuser »."
+        )
+        return
 
     # Récupération du fichier image (photo ou document)
     photo_file = None
@@ -2102,6 +2180,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if media is None:
         return
 
+    if _get_pending_totp_entry_for_chat(chat_id) is not None:
+        await update.message.reply_text(
+            "🔐 Une demande de confirmation est en attente dans ce chat. "
+            "Saisis ton code à 6 chiffres en texte (en réponse au message de la demande) ou clique sur « ❌ Refuser »."
+        )
+        return
+
     file_size = int(getattr(media, "file_size", 0) or 0)
     if file_size > MAX_AUDIO_BYTES:
         await update.message.reply_text(
@@ -2126,9 +2211,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
+        if _extract_totp_code(text) is not None or _get_pending_totp_entry_for_chat(chat_id) is not None:
+            try:
+                await update.message.delete()
+            except Exception:
+                await _call_in_telegram_loop(_delete_message_safe_impl, chat_id, update.message.message_id)
+            await waiting_msg.edit_text(
+                "🔐 Par sécurité, un code à 6 chiffres ne doit pas être dicté en vocal. "
+                "Réponds en texte directement au message de la demande."
+            )
+            return
+
         logger.info(
             "Message vocal Telegram transcrit (%s) : '%s'", engine, text[:200]
         )
+        from core.tools.bot_telegram_handlers import try_nlp_route
+        if await try_nlp_route(update, context, text):
+            await waiting_msg.edit_text(f"🎤 « {text} »")
+            return
         await waiting_msg.edit_text(f"🎤 « {text} »\n\n⏳ Traitement en cours...")
         await _process_prompt_and_reply(update, text, waiting_msg)
 

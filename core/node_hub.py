@@ -10,10 +10,11 @@ des fichiers et exécuter des commandes sur les machines clientes de façon séc
 import asyncio
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -34,6 +35,7 @@ class ConnectedNode:
     last_seen: float = field(default_factory=time.time)
     capabilities: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -54,10 +56,17 @@ class NodeHub:
     def __init__(self) -> None:
         self._nodes: Dict[str, ConnectedNode] = {}
         self._pending_requests: Dict[str, asyncio.Future] = {}
-        self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
+        self._pending_request_nodes: Dict[str, str] = {}
+        self._pending_confirmations: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._confirm_request_callbacks: List[Callable[[str, Dict[str, Any]], Any]] = []
         self._confirm_cancel_callbacks: List[Callable[[str, Dict[str, Any]], Any]] = []
         self._lock = asyncio.Lock()
+
+    def _purge_expired_confirmations(self) -> None:
+        now = time.time()
+        expired = [k for k, c in self._pending_confirmations.items() if now > c["expires_at"]]
+        for k in expired:
+            self._pending_confirmations.pop(k, None)
 
     async def register_node(
         self,
@@ -71,6 +80,10 @@ class NodeHub:
         os_name = str(info.get("os") or "linux")
         capabilities = list(info.get("capabilities") or [])
         metadata = dict(info.get("metadata") or {})
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
 
         async with self._lock:
             # Si un ancien nœud avec le même ID existe, on ferme proprement son ws
@@ -89,17 +102,20 @@ class NodeHub:
                 websocket=websocket,
                 capabilities=capabilities,
                 metadata=metadata,
+                loop=running_loop,
             )
             self._nodes[node_id] = node
             logger.info("Nœud client enregistré : %s (%s, caps=%s)", node_id, hostname, capabilities)
             return node
 
     async def unregister_node(self, node_id: str, websocket: Optional[WebSocket] = None) -> None:
-        """Désenregistre un nœud déconnecté."""
+        """Désenregistre un nœud déconnecté et purge ses confirmations en attente."""
         async with self._lock:
             node = self._nodes.get(node_id)
             if node and (websocket is None or node.websocket == websocket):
                 del self._nodes[node_id]
+                for k in [k for k in self._pending_confirmations if k[0] == node_id]:
+                    self._pending_confirmations.pop(k, None)
                 logger.info("Nœud client déconnecté : %s", node_id)
 
     def list_nodes(self) -> List[Dict[str, Any]]:
@@ -152,9 +168,10 @@ class NodeHub:
 
         msg_type = message.get("type")
         req_id = message.get("req_id")
+        self._purge_expired_confirmations()
 
         if msg_type == "confirm_request":
-            if not req_id:
+            if not req_id or not isinstance(req_id, str):
                 return
             if not node or "remote_confirm" not in node.capabilities:
                 logger.warning(
@@ -164,12 +181,38 @@ class NodeHub:
                 )
                 return
 
-            expires_in = int(message.get("expires_in") or 32)
-            self._pending_confirmations[req_id] = {
+            # Vérifie que le req_id appartient bien à ce nœud (pas d'usurpation inter-nœuds ni de requête non sollicitée)
+            expected_owner = self._pending_request_nodes.get(req_id)
+            if expected_owner is not None and expected_owner != node_id:
+                logger.warning(
+                    "Requête confirm_request (%s) refusée : appartient à %s et non à %s.",
+                    req_id,
+                    expected_owner,
+                    node_id,
+                )
+                return
+            if self._pending_request_nodes and expected_owner is None:
+                logger.warning(
+                    "Requête confirm_request (%s) refusée : aucune action en attente pour %s.",
+                    req_id,
+                    node_id,
+                )
+                return
+            if any(rid == req_id and nid != node_id for (nid, rid) in self._pending_confirmations):
+                logger.warning("Requête confirm_request (%s) refusée : collision req_id sur %s.", req_id, node_id)
+                return
+
+            try:
+                raw_exp = message.get("expires_in")
+                expires_in = max(1, min(int(float(raw_exp if raw_exp is not None else 32)), 120))
+            except (ValueError, TypeError, OverflowError):
+                expires_in = 32
+
+            self._pending_confirmations[(node_id, req_id)] = {
                 "node_id": node_id,
                 "req_id": req_id,
-                "action": message.get("action", ""),
-                "summary": message.get("summary", ""),
+                "action": str(message.get("action") or ""),
+                "summary": str(message.get("summary") or ""),
                 "expires_at": time.time() + expires_in,
                 "code_required": bool(message.get("code_required", True)),
             }
@@ -185,9 +228,11 @@ class NodeHub:
             return
 
         elif msg_type == "confirm_cancel":
-            if not req_id:
+            if not req_id or not isinstance(req_id, str):
                 return
-            self._pending_confirmations.pop(req_id, None)
+            removed = self._pending_confirmations.pop((node_id, req_id), None)
+            if removed is None:
+                return
             logger.info("confirm_cancel reçu du nœud %s pour req_id %s", node_id, req_id)
             for cb in self._confirm_cancel_callbacks:
                 try:
@@ -204,6 +249,10 @@ class NodeHub:
 
         # Traitement de la réponse finale à une action
         if req_id and req_id in self._pending_requests:
+            owner = self._pending_request_nodes.get(req_id)
+            if owner is not None and owner != node_id:
+                logger.warning("Réponse ignorée pour req_id %s : reçue de %s au lieu de %s", req_id, node_id, owner)
+                return
             future = self._pending_requests[req_id]
             if not future.done():
                 future.set_result(message)
@@ -214,9 +263,19 @@ class NodeHub:
         req_id: str,
         decision: str,
         code: Optional[str] = None,
+        node_id: Optional[str] = None,
     ) -> bool:
         """Envoie la décision de confirmation (allow ou deny) au nœud client."""
-        conf = self._pending_confirmations.pop(req_id, None)
+        self._purge_expired_confirmations()
+        conf = None
+        if node_id:
+            conf = self._pending_confirmations.pop((node_id, req_id), None)
+        else:
+            for k in list(self._pending_confirmations.keys()):
+                if k[1] == req_id:
+                    conf = self._pending_confirmations.pop(k, None)
+                    break
+
         if not conf:
             logger.warning("confirm_response ignorée : req_id %s introuvable ou déjà traitée", req_id)
             return False
@@ -225,10 +284,10 @@ class NodeHub:
             logger.warning("confirm_response ignorée : req_id %s est expirée", req_id)
             return False
 
-        node_id = conf["node_id"]
-        node = self._nodes.get(node_id)
+        target_node_id = conf["node_id"]
+        node = self._nodes.get(target_node_id)
         if not node:
-            logger.warning("confirm_response ignorée : nœud %s déconnecté", node_id)
+            logger.warning("confirm_response ignorée : nœud %s déconnecté", target_node_id)
             return False
 
         decision_clean = str(decision).strip().lower()
@@ -243,30 +302,41 @@ class NodeHub:
         }
 
         if decision_clean == "allow":
-            # Ne jamais autoriser sans code TOTP valide à 6 chiffres
+            # Ne jamais autoriser sans code TOTP ASCII valide à 6 chiffres
             clean_code = str(code).strip() if code else ""
-            if not clean_code.isdigit() or len(clean_code) != 6:
+            if not re.fullmatch(r"[0-9]{6}", clean_code, flags=re.ASCII):
                 logger.warning("confirm_response 'allow' refusée : code TOTP manquant ou invalide")
                 return False
             payload["code"] = clean_code
 
         try:
-            await node.websocket.send_json(payload)
-            logger.info("confirm_response envoyée avec succès pour req_id %s au nœud %s (decision=%s)", req_id, node_id, decision_clean)
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+
+            if node.loop is not None and node.loop.is_running() and node.loop is not current_loop:
+                fut = asyncio.run_coroutine_threadsafe(node.websocket.send_json(payload), node.loop)
+                await asyncio.wrap_future(fut)
+            else:
+                await node.websocket.send_json(payload)
+            logger.info("confirm_response envoyée avec succès pour req_id %s au nœud %s (decision=%s)", req_id, target_node_id, decision_clean)
             return True
         except Exception as exc:
-            logger.error("Erreur transmission confirm_response au nœud %s : %s", node_id, exc)
+            logger.error("Erreur transmission confirm_response au nœud %s : %s", target_node_id, exc)
             return False
 
-    def get_pending_confirmation(self, req_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def get_pending_confirmation(self, req_id: Optional[str] = None, node_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Retourne la demande de confirmation active correspondante si non expirée."""
-        now = time.time()
-        expired = [rid for rid, c in self._pending_confirmations.items() if now > c["expires_at"]]
-        for rid in expired:
-            self._pending_confirmations.pop(rid, None)
+        self._purge_expired_confirmations()
 
+        if req_id and node_id:
+            return self._pending_confirmations.get((node_id, req_id))
         if req_id:
-            return self._pending_confirmations.get(req_id)
+            for (nid, rid), conf in self._pending_confirmations.items():
+                if rid == req_id:
+                    return conf
+            return None
         if len(self._pending_confirmations) == 1:
             return next(iter(self._pending_confirmations.values()))
         return None
@@ -276,9 +346,22 @@ class NodeHub:
         node_id: Optional[str],
         action: str,
         params: Optional[Dict[str, Any]] = None,
-        timeout: float = 65.0,
+        timeout: float = 80.0,
     ) -> Dict[str, Any]:
         """Envoie une requête d'action au nœud cible et attend la réponse."""
+        if action in ("exec", "write_file"):
+            if not node_id or str(node_id).strip().lower() in ("", "auto", "default", "any"):
+                return {
+                    "success": False,
+                    "error": f"Sécurité : un identifiant de nœud client (node_id) explicite est obligatoire pour l'action '{action}'.",
+                }
+        if action == "exec":
+            if os.getenv("ENABLE_NODE_EXEC", "0").lower() not in ("1", "true", "yes"):
+                return {
+                    "success": False,
+                    "error": "L'exécution distante de commandes (exec) sur les nœuds clients requiert ENABLE_NODE_EXEC=1 côté serveur.",
+                }
+
         node = self.get_node(node_id)
         if not node:
             available = [n["node_id"] for n in self.list_nodes()]
@@ -291,6 +374,7 @@ class NodeHub:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._pending_requests[req_id] = future
+        self._pending_request_nodes[req_id] = node.node_id
 
         payload = {
             "req_id": req_id,
@@ -316,12 +400,14 @@ class NodeHub:
             return {"success": False, "error": str(exc)}
         finally:
             self._pending_requests.pop(req_id, None)
+            self._pending_request_nodes.pop(req_id, None)
+            self._pending_confirmations.pop((node.node_id, req_id), None)
 
     async def exec_cmd(
         self,
         command: str,
         node_id: Optional[str] = None,
-        timeout: float = 60.0,
+        timeout: float = 75.0,
     ) -> Dict[str, Any]:
         """Exécute une commande shell sécurisée sur le nœud distant (node_id explicite requis)."""
         if not node_id or str(node_id).strip().lower() in ("", "auto", "default", "any"):
@@ -345,7 +431,7 @@ class NodeHub:
         self,
         path: str,
         node_id: Optional[str] = None,
-        timeout: float = 65.0,
+        timeout: float = 80.0,
     ) -> Dict[str, Any]:
         """Lit un fichier sur le nœud distant."""
         return await self.send_action(
@@ -360,7 +446,7 @@ class NodeHub:
         path: str,
         content: str,
         node_id: Optional[str] = None,
-        timeout: float = 65.0,
+        timeout: float = 80.0,
     ) -> Dict[str, Any]:
         """Écrit un fichier sur le nœud distant (node_id explicite requis)."""
         if not node_id or str(node_id).strip().lower() in ("", "auto", "default", "any"):

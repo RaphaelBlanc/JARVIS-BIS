@@ -160,10 +160,11 @@ def identifier(value):
     return quote(value,safe='')
 
 
-async def dispatch(op, p, confirmed=False):
+async def dispatch(op, p, confirmed=False, session_key='default'):
     read = {'capabilities','models','session','memory','conversations','usage','conversation.history','services','logs','quick-settings','google.status','google.calendar'}
     write = {'session.update','session.reset','conversation.resume','conversation.delete','memory.add','memory.delete','profile.set','profile.delete','config.update','config.clear','service.restart','notify','noctalia'}
     if op not in read|write: raise ValueError
+    s_key = quote(str(session_key or p.get('session_key') or 'default').strip()[:120], safe=':_-')
     if op in ('google.status','google.calendar'):
         try:
             from gateway import nc_google
@@ -188,15 +189,18 @@ async def dispatch(op, p, confirmed=False):
             import nc_telegram
         return await nc_telegram.diffuser(p.get('text'))
     if op=='capabilities': return schema()
-    paths={'models':'/models','session':'/session','memory':'/memory','conversations':'/conversations?limit=25','usage':'/usage/stats'}
+    if op=='session': return await runner('GET','/session?session_key='+s_key)
+    paths={'models':'/models','memory':'/memory','conversations':'/conversations?limit=25','usage':'/usage/stats'}
     if op in paths: return await runner('GET',paths[op])
     if op=='conversation.history': return await runner('GET','/conversation/'+identifier(p['id'])+'/history')
-    if op=='quick-settings': return await runner('GET','/nc/engines')
+    if op=='quick-settings': return await runner('GET','/nc/engines?session_key='+s_key)
     if op=='session.update':
-        if not p or set(p)-{'engine','model','effort','mode','permission_mode'} or any(not isinstance(v,str) or len(v)>200 for v in p.values()): raise ValueError
-        return await runner('POST','/nc/engine' if 'engine' in p else '/session',p)
-    if op=='session.reset': return await runner('POST','/session/reset')
-    if op=='conversation.resume': return await runner('POST','/conversation/resume',dict(conversation_id=identifier(p['id'])))
+        clean_p = {k: v for k, v in p.items() if k != 'session_key'}
+        if not clean_p or set(clean_p)-{'engine','model','effort','mode','permission_mode'} or any(not isinstance(v,str) or len(v)>200 for v in clean_p.values()): raise ValueError
+        body_p = dict(clean_p, session_key=str(session_key or p.get('session_key') or 'default').strip()[:120])
+        return await runner('POST','/nc/engine' if 'engine' in clean_p else '/session',body_p)
+    if op=='session.reset': return await runner('POST','/session/reset?session_key='+s_key)
+    if op=='conversation.resume': return await runner('POST','/conversation/resume',dict(conversation_id=identifier(p['id']), session_key=str(session_key or p.get('session_key') or 'default').strip()[:120]))
     if op=='conversation.delete': return await runner('DELETE','/conversation/'+identifier(p['id']))
     if op=='memory.add':
         text=p['text']
@@ -211,6 +215,10 @@ async def dispatch(op, p, confirmed=False):
         results=[]
         for unit in UNITS:
             code,text=await command('systemctl','--user','is-active',unit)
+            if code != 0:
+                code_sys, text_sys = await command('systemctl','is-active',unit)
+                if code_sys == 0 or not text.strip():
+                    code, text = code_sys, text_sys
             results.append(dict(unit=unit,active=code==0,state=text.strip() or 'indisponible'))
         return dict(services=results)
     unit=p.get('unit')
@@ -220,6 +228,8 @@ async def dispatch(op, p, confirmed=False):
         return dict(requested=code==0, message='Redémarrage demandé' if code==0 else 'Redémarrage refusé')
     if op=='logs':
         _,text=await command('journalctl','--user','-u',unit,'-n','60','--no-pager','-o','cat')
+        if not text.strip():
+            _,text=await command('journalctl','-u',unit,'-n','60','--no-pager','-o','cat')
         from dotenv import dotenv_values
         for path in (root()/'.env',root()/('gateway' if (root()/'gateway').is_dir() else 'render-gateway')/'.env',root()/'home-runner/.env'):
             for k,v in dotenv_values(path,interpolate=False).items():

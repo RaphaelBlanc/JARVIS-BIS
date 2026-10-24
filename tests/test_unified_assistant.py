@@ -108,6 +108,80 @@ class TestUnifiedAssistant(unittest.IsolatedAsyncioTestCase):
         self.assertIn("claude", nc_engines.ENGINES)
         self.assertIn("opencode", nc_engines.ENGINES)
 
+    async def test_hardware_relay_extended_actions(self):
+        """Vérifie les actions corrigées de HardwareRelay (windows, kill, git_summary, hardware_health)."""
+        relay = HardwareRelay()
+        with patch("core.tools.system_tools.list_hyprland_windows", return_value=[{"workspace": 1, "class": "kitty", "title": "zsh", "pid": 1234}]):
+            ok, msg, _ = await relay.execute("windows")
+            self.assertTrue(ok)
+            self.assertIn("kitty", msg)
+
+        with patch("core.tools.system_tools.terminate_process", new_callable=AsyncMock, return_value=(True, "Processus arrêté")):
+            ok, msg, _ = await relay.execute("kill", {"target": "firefox"})
+            self.assertTrue(ok)
+            self.assertEqual(msg, "Processus arrêté")
+
+        with patch("core.tools.system_tools.check_hardware_health", return_value=([], {"cpu_percent": 12.0})):
+            ok, msg, data = await relay.execute("hardware_health")
+            self.assertTrue(ok)
+            self.assertEqual(data.get("metrics", {}).get("cpu_percent"), 12.0)
+
+    async def test_dispatcher_extended_tools(self):
+        """Vérifie le dispatcher pour focus, ideas et travel."""
+        with patch.dict(os.environ, {"ENABLE_TOOL_FOCUS": "1", "ENABLE_TOOL_IDEAS": "1", "ENABLE_TOOL_TRAVEL": "1"}):
+            res_ideas = await execute_tool_action("ideas", "list")
+            self.assertTrue(res_ideas.get("success"))
+
+            res_focus = await execute_tool_action("focus", "stats")
+            self.assertTrue(res_focus.get("success"))
+
+            res_travel = await execute_tool_action("travel", "plan", {"raw_args": "18h30 Gare Matabiau"})
+            self.assertTrue(res_travel.get("success"))
+
+    async def test_nc_management_session_key_propagation(self):
+        """Vérifie que session_key est bien propagé par nc_management.dispatch."""
+        from gateway.nc_management import dispatch
+        with patch("gateway.nc_management.runner", new_callable=AsyncMock) as mock_runner:
+            mock_runner.return_value = {"status": "updated"}
+            await dispatch("session.update", {"model": "gemini-3.8-flash-high"}, True, session_key="desktop:tour")
+            mock_runner.assert_called_once()
+            _, path, body = mock_runner.call_args[0]
+            self.assertEqual(path, "/session")
+            self.assertEqual(body.get("session_key"), "desktop:tour")
+
+    async def test_agy_stateless_preserves_persistent_worker(self):
+        """Vérifie qu'un appel continue_session=False ne détruit pas le worker persistant actif."""
+        import sys
+        from pathlib import Path
+        runner_dir = str(Path(__file__).resolve().parent.parent / "home-runner")
+        if runner_dir not in sys.path:
+            sys.path.insert(0, runner_dir)
+        import agy_bridge
+
+        class DummyWorker:
+            def __init__(self):
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        dummy = DummyWorker()
+        agy_bridge._WORKERS["desktop:test"] = dummy
+        try:
+            with patch.object(agy_bridge, "_run_agy_oneshot", new_callable=AsyncMock) as mock_oneshot:
+                mock_oneshot.return_value = {"success": True, "output": "ok"}
+                res = await agy_bridge.run_agy(
+                    "Météo Toulouse",
+                    continue_session=False,
+                    reset_session_flag=False,
+                    session_key="desktop:test",
+                )
+                self.assertTrue(res.get("success"))
+                self.assertFalse(dummy.stopped)
+                self.assertIs(agy_bridge._WORKERS.get("desktop:test"), dummy)
+        finally:
+            agy_bridge._WORKERS.pop("desktop:test", None)
+
 
 if __name__ == "__main__":
     unittest.main()

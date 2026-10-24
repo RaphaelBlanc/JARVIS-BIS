@@ -161,8 +161,8 @@ class Engines:
                 except (ValueError, KeyError, TypeError, OSError): pass
         return []  # Ne pas présenter une liste inventée comme celle du compte distant.
 
-    def snapshot(self):
-        return dict(session=self.session(), engines=[dict(id=k,name=v,installed=bool(executable(k)),models=self.models(k),
+    def snapshot(self, session_key='default'):
+        return dict(session=self.session(session_key=session_key), engines=[dict(id=k,name=v,installed=bool(executable(k)),models=self.models(k),
             efforts=(['low','medium','high'] if k=='agy' else ['low','medium','high','xhigh','max'] if k=='claude' else ['low','medium','high','xhigh','max','ultra'] if k=='codex' else [])) for k,v in ENGINES.items()],
             shared_session=True, context_limit=32000)
 
@@ -232,7 +232,13 @@ class Engines:
 
     async def run(self, prompt, timeout=120, model=None, effort=None, mode=None,
                   continue_session=True, reset_session_flag=False, permission_mode=None, **kwargs):
-        def failure(message): return dict(success=False,output='',error=message,session=self.session())
+        session_key = kwargs.get('session_key', 'default')
+        def failure(message): return dict(success=False,output='',error=message,session=self.session(session_key=session_key))
+        engine=self.state['engine']
+        if engine=='agy':
+            # Délègue directement à run_agy qui gère son verrou par session_key et son sémaphore global.
+            return await self.original['run_agy'](prompt=prompt,timeout=timeout,model=model,effort=effort,mode=mode,
+                continue_session=continue_session,reset_session_flag=reset_session_flag,permission_mode=permission_mode, **kwargs)
         if self.lock.locked(): return failure('Une autre requête JARVIS est déjà en cours.')
         async with self.lock:
             engine=self.state['engine']

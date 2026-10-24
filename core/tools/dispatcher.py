@@ -147,24 +147,26 @@ async def execute_tool_action(
             from core.tools import obsidian_bridge
             if action in ("search", "kb"):
                 q = params.get("query", "")
-                results = obsidian_bridge.search_vault(q, max_results=params.get("limit", 5))
+                res_vault = await obsidian_bridge.search_vault(q, limit=int(params.get("limit", 5)))
+                results = res_vault.get("results", [])
                 if not results:
-                    return {"success": True, "message": f"🔍 Aucune note trouvée pour : <i>{q}</i>"}
-                msg = f"🧠 <b>Notes Obsidian trouvées ({len(results)}) :</b>\n\n"
-                for r in results:
-                    msg += f"📄 <b>{r['title']}</b> (<code>{r['folder']}</code>)\n{r.get('preview', '')}\n\n"
-                return {"success": True, "message": msg, "results": results}
+                    return {"success": True, "message": res_vault.get("message", f"🔍 Aucune note trouvée pour : <i>{q}</i>"), "results": []}
+                return {"success": True, "message": res_vault.get("message", ""), "results": results}
 
             elif action in ("note", "create"):
                 text = params.get("text", "")
-                note_file = obsidian_bridge.create_or_append_vault_note(text)
-                return {"success": True, "message": f"📝 Note enregistrée dans : <code>{note_file.name}</code>"}
+                note_res = obsidian_bridge.create_or_append_vault_note(text)
+                return {
+                    "success": True,
+                    "message": note_res.get("message", f"📝 Note enregistrée dans : <code>{note_res.get('rel', '')}</code>"),
+                    "note": note_res,
+                }
 
             elif action in ("overview", "vault"):
                 stats = obsidian_bridge.get_vault_overview()
-                msg = (
+                msg = stats.get("message") or (
                     f"🧠 <b>Statistiques du Coffre Obsidian :</b>\n\n"
-                    f"• <b>Total notes :</b> {stats['total_notes']}\n"
+                    f"• <b>Total notes :</b> {stats.get('total_notes', stats.get('total', 0))}\n"
                     f"• <b>Dossiers :</b> {len(stats.get('folders', {}))}\n"
                 )
                 return {"success": True, "message": msg, "stats": stats}
@@ -173,15 +175,18 @@ async def execute_tool_action(
         elif tool_id == "focus":
             from core.tools import focus_manager
             if action == "start":
-                duration_m = int(params.get("duration", 25))
-                topic = params.get("topic", "Travail")
-                session = focus_manager.parse_focus_input(f"{duration_m}m {topic}")
+                raw_text = params.get("raw_text")
+                if raw_text:
+                    duration_m, topic = focus_manager.parse_focus_input(str(raw_text))
+                else:
+                    duration_m = int(params.get("duration", 25))
+                    topic = params.get("topic", "Travail")
                 msg = f"🎯 <b>Session Focus démarrée !</b>\n• <b>Durée :</b> {duration_m} min\n• <b>Sujet :</b> {topic}"
-                return {"success": True, "message": msg, "session": session}
+                return {"success": True, "message": msg, "session": {"duration": duration_m, "topic": topic}}
 
             elif action == "stats":
                 stats = focus_manager.get_productivity_stats()
-                msg = (
+                msg = stats.get("message") or (
                     f"📊 <b>Statistiques Deep Work :</b>\n\n"
                     f"• <b>Temps total :</b> {stats.get('total_hours', 0):.1f} h\n"
                     f"• <b>Sessions terminées :</b> {stats.get('sessions_count', 0)}\n"
@@ -193,9 +198,12 @@ async def execute_tool_action(
         elif tool_id == "ideas":
             from core.tools import idea_incubator
             if action == "list":
-                ideas = idea_incubator.load_ideas()
-                msg = idea_incubator.format_ideas_list(ideas)
-                return {"success": True, "message": msg, "ideas": ideas}
+                res_ideas = idea_incubator.format_ideas_list()
+                return {
+                    "success": True,
+                    "message": res_ideas.get("message", "Aucune idée.") if isinstance(res_ideas, dict) else str(res_ideas),
+                    "ideas": res_ideas.get("ideas", []) if isinstance(res_ideas, dict) else [],
+                }
 
             elif action == "incubate":
                 raw_text = params.get("text", "")
@@ -232,22 +240,21 @@ async def execute_tool_action(
                 url = params.get("url", "")
                 note = params.get("note", "")
                 res = await universal_inbox.capture_and_enrich_link(url, note)
-                return {"success": True, "message": f"🌐 Lien capturé dans l'Inbox : {url}", "item": res}
+                card = universal_inbox.format_enriched_link_card(res)
+                return {"success": True, "message": card, "item": res}
 
         # ── TRAVEL ADVISOR ───────────────────────────────────────────────────────
         elif tool_id == "travel":
             from core.tools import travel_advisor
             if action == "plan":
-                dest = params.get("destination", "Paris")
-                target_time = params.get("time", "08:00")
-                plan = travel_advisor.calculate_departure_plan(dest, target_time)
-                msg = (
-                    f"🗺️ <b>Trajet vers {dest} :</b>\n\n"
-                    f"• <b>Heure d'arrivée cible :</b> {target_time}\n"
-                    f"• <b>Durée estimée :</b> {plan.get('duration_min', 30)} min (+ {plan.get('margin_min', 10)} min de marge)\n"
-                    f"• <b>Heure de départ conseillée :</b> ⏰ <b>{plan.get('departure_time', '07:20')}</b>"
-                )
-                return {"success": True, "message": msg, "plan": plan}
+                raw_text = params.get("text")
+                if not raw_text:
+                    dest = params.get("destination", "Paris")
+                    target_time = params.get("time", "")
+                    raw_text = f"{dest} à {target_time}" if target_time else dest
+                parsed = travel_advisor.parse_depart_request(str(raw_text)) or {"destination": str(raw_text), "target_time": None}
+                plan = travel_advisor.calculate_departure_plan(parsed)
+                return {"success": True, "message": plan.get("message", ""), "plan": plan}
 
         # ── SECURITY PIN ─────────────────────────────────────────────────────────
         elif tool_id == "security_pin":
