@@ -1311,7 +1311,7 @@ async def mode_slash(interaction: discord.Interaction, mode: app_commands.Choice
 @app_commands.command(name="permissions", description="Politique de permissions des outils sensibles")
 @app_commands.describe(policy="Choisissez la politique de permissions")
 @app_commands.choices(policy=[
-    app_commands.Choice(name="always-proceed (Exécution automatique sans confirmation)", value="always-proceed"),
+    app_commands.Choice(name="default (Mode standard)", value="default"),
     app_commands.Choice(name="request-review (Demande confirmation avant actions)", value="request-review"),
 ])
 async def permissions_slash(interaction: discord.Interaction, policy: app_commands.Choice[str]) -> None:
@@ -1377,7 +1377,7 @@ async def session_slash(interaction: discord.Interaction) -> None:
         f"• **Modèle :** `{s.get('model', 'défaut')}`\n"
         f"• **Effort :** `{s.get('effort') or 'par défaut'}`\n"
         f"• **Mode :** `{s.get('mode') or 'auto'}`\n"
-        f"• **Permissions :** `{s.get('permission_mode', 'always-proceed')}`\n"
+        f"• **Permissions :** `{s.get('permission_mode', 'default')}`\n"
         f"• **Conversation active :** `{'Oui' if s.get('has_active_session') else 'Non (vierge)'}`"
     )
     await interaction.response.send_message(text)
@@ -1534,15 +1534,15 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
         await update_session_remote(mode=mode_val.lower())
         await ctx.send(f"✅ Mode d'exécution réglé sur : `{mode_val.lower()}`")
 
-    @bot.command(name="permissions", help="Règle la politique de permissions (always-proceed|request-review)")
+    @bot.command(name="permissions", help="Règle la politique de permissions (default|request-review)")
     async def perms_cmd(ctx: commands.Context, *, perm_val: str = "") -> None:
         if not _is_allowed(ctx.author.id):
             return
-        valid = ["always-proceed", "request-review"]
+        valid = ["default", "request-review", "plan", "ask", "auto_edit", "auto"]
         if not perm_val or perm_val.lower() not in valid:
-            await ctx.send(f"⚠️ Spécifiez : `{', '.join(valid)}`. Ex: `!permissions always-proceed`")
+            await ctx.send(f"⚠️ Spécifiez : `{', '.join(valid)}`. Ex: `!permissions default`")
             return
-        await update_session_remote(permission_mode=perm_val.lower())
+        await update_session_remote(permission_mode=perm_val.lower(), session_key=f"discord:{ctx.author.id}")
         await ctx.send(f"✅ Politique de permissions : `{perm_val.lower()}`")
 
     @bot.command(name="new", aliases=["clear", "reset"], help="Démarre une nouvelle conversation vierge (vide le salon)")
@@ -1565,13 +1565,13 @@ def _register_prefix_commands(bot: AssistantBot) -> None:
     async def session_cmd(ctx: commands.Context) -> None:
         if not _is_allowed(ctx.author.id):
             return
-        s = await fetch_session()
+        s = await fetch_session(session_key=f"discord:{ctx.author.id}")
         text = (
             "⚙️ **Configuration de la session :**\n"
             f"• **Modèle :** `{s.get('model', 'défaut')}`\n"
             f"• **Effort :** `{s.get('effort') or 'par défaut'}`\n"
             f"• **Mode :** `{s.get('mode') or 'auto'}`\n"
-            f"• **Permissions :** `{s.get('permission_mode', 'always-proceed')}`\n"
+            f"• **Permissions :** `{s.get('permission_mode', 'default')}`\n"
             f"• **Conversation active :** `{'Oui' if s.get('has_active_session') else 'Non (vierge)'}`"
         )
         await ctx.send(text)

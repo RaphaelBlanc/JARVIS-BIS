@@ -623,15 +623,17 @@ async def cmd_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     args = context.args
-    valid = ["always-proceed", "request-review"]
+    valid = ["default", "request-review", "plan", "ask", "auto_edit", "auto"]
+    chat_id = update.effective_chat.id if update.effective_chat else user.id
+    target_sk = f"telegram:{chat_id}"
 
     if not args or args[0].lower() not in valid:
         keyboard = [
             [
-                InlineKeyboardButton("✅ Auto (Always Proceed)", callback_data="perm:always-proceed"),
+                InlineKeyboardButton("🛡️ Standard (Default)", callback_data="perm:default"),
             ],
             [
-                InlineKeyboardButton("🛡️ Demander confirmation (Request Review)", callback_data="perm:request-review"),
+                InlineKeyboardButton("🔍 Demander confirmation (Request Review)", callback_data="perm:request-review"),
             ],
         ]
         await update.message.reply_text(
@@ -642,7 +644,7 @@ async def cmd_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     perm_val = args[0].lower()
-    await update_session_remote(permission_mode=perm_val)
+    await update_session_remote(permission_mode=perm_val, session_key=target_sk)
     await update.message.reply_text(f"✅ Politique de permissions : `{perm_val}`", parse_mode="Markdown")
 
 
@@ -1300,7 +1302,7 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"• *Modèle :* `{s.get('model', 'défaut')}`\n"
         f"• *Effort de réflexion :* `{s.get('effort') or 'par défaut'}`\n"
         f"• *Mode d'exécution :* `{s.get('mode') or 'auto'}`\n"
-        f"• *Permissions :* `{s.get('permission_mode', 'always-proceed')}`\n"
+        f"• *Permissions :* `{s.get('permission_mode', 'default')}`\n"
         f"• *Conversation en cours :* `{'Oui' if s.get('has_active_session') else 'Non (vierge)'}`"
     )
     try:

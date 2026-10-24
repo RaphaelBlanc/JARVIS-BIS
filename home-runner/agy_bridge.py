@@ -73,7 +73,6 @@ def _default_session() -> dict:
         "mode": None,
         "has_active_session": False,
         "conversation_id": None,
-        "session_token": secrets.token_hex(16),
         "permission_mode": "default",  # default | request-review | plan | ask | auto_edit | auto
         "turns": 0,
     }
@@ -114,18 +113,12 @@ def active_origin_token_scope(token: Optional[str], session_key: str = "default"
         return
     d = _origin_runtime_dir()
     target = _origin_token_file(d, session_key)
-    legacy = d / "active_token"
     tmp = d / f"active_token.{secrets.token_hex(6)}.tmp"
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(clean)
         os.replace(str(tmp), str(target))
-        # Rétrocompatibilité avec les outils lisant encore le chemin historique
-        with contextlib.suppress(OSError):
-            if not legacy.exists():
-                legacy.write_text(clean, encoding="utf-8")
-                os.chmod(str(legacy), 0o600)
     except OSError:
         with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
@@ -134,19 +127,14 @@ def active_origin_token_scope(token: Optional[str], session_key: str = "default"
     finally:
         with contextlib.suppress(OSError):
             target.unlink(missing_ok=True)
-            if legacy.exists() and legacy.read_text(encoding="utf-8").strip() == clean:
-                legacy.unlink(missing_ok=True)
 
 
 def _public_session(cfg: dict, include_secret: bool = False) -> dict:
-    d = dict(cfg)
-    if not include_secret:
-        d.pop("session_token", None)
-    return d
+    return dict(cfg)
 
 
 def _get_session(session_key: str = "default") -> dict:
-    key = (session_key or "default").strip()[:120] or "default"
+    key = (session_key or "default").strip()[:180] or "default"
     if key not in _SESSIONS:
         if len(_SESSIONS) >= _MAX_SESSIONS:
             for old_key in list(_SESSIONS.keys()):
@@ -155,29 +143,17 @@ def _get_session(session_key: str = "default") -> dict:
                     _SESSION_LOCKS.pop(old_key, None)
                     break
         _SESSIONS[key] = _default_session()
-    elif not _SESSIONS[key].get("session_token") or len(str(_SESSIONS[key].get("session_token"))) < 32:
-        _SESSIONS[key]["session_token"] = secrets.token_hex(16)
     return _SESSIONS[key]
 
 
 def get_or_set_origin_token(session_key: str = "default", token: Optional[str] = None) -> str:
-    """Retourne ou synchronise le jeton secret 128 bits d'une session (usage interne runner/gateway)."""
-    cfg = _get_session(session_key)
-    clean = (token or "").strip()
-    if len(clean) >= 32 and len(clean) <= 128:
-        cfg["session_token"] = clean
-    return str(cfg["session_token"])
+    """Aucun jeton persistant n'est conservé côté runner (transmis par requête via X-Jarvis-Origin-Token)."""
+    return ""
 
 
 def rotate_origin_token(session_key: str = "default") -> str:
-    """Fait tourner le jeton secret 128 bits d'une session (ou de toutes les sessions)."""
-    if (session_key or "").strip() == "all":
-        for s in _SESSIONS.values():
-            s["session_token"] = secrets.token_hex(16)
-        return str(_get_session("default")["session_token"])
-    cfg = _get_session(session_key)
-    cfg["session_token"] = secrets.token_hex(16)
-    return str(cfg["session_token"])
+    """Aucun jeton persistant n'est conservé côté runner (rotation gérée par le Gateway)."""
+    return ""
 
 
 SESSION_CONFIG = _get_session("default")
@@ -232,7 +208,7 @@ def _normalize_model_effort(
 
 
 def get_session_info(session_key: str = "default", include_secret: bool = False) -> dict:
-    """Retourne la configuration actuelle de la session spécifiée (sans session_token par défaut)."""
+    """Retourne la configuration actuelle de la session spécifiée."""
     return _public_session(_get_session(session_key), include_secret=include_secret)
 
 
@@ -274,13 +250,11 @@ def reset_session(session_key: str = "default") -> dict:
             s = _SESSIONS[k]
             s["has_active_session"] = False
             s["conversation_id"] = None
-            s["session_token"] = secrets.token_hex(16)
             s["turns"] = 0
         return _public_session(_get_session("default"))
     cfg = _get_session(session_key)
     cfg["has_active_session"] = False
     cfg["conversation_id"] = None
-    cfg["session_token"] = secrets.token_hex(16)
     cfg["turns"] = 0
     return _public_session(cfg)
 
@@ -477,7 +451,6 @@ def resume_conversation(conv_id: str, session_key: str = "default") -> dict:
     cfg = _get_session(session_key)
     cfg["conversation_id"] = clean_id
     cfg["has_active_session"] = True
-    cfg["session_token"] = secrets.token_hex(16)
     cfg["turns"] = 0
     history = get_conversation_history(clean_id)
     return {
@@ -568,7 +541,6 @@ def delete_conversation(conv_id: str) -> dict:
     try:
         shutil.rmtree(target_dir)
         for s_key, s_cfg in list(_SESSIONS.items()):
-            s_cfg["session_token"] = secrets.token_hex(16)
             if s_cfg.get("conversation_id") == clean_id:
                 reset_session(s_key)
         logger.info("Conversation %s supprimée avec succès.", clean_id)
@@ -643,7 +615,6 @@ class _AgyStreamWorker:
         conversation_id: Optional[str],
         has_active_session: bool,
         session_key: str = "default",
-        session_token: str = "",
     ) -> None:
         self.agy_path = agy_path
         self.model = model
@@ -654,7 +625,6 @@ class _AgyStreamWorker:
         self.conversation_id = conversation_id
         self.has_active_session = has_active_session
         self.session_key = session_key
-        self.session_token = session_token
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._stderr_tail: deque[str] = deque(maxlen=40)
@@ -667,7 +637,6 @@ class _AgyStreamWorker:
         effort: Optional[str],
         mode: Optional[str],
         permission_mode: Optional[str],
-        session_token: Optional[str] = None,
     ) -> bool:
         """Indique si le worker peut servir la configuration demandée."""
         return (
@@ -675,7 +644,6 @@ class _AgyStreamWorker:
             and self.effort == effort
             and self.mode == mode
             and self.permission_mode == permission_mode
-            and (session_token is None or self.session_token == session_token)
         )
 
     def is_alive(self) -> bool:
@@ -881,7 +849,7 @@ _WATCHDOG_TASK: Optional[asyncio.Task] = None
 
 
 def _get_session_lock(session_key: str = "default") -> asyncio.Lock:
-    key = (session_key or "default").strip()[:120] or "default"
+    key = (session_key or "default").strip()[:180] or "default"
     if key not in _SESSION_LOCKS:
         if len(_SESSION_LOCKS) >= _MAX_SESSIONS:
             for old_key, old_lock in list(_SESSION_LOCKS.items()):
@@ -991,6 +959,7 @@ async def _run_agy_oneshot(
     permission_mode: Optional[str] = None,
     update_session: bool = True,
     session_key: str = "default",
+    origin_token: Optional[str] = None,
 ) -> dict:
     """
     Lance `agy` en subprocess non-interactif (-p / --print) avec support de continuité conversationnelle.
@@ -1008,7 +977,6 @@ async def _run_agy_oneshot(
     if reset_session_flag:
         cfg["has_active_session"] = False
         cfg["conversation_id"] = None
-        cfg["session_token"] = secrets.token_hex(16)
 
     # Construction des arguments agy
     cmd = [agy_path, *_sandbox_args()]
@@ -1037,9 +1005,10 @@ async def _run_agy_oneshot(
     if active_mode:
         cmd.extend(["--mode", active_mode])
 
-    # Permissions
-    perm = permission_mode or cfg.get("permission_mode", "default")
-    if perm and perm != "default":
+    # Permissions strictement validées contre _ALLOWED_PERMISSION_MODES
+    raw_perm = (permission_mode or cfg.get("permission_mode") or "default").strip().lower()
+    perm = raw_perm if raw_perm in _ALLOWED_PERMISSION_MODES else "default"
+    if perm != "default":
         cmd.extend(["--permission-mode", perm])
 
     # Prompt et format
@@ -1060,7 +1029,7 @@ async def _run_agy_oneshot(
 
     proc: Optional[asyncio.subprocess.Process] = None
     try:
-        with active_origin_token_scope(str(cfg.get("session_token") or ""), session_key):
+        with active_origin_token_scope(origin_token, session_key):
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -1139,6 +1108,7 @@ async def _run_agy_persistent(
     reset_session_flag: bool,
     permission_mode: Optional[str],
     session_key: str = "default",
+    origin_token: Optional[str] = None,
 ) -> dict:
     """Exécute un tour via le worker stream-json persistant associé à la session."""
     cfg = _get_session(session_key)
@@ -1155,7 +1125,6 @@ async def _run_agy_persistent(
         await _stop_worker(session_key)
         cfg["has_active_session"] = False
         cfg["conversation_id"] = None
-        cfg["session_token"] = secrets.token_hex(16)
 
     active_model = model or cfg.get("model")
     active_effort = effort or cfg.get("effort") or "low"
@@ -1163,9 +1132,8 @@ async def _run_agy_persistent(
         active_model, active_effort
     )
     active_mode = mode or cfg.get("mode")
-    active_perm = permission_mode or cfg.get(
-        "permission_mode", "always-proceed"
-    )
+    raw_perm = (permission_mode or cfg.get("permission_mode") or "default").strip().lower()
+    active_perm = raw_perm if raw_perm in _ALLOWED_PERMISSION_MODES else "default"
 
     is_slash = prompt.lstrip().startswith("/")
     if not continue_session or is_slash:
@@ -1181,9 +1149,10 @@ async def _run_agy_persistent(
             mode=mode,
             continue_session=continue_session,
             reset_session_flag=False,
-            permission_mode=permission_mode,
+            permission_mode=active_perm,
             update_session=continue_session,
             session_key=session_key,
+            origin_token=origin_token,
         )
 
     worker = _WORKERS.get(session_key)
@@ -1200,7 +1169,6 @@ async def _run_agy_persistent(
         active_effort,
         active_mode,
         active_perm,
-        session_token=cfg.get("session_token"),
     ):
         await _stop_worker(session_key)
         worker = None
@@ -1226,7 +1194,6 @@ async def _run_agy_persistent(
             conversation_id=cfg.get("conversation_id"),
             has_active_session=cfg.get("has_active_session", False),
             session_key=session_key,
-            session_token=str(cfg.get("session_token") or ""),
         )
         try:
             await worker.start()
@@ -1253,7 +1220,7 @@ async def _run_agy_persistent(
         _ensure_watchdog()
 
     try:
-        with active_origin_token_scope(str(cfg.get("session_token") or ""), session_key):
+        with active_origin_token_scope(origin_token, session_key):
             result = await worker.send(prompt, timeout)
     except asyncio.TimeoutError:
         logger.error("Worker agy [%s] : timeout de %ds dépassé.", session_key, timeout)
@@ -1316,6 +1283,7 @@ async def run_agy(
     reset_session_flag: bool = False,
     permission_mode: Optional[str] = None,
     session_key: str = "default",
+    origin_token: Optional[str] = None,
 ) -> dict:
     """Exécute agy pour la session demandée.
 
@@ -1323,7 +1291,7 @@ async def run_agy(
     Un sémaphore global (2 requêtes max) empêche de surcharger le processeur
     tout en permettant à plusieurs machines de converser simultanément.
     """
-    key = (session_key or "default").strip()
+    key = (session_key or "default").strip()[:180] or "default"
     if not continue_session and not reset_session_flag:
         async with _GLOBAL_SEMAPHORE:
             return await _run_agy_oneshot(
@@ -1337,6 +1305,7 @@ async def run_agy(
                 permission_mode=permission_mode,
                 update_session=False,
                 session_key=key,
+                origin_token=origin_token,
             )
 
     session_lock = _get_session_lock(key)
@@ -1364,6 +1333,7 @@ async def run_agy(
                     reset_session_flag=reset_session_flag,
                     permission_mode=permission_mode,
                     session_key=key,
+                    origin_token=origin_token,
                 )
             return await _run_agy_oneshot(
                 prompt=prompt,
@@ -1376,6 +1346,7 @@ async def run_agy(
                 permission_mode=permission_mode,
                 update_session=continue_session,
                 session_key=key,
+                origin_token=origin_token,
             )
     finally:
         session_lock.release()

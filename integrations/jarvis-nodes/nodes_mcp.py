@@ -53,7 +53,9 @@ def _get_secret_key() -> str:
 def _read_origin_token() -> str:
     """Lit le jeton d'origine secret (128 bits) depuis le fichier d'exécution 0600 dédié à la session."""
     session_key = (os.environ.get("JARVIS_SESSION_KEY") or "").strip()
-    key_hash = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:24] if session_key else ""
+    if not session_key:
+        return ""
+    key_hash = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:24]
 
     candidates = []
     base_dirs = []
@@ -63,9 +65,7 @@ def _read_origin_token() -> str:
     base_dirs.append(Path(f"/tmp/jarvis-origin-{os.getuid()}"))
 
     for d in base_dirs:
-        if key_hash:
-            candidates.append(d / f"active_token_{key_hash}")
-        candidates.append(d / "active_token")
+        candidates.append(d / f"active_token_{key_hash}")
 
     for p in candidates:
         try:

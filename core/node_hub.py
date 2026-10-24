@@ -121,9 +121,9 @@ class NodeHub:
         self._session_update_callbacks: List[Callable[[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]], Any]] = []
         self._conversation_tokens: Dict[str, str] = {}
         self._token_to_session_key: Dict[str, str] = {}
-        _raw_sk = os.getenv("GATEWAY_ORIGIN_KEY") or os.getenv("SECRET_KEY") or ""
-        if _raw_sk:
-            self._hmac_key: bytes = hashlib.sha256(_raw_sk.encode("utf-8") + b":jarvis-gateway-origin-salt-v1").digest()
+        origin_secret = os.getenv("GATEWAY_ORIGIN_KEY")
+        if origin_secret:
+            self._hmac_key: bytes = hashlib.sha256(origin_secret.encode("utf-8")).digest()
         else:
             self._hmac_key: bytes = secrets.token_bytes(32)
         self._active_sessions: Dict[str, Dict[str, Any]] = {}
@@ -144,7 +144,7 @@ class NodeHub:
 
     def get_conversation_token(self, session_key: str) -> str:
         """Retourne le secret de conversation (128 bits) pour session_key (le crée si absent)."""
-        key = (session_key or "default").strip()[:120] or "default"
+        key = (session_key or "default").strip()[:180] or "default"
         token = self._conversation_tokens.get(key)
         if not token:
             self._evict_oldest_token_if_needed()
@@ -155,8 +155,8 @@ class NodeHub:
 
     def set_conversation_token(self, session_key: str, token: str) -> str:
         """Synchronise le secret de conversation avec celui du runner."""
-        key = (session_key or "default").strip()[:120] or "default"
-        clean_token = str(token).strip()[:128]
+        key = (session_key or "default").strip()[:180] or "default"
+        clean_token = str(token).strip()[:180]
         if clean_token:
             prev = self._conversation_tokens.get(key)
             if prev and prev != clean_token:
@@ -173,7 +173,7 @@ class NodeHub:
             self._conversation_tokens.clear()
             self._token_to_session_key.clear()
             return secrets.token_hex(16)
-        key = session_key.strip()[:120] or "default"
+        key = session_key.strip()[:180] or "default"
         prev = self._conversation_tokens.get(key)
         if prev:
             self._token_to_session_key.pop(prev, None)
@@ -183,6 +183,10 @@ class NodeHub:
         self._conversation_tokens[key] = new_token
         self._token_to_session_key[new_token] = key
         return new_token
+
+    def get_origin_for_session(self, session_key: str) -> Optional[Dict[str, Any]]:
+        """Retourne l'origine (via, chat, conversation) liée à session_key."""
+        return self.build_origin(session_key=session_key)
 
     def resolve_origin_from_token(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
         """Résout un en-tête secret X-Jarvis-Origin-Token (≥ 128 bits) en origin (via, chat, HMAC(token)).

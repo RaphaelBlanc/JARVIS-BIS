@@ -857,12 +857,10 @@ async def node_websocket_endpoint(websocket: WebSocket):
 )
 async def api_stream(
     prompt: str,
-    secret_key: Optional[str] = None,
     x_secret_key: Optional[str] = Header(default=None, alias="X-Secret-Key"),
 ):
     """Fournit un flux Server-Sent Events (SSE) pour afficher les réponses en temps réel."""
-    auth_key = x_secret_key or secret_key
-    if not SECRET_KEY or not auth_key or not hmac.compare_digest(auth_key, SECRET_KEY):
+    if not SECRET_KEY or not x_secret_key or not hmac.compare_digest(x_secret_key, SECRET_KEY):
         raise HTTPException(status_code=401, detail="Clé API invalide")
 
     async def event_generator():

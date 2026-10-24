@@ -680,25 +680,16 @@ class TestTrustSessionOrigin(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(normalize_origin({"via": "telegram", "chat": 123}))
         self.assertIsNone(normalize_origin({"via": "", "chat": 123, "conversation": "abc"}))
 
-    def test_agy_bridge_session_token_rotation(self):
+    def test_agy_bridge_no_persistent_token_stored(self):
         from agy_bridge import resume_conversation, get_or_set_origin_token, rotate_origin_token
 
-        tok1 = get_or_set_origin_token("desktop:laptop")
-        self.assertTrue(tok1)
-        self.assertTrue(len(tok1) >= 32)
+        # Le runner ne conserve aucun jeton d'origine persistant
+        self.assertEqual(get_or_set_origin_token("desktop:laptop"), "")
+        self.assertEqual(rotate_origin_token("desktop:laptop"), "")
 
-        # Même token tant que la session n'est pas réinitialisée
-        self.assertEqual(get_or_set_origin_token("desktop:laptop"), tok1)
-
-        # Rotation du secret
-        tok2 = rotate_origin_token("desktop:laptop")
-        self.assertNotEqual(tok2, tok1)
-
-        # Rotation sur resume_conversation
+        # Sur resume_conversation, aucun session_token n'est injecté
         resumed = resume_conversation("conv-abc-12345", session_key="desktop:laptop")
-        tok3 = get_or_set_origin_token("desktop:laptop")
-        self.assertNotEqual(tok3, tok2)
-        # Vérifie que le session_token n'est pas exposé dans la réponse publique de session
+        self.assertEqual(get_or_set_origin_token("desktop:laptop"), "")
         self.assertNotIn("session_token", resumed["session"])
 
     async def test_exec_forwards_origin_and_tracks_active_session_and_session_end(self):
