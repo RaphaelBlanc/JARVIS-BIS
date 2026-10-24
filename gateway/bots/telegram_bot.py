@@ -1964,7 +1964,9 @@ async def _process_prompt_and_reply(update: Update, prompt: str, waiting_msg) ->
     if await _try_create_natural_reminder(update, prompt, waiting_msg):
         return
 
-    session_key = f"telegram:{user.id}"
+    user = update.effective_user
+    user_id = user.id if user else (update.effective_chat.id if update.effective_chat else "unknown")
+    session_key = f"telegram:{user_id}"
     result = await forward_to_runner(prompt, continue_session=True, session_key=session_key)
 
     if result.get("success"):
