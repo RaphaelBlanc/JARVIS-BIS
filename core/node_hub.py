@@ -153,12 +153,6 @@ class NodeHub:
         msg_type = message.get("type")
         req_id = message.get("req_id")
 
-        if req_id and req_id in self._pending_requests:
-            future = self._pending_requests[req_id]
-            if not future.done():
-                future.set_result(message)
-            return
-
         if msg_type == "confirm_request":
             if not req_id:
                 return
@@ -206,6 +200,14 @@ class NodeHub:
 
         if msg_type == "ping":
             logger.debug("Ping reçu du nœud %s", node_id)
+            return
+
+        # Traitement de la réponse finale à une action
+        if req_id and req_id in self._pending_requests:
+            future = self._pending_requests[req_id]
+            if not future.done():
+                future.set_result(message)
+            return
 
     async def send_confirm_response(
         self,

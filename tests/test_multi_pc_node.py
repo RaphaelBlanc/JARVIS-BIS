@@ -447,6 +447,51 @@ class TestRemoteConfirmRelay(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(canceled_req)
         self.assertIsNone(self.hub.get_pending_confirmation("req_cancel_1"))
 
+    async def test_full_action_flow_with_confirm_request_then_response(self):
+        confirm_seen = False
+
+        def on_confirm(node_id, msg):
+            nonlocal confirm_seen
+            confirm_seen = True
+
+        self.hub.on_confirm_request(on_confirm)
+
+        async def fake_node_behavior():
+            await asyncio.sleep(0.02)
+            self.assertEqual(len(self.ws.sent_messages), 1)
+            action_msg = self.ws.sent_messages[0]
+            req_id = action_msg["req_id"]
+
+            # 1. Le nœud émet confirm_request
+            self.hub.handle_incoming_message("pc-remote", {
+                "type": "confirm_request",
+                "req_id": req_id,
+                "action": "exec",
+                "summary": "lancer discord",
+                "expires_in": 30,
+                "code_required": True,
+            })
+
+            self.assertTrue(confirm_seen)
+
+            # 2. Le serveur autorise avec le code TOTP
+            ok = await self.hub.send_confirm_response(req_id, decision="allow", code="123456")
+            self.assertTrue(ok)
+
+            # 3. Le nœud exécute et envoie la réponse finale
+            self.hub.handle_incoming_message("pc-remote", {
+                "type": "response",
+                "req_id": req_id,
+                "success": True,
+                "stdout": "discord launched",
+            })
+
+        asyncio.create_task(fake_node_behavior())
+
+        res = await self.hub.send_action("pc-remote", "exec", {"command": "discord"}, timeout=2.0)
+        self.assertTrue(res.get("success"))
+        self.assertEqual(res.get("stdout"), "discord launched")
+
 
 class TestHardwareRelaySecurity(unittest.TestCase):
     """Vérifie la sanitisation des chemins et le nettoyage des temporaires."""
