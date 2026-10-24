@@ -270,9 +270,9 @@ class Engines:
             try:
                 args=commande(engine,path,model if model is not None else settings.get('model',''),effort if effort is not None else settings.get('effort',''))
                 tok = self.up.get_or_set_origin_token(session_key) if hasattr(self.up, 'get_or_set_origin_token') else ''
-                scope = self.up.active_origin_token_scope(tok) if hasattr(self.up, 'active_origin_token_scope') else contextlib.nullcontext()
+                scope = self.up.active_origin_token_scope(tok, session_key) if hasattr(self.up, 'active_origin_token_scope') else contextlib.nullcontext()
                 with scope:
-                    code,out=await process(args,full,timeout,self.path.parent)
+                    code,out=await process(args,full,timeout,self.path.parent,env_extra={'JARVIS_SESSION_KEY': session_key})
                 if code: return failure(ENGINES[engine]+' a échoué (code '+str(code)+'). Vérifie son authentification et le modèle sur le runner.')
                 answer=reponse(engine,out)
                 if continue_session:

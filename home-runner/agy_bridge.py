@@ -8,6 +8,7 @@ capture stdout/stderr et retourne un dict structuré.
 import asyncio
 import contextlib
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -73,13 +74,13 @@ def _default_session() -> dict:
         "has_active_session": False,
         "conversation_id": None,
         "session_token": secrets.token_hex(16),
-        "permission_mode": "always-proceed",  # always-proceed | request-review
+        "permission_mode": "default",  # default | request-review | plan | ask | auto_edit | auto
         "turns": 0,
     }
 
 _MAX_SESSIONS = 64
 _ALLOWED_PERMISSION_MODES = frozenset({
-    "always-proceed", "request-review", "default", "auto_edit", "yolo", "ask", "bypass", "plan", "auto"
+    "default", "request-review", "plan", "ask", "auto_edit", "auto"
 })
 _SESSIONS: dict[str, dict] = {}
 
@@ -96,9 +97,15 @@ def _origin_runtime_dir() -> Path:
     return d
 
 
+def _origin_token_file(d: Path, session_key: str = "default") -> Path:
+    sk = (session_key or "default").strip()
+    h = hashlib.sha256(sk.encode("utf-8")).hexdigest()[:24]
+    return d / f"active_token_{h}"
+
+
 @contextlib.contextmanager
-def active_origin_token_scope(token: Optional[str]):
-    """Expose temporairement le jeton d'origine 128 bits dans un fichier 0600 (hors variables d'environnement)
+def active_origin_token_scope(token: Optional[str], session_key: str = "default"):
+    """Expose temporairement le jeton d'origine 128 bits dans un fichier 0600 dédié à la session
     uniquement pendant l'exécution d'un tour actif, puis le supprime immédiatement.
     """
     clean = (token or "").strip()
@@ -106,13 +113,19 @@ def active_origin_token_scope(token: Optional[str]):
         yield
         return
     d = _origin_runtime_dir()
-    target = d / "active_token"
+    target = _origin_token_file(d, session_key)
+    legacy = d / "active_token"
     tmp = d / f"active_token.{secrets.token_hex(6)}.tmp"
     try:
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(clean)
         os.replace(str(tmp), str(target))
+        # Rétrocompatibilité avec les outils lisant encore le chemin historique
+        with contextlib.suppress(OSError):
+            if not legacy.exists():
+                legacy.write_text(clean, encoding="utf-8")
+                os.chmod(str(legacy), 0o600)
     except OSError:
         with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
@@ -121,6 +134,8 @@ def active_origin_token_scope(token: Optional[str]):
     finally:
         with contextlib.suppress(OSError):
             target.unlink(missing_ok=True)
+            if legacy.exists() and legacy.read_text(encoding="utf-8").strip() == clean:
+                legacy.unlink(missing_ok=True)
 
 
 def _public_session(cfg: dict, include_secret: bool = False) -> dict:
@@ -742,8 +757,8 @@ class _AgyStreamWorker:
             cmd.extend(["--effort", self.effort])
         if self.mode:
             cmd.extend(["--mode", self.mode])
-        if self.permission_mode == "always-proceed":
-            cmd.append("--dangerously-skip-permissions")
+        if self.permission_mode and self.permission_mode != "default":
+            cmd.extend(["--permission-mode", self.permission_mode])
 
         env = {
             **os.environ,
@@ -752,7 +767,7 @@ class _AgyStreamWorker:
             "FORCE_COLOR": "0",
             "COLORTERM": "",
         }
-        env.pop("JARVIS_SESSION_KEY", None)
+        env["JARVIS_SESSION_KEY"] = self.session_key
         env.pop("JARVIS_SESSION_TOKEN", None)
 
         logger.info(
@@ -1023,14 +1038,14 @@ async def _run_agy_oneshot(
         cmd.extend(["--mode", active_mode])
 
     # Permissions
-    perm = permission_mode or cfg.get("permission_mode", "always-proceed")
-    if perm == "always-proceed":
-        cmd.append("--dangerously-skip-permissions")
+    perm = permission_mode or cfg.get("permission_mode", "default")
+    if perm and perm != "default":
+        cmd.extend(["--permission-mode", perm])
 
     # Prompt et format
     cmd.extend(["-p", prompt, "--output-format", "text"])
 
-    # Environnement épuré (aucun jeton de session dans l'environnement du processus)
+    # Environnement épuré (aucun jeton secret de session dans l'environnement du processus)
     env = {
         **os.environ,
         "TERM": "dumb",
@@ -1038,14 +1053,14 @@ async def _run_agy_oneshot(
         "FORCE_COLOR": "0",
         "COLORTERM": "",
     }
-    env.pop("JARVIS_SESSION_KEY", None)
+    env["JARVIS_SESSION_KEY"] = session_key
     env.pop("JARVIS_SESSION_TOKEN", None)
 
     logger.info("Exécution agy [%s]: %s (timeout=%ds)", session_key, " ".join(cmd[:6]), timeout)
 
     proc: Optional[asyncio.subprocess.Process] = None
     try:
-        with active_origin_token_scope(str(cfg.get("session_token") or "")):
+        with active_origin_token_scope(str(cfg.get("session_token") or ""), session_key):
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -1238,7 +1253,7 @@ async def _run_agy_persistent(
         _ensure_watchdog()
 
     try:
-        with active_origin_token_scope(str(cfg.get("session_token") or "")):
+        with active_origin_token_scope(str(cfg.get("session_token") or ""), session_key):
             result = await worker.send(prompt, timeout)
     except asyncio.TimeoutError:
         logger.error("Worker agy [%s] : timeout de %ds dépassé.", session_key, timeout)

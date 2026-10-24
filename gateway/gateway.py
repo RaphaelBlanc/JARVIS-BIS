@@ -97,7 +97,8 @@ async def forward_to_runner(
         try:
             from core.node_hub import NODE_HUB
             NODE_HUB.rotate_conversation_token(eff_key)
-            await NODE_HUB.send_session_end()
+            origin = NODE_HUB.get_origin_for_session(eff_key)
+            await NODE_HUB.send_session_end(origin=origin)
         except Exception:
             pass
 

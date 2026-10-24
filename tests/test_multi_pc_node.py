@@ -747,10 +747,10 @@ class TestTrustSessionOrigin(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.hub.get_active_session("tour"))
         self.assertIsNone(updates[-1][1])
 
-    async def test_distinct_sessions_per_machine_and_cross_pc_totp_prompt(self):
+    async def test_distinct_sessions_per_machine_and_remote_confirm(self):
         origin_tour = self.hub.build_origin(session_key="desktop:tour")
 
-        async def fake_laptop_screenshot_with_cross_pc_totp():
+        async def fake_laptop_screenshot_with_remote_confirm():
             await asyncio.sleep(0.02)
             action_msg = self.ws_laptop.sent_messages[-1]
             req_id = action_msg["req_id"]
@@ -768,27 +768,18 @@ class TestTrustSessionOrigin(unittest.IsolatedAsyncioTestCase):
             })
             await asyncio.sleep(0.02)
 
-            # 2. La tour (PC appelant) doit avoir reçu totp_prompt
-            self.assertTrue(any(m.get("type") == "totp_prompt" and m.get("req_id") == req_id for m in self.ws_tour.sent_messages))
-
-            # 3. La tour renvoie le code Authenticator à 6 chiffres (totp_prompt_response)
-            self.hub.handle_incoming_message("tour", {
-                "type": "totp_prompt_response",
-                "req_id": req_id,
-                "target_node": "laptop",
-                "decision": "allow",
-                "code": "654321",
-            })
+            # 2. La confirmation distante est validée via Telegram / API avec le code TOTP
+            await self.hub.send_confirm_response(req_id, decision="allow", code="654321", node_id="laptop")
             await asyncio.sleep(0.02)
 
-            # 4. Le laptop reçoit confirm_response avec le code 654321
+            # 3. Le laptop reçoit confirm_response avec le code 654321
             conf_resp = self.ws_laptop.sent_messages[-1]
             self.assertEqual(conf_resp["type"], "confirm_response")
             self.assertEqual(conf_resp["req_id"], req_id)
             self.assertEqual(conf_resp["decision"], "allow")
             self.assertEqual(conf_resp["code"], "654321")
 
-            # 5. Le laptop exécute la capture et ouvre automatiquement sa session de confiance dès ce 1er accès
+            # 4. Le laptop exécute la capture et ouvre automatiquement sa session de confiance dès ce 1er accès
             self.hub.handle_incoming_message("laptop", {
                 "type": "response",
                 "req_id": req_id,
@@ -797,7 +788,7 @@ class TestTrustSessionOrigin(unittest.IsolatedAsyncioTestCase):
                 "session": {"reste_s": 900, "reste_actions": 20},
             })
 
-        asyncio.create_task(fake_laptop_screenshot_with_cross_pc_totp())
+        asyncio.create_task(fake_laptop_screenshot_with_remote_confirm())
         res = await self.hub.send_action("laptop", "screenshot", {}, origin=origin_tour, timeout=2.0)
         self.assertTrue(res.get("success"))
 
@@ -807,6 +798,87 @@ class TestTrustSessionOrigin(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(sess_laptop)
         self.assertEqual(sess_laptop["reste_actions"], 20)
         self.assertIsNone(sess_tour)
+
+
+class TestAskRouteAndSessionTokenIsolation(unittest.TestCase):
+    """Vérifie le durcissement de sécurité de /api/ask et l'isolation des fichiers de jeton d'origine."""
+
+    def test_api_ask_rejects_bot_session_keys_and_platforms(self):
+        try:
+            from gateway.main import _ASK_SESSION_KEY_RE, app
+            has_fastapi = True
+        except ImportError:
+            import re
+            _ASK_SESSION_KEY_RE = re.compile(r'^(?:default|desktop:[\w.@-]{1,180})$', re.ASCII)
+            has_fastapi = False
+
+        # 1. Validation de la regex anti-usurpation
+        self.assertIsNone(_ASK_SESSION_KEY_RE.fullmatch("telegram:5673671100"))
+        self.assertIsNone(_ASK_SESSION_KEY_RE.fullmatch("discord:123456"))
+        self.assertIsNone(_ASK_SESSION_KEY_RE.fullmatch("admin:bot"))
+        self.assertIsNotNone(_ASK_SESSION_KEY_RE.fullmatch("default"))
+        self.assertIsNotNone(_ASK_SESSION_KEY_RE.fullmatch("desktop:laptop"))
+        self.assertIsNotNone(_ASK_SESSION_KEY_RE.fullmatch("desktop:tour"))
+
+        if has_fastapi:
+            from fastapi.testclient import TestClient
+            import os
+
+            client = TestClient(app)
+            sec = os.getenv("SECRET_KEY", "test-secret")
+            headers = {"X-Secret-Key": sec, "Content-Type": "application/json"}
+
+            resp = client.post("/api/ask", json={"prompt": "test", "session_key": "telegram:5673671100"}, headers=headers)
+            self.assertEqual(resp.status_code, 400)
+            self.assertIn("Clé de session refusée", resp.text)
+
+            resp = client.post("/api/ask", json={"prompt": "test", "platform": "telegram"}, headers=headers)
+            self.assertEqual(resp.status_code, 400)
+            self.assertIn("Plateforme refusée", resp.text)
+
+    def test_active_origin_token_isolated_per_session(self):
+        from importlib.machinery import SourceFileLoader
+        import hashlib
+        import tempfile
+
+        loader = SourceFileLoader("agy_bridge_mod", str(Path(__file__).parent.parent / "home-runner" / "agy_bridge.py"))
+        agy_bridge = loader.load_module()
+
+        # Vérifie que deux sessions distinctes écrivent dans deux fichiers token distincts
+        session_a = "desktop:laptop"
+        session_b = "telegram:123456"
+        token_a = "0123456789abcdef0123456789abcdef"
+        token_b = "fedcba9876543210fedcba9876543210"
+
+        d = agy_bridge._origin_runtime_dir()
+        file_a = agy_bridge._origin_token_file(d, session_a)
+        file_b = agy_bridge._origin_token_file(d, session_b)
+        self.assertNotEqual(file_a, file_b)
+
+        with agy_bridge.active_origin_token_scope(token_a, session_a):
+            self.assertTrue(file_a.exists())
+            self.assertEqual(file_a.read_text(encoding="utf-8").strip(), token_a)
+
+            with agy_bridge.active_origin_token_scope(token_b, session_b):
+                self.assertTrue(file_b.exists())
+                self.assertEqual(file_b.read_text(encoding="utf-8").strip(), token_b)
+                self.assertTrue(file_a.exists())
+
+            self.assertFalse(file_b.exists())
+            self.assertTrue(file_a.exists())
+
+        self.assertFalse(file_a.exists())
+
+    def test_permission_modes_restricted(self):
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("agy_bridge_mod2", str(Path(__file__).parent.parent / "home-runner" / "agy_bridge.py"))
+        agy_bridge = loader.load_module()
+
+        self.assertNotIn("always-proceed", agy_bridge._ALLOWED_PERMISSION_MODES)
+        self.assertNotIn("yolo", agy_bridge._ALLOWED_PERMISSION_MODES)
+        self.assertNotIn("bypass", agy_bridge._ALLOWED_PERMISSION_MODES)
+        self.assertIn("default", agy_bridge._ALLOWED_PERMISSION_MODES)
+        self.assertIn("request-review", agy_bridge._ALLOWED_PERMISSION_MODES)
 
 
 if __name__ == "__main__":

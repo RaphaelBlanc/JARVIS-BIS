@@ -453,10 +453,13 @@ async def limit_desktop_api(request: Request, call_next):
 # ── API Desktop / Client générique (Noctalia, scripts, etc.) ─────────────────
 
 
+_ASK_SESSION_KEY_RE = re.compile(r'^(?:default|desktop:[\w.@-]{1,180})$', re.ASCII)
+
+
 class AskRequest(BaseModel):
     """Corps d'une requête de question depuis un client externe."""
 
-    prompt: str = Field(..., min_length=1, description="La question ou commande")
+    prompt: str = Field(..., min_length=1, max_length=8000, description="La question ou commande")
     platform: str = Field(default="desktop", description="Plateforme d'origine")
     user_id: str = Field(default="desktop", description="Identifiant utilisateur")
     client_id: Optional[str] = Field(default=None, description="Identifiant unique de la machine cliente (laptop, tour)")
@@ -492,10 +495,27 @@ async def api_ask(payload: AskRequest) -> dict:
     client HTTP authentifié (bureau Noctalia, scripts, applications tierces).
 
     Isole les conversations par machine/utilisateur via effective_session_key.
+    Interdit toute usurpation de session Telegram/Discord via HTTP.
     """
     from gateway import forward_to_runner
 
-    effective_session_key = payload.session_key or f"{payload.platform}:{payload.client_id or payload.user_id}"
+    if payload.platform and payload.platform.strip().lower() != "desktop":
+        raise HTTPException(
+            status_code=400,
+            detail="Plateforme refusée : seul 'desktop' est autorisé sur cette route",
+        )
+    if payload.session_key is not None:
+        sk = str(payload.session_key).strip()
+        if not _ASK_SESSION_KEY_RE.fullmatch(sk):
+            raise HTTPException(
+                status_code=400,
+                detail="Clé de session refusée : seules les clés desktop:... ou default sont autorisées",
+            )
+        effective_session_key = sk
+    else:
+        ident = (payload.client_id or payload.user_id or "default").strip()
+        ident_clean = re.sub(r"[^\w.@-]", "", ident)[:180] or "default"
+        effective_session_key = f"desktop:{ident_clean}"
     logger.info(
         "API /api/ask — platform=%s user=%s client_id=%s session_key=%s prompt=%.60s…",
         payload.platform,

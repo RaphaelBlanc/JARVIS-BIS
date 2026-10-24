@@ -9,6 +9,7 @@ Expose à l'agent Antigravity des outils directs (MCP) pour :
 - Prendre une capture d'écran
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -50,12 +51,22 @@ def _get_secret_key() -> str:
 
 
 def _read_origin_token() -> str:
-    """Lit le jeton d'origine secret (128 bits) depuis le fichier d'exécution 0600 (jamais depuis l'environnement)."""
+    """Lit le jeton d'origine secret (128 bits) depuis le fichier d'exécution 0600 dédié à la session."""
+    session_key = (os.environ.get("JARVIS_SESSION_KEY") or "").strip()
+    key_hash = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:24] if session_key else ""
+
     candidates = []
+    base_dirs = []
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
-        candidates.append(Path(xdg) / "jarvis-origin" / "active_token")
-    candidates.append(Path(f"/tmp/jarvis-origin-{os.getuid()}") / "active_token")
+        base_dirs.append(Path(xdg) / "jarvis-origin")
+    base_dirs.append(Path(f"/tmp/jarvis-origin-{os.getuid()}"))
+
+    for d in base_dirs:
+        if key_hash:
+            candidates.append(d / f"active_token_{key_hash}")
+        candidates.append(d / "active_token")
+
     for p in candidates:
         try:
             fd = os.open(str(p), os.O_RDONLY | os.O_NOFOLLOW)

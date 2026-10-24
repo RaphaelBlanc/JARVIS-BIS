@@ -681,7 +681,7 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 pass
         else:
             try:
-                await query.answer("⚠️ Échec : impossible de joindre le PC, arrête la session sur le PC.", show_alert=True)
+                await query.edit_message_text(f"⚠️ Impossible de joindre « {target_nid} » pour fermer la session (nœud déconnecté ou session déjà expirée).", reply_markup=None)
             except Exception:
                 pass
         return
