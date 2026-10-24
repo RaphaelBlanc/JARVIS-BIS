@@ -70,15 +70,20 @@ def _read_parent_env() -> dict[str, str]:
     return res
 
 
-def _get_origin() -> Optional[dict]:
-    """Construit l'identifiant d'origine stable (via, chat, conversation) de la session courante."""
+def _get_session_context() -> tuple[str, str]:
+    """Récupère (session_key, session_token) depuis l'environnement du runner."""
     session_key = os.getenv("JARVIS_SESSION_KEY", "").strip()
     session_token = os.getenv("JARVIS_SESSION_TOKEN", "").strip()
     if not session_key or not session_token:
         penv = _read_parent_env()
         session_key = session_key or penv.get("JARVIS_SESSION_KEY", "").strip()
         session_token = session_token or penv.get("JARVIS_SESSION_TOKEN", "").strip()
+    return session_key, session_token
 
+
+def _get_origin() -> Optional[dict]:
+    """Construit l'identifiant d'origine stable (via, chat, conversation) de la session courante."""
+    session_key, session_token = _get_session_context()
     if not session_key or not session_token:
         return None
 
@@ -94,6 +99,16 @@ def _get_origin() -> Optional[dict]:
         "chat": chat,
         "conversation": session_token,
     }
+
+
+def _attach_session(payload: dict) -> dict:
+    session_key, _ = _get_session_context()
+    origin = _get_origin()
+    if session_key:
+        payload["session_key"] = session_key
+    if origin:
+        payload["origin"] = origin
+    return payload
 
 
 @server.tool()
@@ -147,10 +162,7 @@ async def node_write_file(node_id: str, path: str, content: str) -> str:
         content: Contenu texte à écrire dans le fichier.
     """
     headers = _headers()
-    payload: dict = {"path": path, "content": content}
-    origin = _get_origin()
-    if origin:
-        payload["origin"] = origin
+    payload: dict = _attach_session({"path": path, "content": content})
     async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/write_file", headers=headers, json=payload)
@@ -173,10 +185,7 @@ async def node_read_file(node_id: str, path: str) -> str:
         path: Chemin du fichier (ex: 'Bureau/test.txt').
     """
     headers = _headers()
-    payload: dict = {"path": path}
-    origin = _get_origin()
-    if origin:
-        payload["origin"] = origin
+    payload: dict = _attach_session({"path": path})
     async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/read_file", headers=headers, json=payload)
@@ -200,10 +209,7 @@ async def node_exec(node_id: str, command: str) -> str:
         command: Commande shell à exécuter.
     """
     headers = _headers()
-    payload: dict = {"command": command}
-    origin = _get_origin()
-    if origin:
-        payload["origin"] = origin
+    payload: dict = _attach_session({"command": command})
     async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/exec", headers=headers, json=payload)
@@ -258,10 +264,7 @@ async def node_screenshot(node_id: str) -> str:
         node_id: Identifiant de la machine cible (ex: 'tour', 'laptop').
     """
     headers = _headers()
-    origin = _get_origin()
-    body: dict = {"action": "screenshot", "params": {}}
-    if origin:
-        body["origin"] = origin
+    body: dict = _attach_session({"action": "screenshot", "params": {}})
     async with httpx.AsyncClient(timeout=90.0) as client:
         try:
             resp = await client.post(f"{GATEWAY_URL}/api/node/{node_id}/action", headers=headers, json=body)

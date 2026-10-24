@@ -154,7 +154,7 @@ class TestNodeHub(unittest.IsolatedAsyncioTestCase):
         asyncio.create_task(fake_node_reply())
 
         with patch.dict(os.environ, {"ENABLE_NODE_EXEC": "1"}):
-            res = await self.hub.send_action("laptop", "exec", {"command": "uname -a"}, timeout=2.0)
+            res = await self.hub.send_action("xenospacex-laptop", "exec", {"command": "uname -a"}, timeout=6.0)
         self.assertTrue(res.get("success"))
         self.assertEqual(res.get("stdout"), "Linux 6.12 arch-laptop")
 
@@ -364,6 +364,7 @@ class TestRemoteConfirmRelay(unittest.IsolatedAsyncioTestCase):
             received_req = msg
 
         self.hub.on_confirm_request(cb)
+        self.hub._pending_request_nodes["req_123"] = "pc-remote"
         self.hub.handle_incoming_message("pc-remote", {
             "type": "confirm_request",
             "req_id": "req_123",
@@ -395,6 +396,7 @@ class TestRemoteConfirmRelay(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.hub.get_pending_confirmation("req_123"))
 
     async def test_confirm_allow_requires_valid_6_digits(self):
+        self.hub._pending_request_nodes["req_invalid_code"] = "pc-remote"
         self.hub.handle_incoming_message("pc-remote", {
             "type": "confirm_request",
             "req_id": "req_invalid_code",
@@ -413,6 +415,7 @@ class TestRemoteConfirmRelay(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok3)
 
     async def test_confirm_deny(self):
+        self.hub._pending_request_nodes["req_deny_1"] = "pc-remote"
         self.hub.handle_incoming_message("pc-remote", {
             "type": "confirm_request",
             "req_id": "req_deny_1",
@@ -426,6 +429,21 @@ class TestRemoteConfirmRelay(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp["decision"], "deny")
         self.assertNotIn("code", resp)
 
+    async def test_confirm_unavailable(self):
+        self.hub._pending_request_nodes["req_unavail_1"] = "pc-remote"
+        self.hub.handle_incoming_message("pc-remote", {
+            "type": "confirm_request",
+            "req_id": "req_unavail_1",
+            "summary": "touch /tmp/test",
+            "expires_in": 30,
+        })
+        ok = await self.hub.send_confirm_unavailable("req_unavail_1", node_id="pc-remote")
+        self.assertTrue(ok)
+        self.assertEqual(len(self.ws.sent_messages), 1)
+        resp = self.ws.sent_messages[0]
+        self.assertEqual(resp, {"type": "confirm_unavailable", "req_id": "req_unavail_1"})
+        self.assertIsNone(self.hub.get_pending_confirmation("req_unavail_1"))
+
     async def test_confirm_cancel(self):
         canceled_req = None
 
@@ -434,6 +452,7 @@ class TestRemoteConfirmRelay(unittest.IsolatedAsyncioTestCase):
             canceled_req = msg
 
         self.hub.on_confirm_cancel(cancel_cb)
+        self.hub._pending_request_nodes["req_cancel_1"] = "pc-remote"
         self.hub.handle_incoming_message("pc-remote", {
             "type": "confirm_request",
             "req_id": "req_cancel_1",
@@ -497,17 +516,46 @@ class TestRemoteConfirmRelay(unittest.IsolatedAsyncioTestCase):
 
     async def test_send_action_enforces_enable_node_exec_and_explicit_node_id(self):
         with patch.dict(os.environ, {"ENABLE_NODE_EXEC": "0"}):
-            res_disabled = await self.hub.send_action("pc-remote", "exec", {"command": "id"}, timeout=2.0)
+            res_disabled = await self.hub.send_action("pc-remote", "exec", {"command": "id"}, timeout=6.0)
             self.assertFalse(res_disabled.get("success"))
             self.assertIn("ENABLE_NODE_EXEC", res_disabled.get("error", ""))
 
+            # L'alias run_shell doit également être soumis à ENABLE_NODE_EXEC
+            res_run_shell = await self.hub.send_action("pc-remote", "run_shell", {"command": "id"}, timeout=6.0)
+            self.assertFalse(res_run_shell.get("success"))
+            self.assertIn("ENABLE_NODE_EXEC", res_run_shell.get("error", ""))
+
         with patch.dict(os.environ, {"ENABLE_NODE_EXEC": "1"}):
-            res_auto_exec = await self.hub.send_action("auto", "exec", {"command": "id"}, timeout=2.0)
+            res_auto_exec = await self.hub.send_action("auto", "exec", {"command": "id"}, timeout=6.0)
             self.assertFalse(res_auto_exec.get("success"))
-            res_auto_write = await self.hub.send_action("auto", "write_file", {"path": "a.txt", "content": "x"}, timeout=2.0)
+            res_auto_shell = await self.hub.send_action("auto", "run_shell", {"command": "id"}, timeout=6.0)
+            self.assertFalse(res_auto_shell.get("success"))
+            res_auto_write = await self.hub.send_action("auto", "write_file", {"path": "a.txt", "content": "x"}, timeout=6.0)
             self.assertFalse(res_auto_write.get("success"))
+            # Une sous-chaîne ("remote" ou "o") doit être rejetée pour exec et write_file (correspondance exacte requise)
+            res_sub_exec = await self.hub.send_action("remote", "exec", {"command": "id"}, timeout=6.0)
+            self.assertFalse(res_sub_exec.get("success"))
+            res_sub_write = await self.hub.send_action("o", "write_file", {"path": "a.txt", "content": "x"}, timeout=6.0)
+            self.assertFalse(res_sub_write.get("success"))
+            # Action hors liste blanche rejetée
+            res_unknown = await self.hub.send_action("pc-remote", "arbitrary_action", {}, timeout=6.0)
+            self.assertFalse(res_unknown.get("success"))
+            # Timeout non fini rejeté
+            res_nan = await self.hub.send_action("pc-remote", "exec", {"command": "id"}, timeout=float("nan"))
+            self.assertFalse(res_nan.get("success"))
 
     async def test_confirm_request_rejects_other_node_hijack(self):
+        # 1. Aucune action en cours -> confirm_request non sollicité rejeté
+        self.hub._pending_request_nodes.clear()
+        self.hub.handle_incoming_message("pc-remote", {
+            "type": "confirm_request",
+            "req_id": "req_unsolicited",
+            "summary": "texte arbitraire non sollicité",
+            "expires_in": 30,
+        })
+        self.assertIsNone(self.hub.get_pending_confirmation("req_unsolicited"))
+
+        # 2. Action appartenant à un autre nœud -> rejeté
         self.hub._pending_request_nodes["req_owned_by_remote"] = "pc-remote"
         try:
             await self.hub.register_node("pc-other", DummyWebSocket(), {

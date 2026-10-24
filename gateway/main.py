@@ -646,11 +646,16 @@ class ActionRequest(BaseModel):
 
 
 def _resolve_node_origin(origin: Optional[dict], session_key: Optional[str]) -> Optional[dict]:
-    if origin:
-        return origin
-    if session_key:
-        return NODE_HUB.build_origin(session_key=session_key)
-    return None
+    clean_key = (session_key or "").strip()[:120]
+    if clean_key:
+        if clean_key not in NODE_HUB._conversation_tokens and isinstance(origin, dict) and origin.get("conversation"):
+            NODE_HUB.set_conversation_token(clean_key, str(origin.get("conversation")))
+        return NODE_HUB.build_origin(session_key=clean_key)
+    return NODE_HUB.build_origin(
+        via=origin.get("via") if isinstance(origin, dict) else None,
+        chat=origin.get("chat") if isinstance(origin, dict) else None,
+        conversation=origin.get("conversation") if isinstance(origin, dict) else None,
+    ) if isinstance(origin, dict) else None
 
 
 @app.post(
@@ -664,14 +669,14 @@ async def api_action(payload: ActionRequest) -> dict:
     n'importe quelle action de module (courses, devoirs Moodle, finances, capture d'écran, etc.).
     """
     params = dict(payload.params or {})
-    resolved_origin = _resolve_node_origin(payload.origin or params.get("origin"), payload.session_key or params.get("session_key"))
-    if resolved_origin and "origin" not in params:
-        params["origin"] = resolved_origin
+    params.pop("origin", None)
+    params.pop("session_key", None)
     return await execute_tool_action(
         tool_id=payload.tool,
         action=payload.action,
         params=params,
         platform=payload.platform,
+        session_key=payload.session_key,
     )
 
 

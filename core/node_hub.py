@@ -9,6 +9,7 @@ des fichiers et exécuter des commandes sur les machines clientes de façon séc
 
 import asyncio
 import logging
+import math
 import os
 import re
 import time
@@ -22,6 +23,25 @@ else:
     WebSocket = Any
 
 logger = logging.getLogger("core.node_hub")
+
+ACTION_ALIASES: Dict[str, str] = {
+    "run_shell": "exec",
+    "clipboard_read": "clipboard_get",
+    "clipboard_write": "clipboard_set",
+}
+
+ALLOWED_ACTIONS = frozenset({
+    "exec",
+    "read_file",
+    "write_file",
+    "list_files",
+    "screenshot",
+    "lock",
+    "clipboard_get",
+    "clipboard_set",
+    "media",
+    "notify",
+})
 
 
 def normalize_origin(origin: Any) -> Optional[Dict[str, Any]]:
@@ -101,18 +121,24 @@ class NodeHub:
 
     def get_conversation_token(self, session_key: str) -> str:
         """Retourne l'identifiant stable de conversation pour session_key (le crée si absent)."""
-        key = (session_key or "default").strip() or "default"
+        key = (session_key or "default").strip()[:120] or "default"
         token = self._conversation_tokens.get(key)
         if not token:
+            if len(self._conversation_tokens) >= 128:
+                oldest = next(iter(self._conversation_tokens))
+                self._conversation_tokens.pop(oldest, None)
             token = uuid.uuid4().hex[:16]
             self._conversation_tokens[key] = token
         return token
 
     def set_conversation_token(self, session_key: str, token: str) -> str:
         """Synchronise l'identifiant de conversation avec celui du runner."""
-        key = (session_key or "default").strip() or "default"
-        clean_token = str(token).strip()
+        key = (session_key or "default").strip()[:120] or "default"
+        clean_token = str(token).strip()[:128]
         if clean_token:
+            if key not in self._conversation_tokens and len(self._conversation_tokens) >= 128:
+                oldest = next(iter(self._conversation_tokens))
+                self._conversation_tokens.pop(oldest, None)
             self._conversation_tokens[key] = clean_token
         return self.get_conversation_token(key)
 
@@ -121,7 +147,10 @@ class NodeHub:
         if not session_key or session_key == "all":
             self._conversation_tokens.clear()
             return uuid.uuid4().hex[:16]
-        key = session_key.strip() or "default"
+        key = session_key.strip()[:120] or "default"
+        if key not in self._conversation_tokens and len(self._conversation_tokens) >= 128:
+            oldest = next(iter(self._conversation_tokens))
+            self._conversation_tokens.pop(oldest, None)
         new_token = uuid.uuid4().hex[:16]
         self._conversation_tokens[key] = new_token
         return new_token
@@ -294,12 +323,14 @@ class NodeHub:
             out.append(d)
         return out
 
-    def get_node(self, node_identifier: Optional[str] = None) -> Optional[ConnectedNode]:
+    def get_node(self, node_identifier: Optional[str] = None, exact_only: bool = False) -> Optional[ConnectedNode]:
         """Résout un nœud par son ID, son hostname ou sélectionne l'unique nœud connecté."""
         if not self._nodes:
             return None
 
         if not node_identifier or node_identifier.lower() in ("default", "auto", "any"):
+            if exact_only:
+                return None
             # Si exactement un nœud est connecté, on le sélectionne
             if len(self._nodes) == 1:
                 return next(iter(self._nodes.values()))
@@ -311,6 +342,9 @@ class NodeHub:
         for nid, node in self._nodes.items():
             if nid.lower() == clean_id:
                 return node
+
+        if exact_only:
+            return None
 
         # 2. Correspondance exacte sur hostname
         for node in self._nodes.values():
@@ -353,9 +387,9 @@ class NodeHub:
                 )
                 return
 
-            # Vérifie que le req_id appartient bien à ce nœud (pas d'usurpation inter-nœuds ni de requête non sollicitée)
+            # Vérifie que le req_id correspond à une action en cours sur ce nœud (pas d'usurpation ni de requête sans action)
             expected_owner = self._pending_request_nodes.get(req_id)
-            if expected_owner is not None and expected_owner != node_id:
+            if expected_owner != node_id:
                 logger.warning(
                     "Requête confirm_request (%s) refusée : appartient à %s et non à %s.",
                     req_id,
@@ -363,14 +397,7 @@ class NodeHub:
                     node_id,
                 )
                 return
-            if self._pending_request_nodes and expected_owner is None:
-                logger.warning(
-                    "Requête confirm_request (%s) refusée : aucune action en attente pour %s.",
-                    req_id,
-                    node_id,
-                )
-                return
-            if any(rid == req_id and nid != node_id for (nid, rid) in self._pending_confirmations):
+            if any(rid == req_id and nid != node_id for (nid, rid) in list(self._pending_confirmations)):
                 logger.warning("Requête confirm_request (%s) refusée : collision req_id sur %s.", req_id, node_id)
                 return
 
@@ -430,6 +457,72 @@ class NodeHub:
                 future.set_result(message)
             return
 
+    def _find_owner_loop(self, req_id: str, node_id: Optional[str] = None) -> Optional[asyncio.AbstractEventLoop]:
+        """Retourne la boucle d'événements du nœud associé à req_id ou node_id."""
+        if node_id and node_id in self._nodes:
+            return self._nodes[node_id].loop
+        owner_id = self._pending_request_nodes.get(req_id)
+        if owner_id and owner_id in self._nodes:
+            return self._nodes[owner_id].loop
+        for (nid, rid) in list(self._pending_confirmations.keys()):
+            if rid == req_id and nid in self._nodes:
+                return self._nodes[nid].loop
+        return None
+
+    async def send_confirm_unavailable(
+        self,
+        req_id: str,
+        node_id: Optional[str] = None,
+    ) -> bool:
+        """Envoie {"type": "confirm_unavailable", "req_id": ...} au nœud client lorsque le serveur
+        ne peut pas relayer la demande (liste d'utilisateurs vide ou chat déjà occupé).
+        """
+        owner_loop = self._find_owner_loop(req_id, node_id)
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if owner_loop is not None and owner_loop.is_running() and owner_loop is not current_loop:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._send_confirm_unavailable_in_loop(req_id, node_id),
+                owner_loop,
+            )
+            return await asyncio.wrap_future(fut)
+        return await self._send_confirm_unavailable_in_loop(req_id, node_id)
+
+    async def _send_confirm_unavailable_in_loop(
+        self,
+        req_id: str,
+        node_id: Optional[str] = None,
+    ) -> bool:
+        self._purge_expired_confirmations()
+        conf = None
+        if node_id:
+            conf = self._pending_confirmations.pop((node_id, req_id), None)
+        else:
+            for k in list(self._pending_confirmations.keys()):
+                if k[1] == req_id:
+                    conf = self._pending_confirmations.pop(k, None)
+                    break
+
+        if not conf:
+            return False
+
+        target_node_id = conf["node_id"]
+        node = self._nodes.get(target_node_id)
+        if not node:
+            return False
+
+        payload = {"type": "confirm_unavailable", "req_id": req_id}
+        try:
+            await node.websocket.send_json(payload)
+            logger.info("confirm_unavailable envoyée pour req_id %s au nœud %s", req_id, target_node_id)
+            return True
+        except Exception as exc:
+            logger.error("Erreur transmission confirm_unavailable au nœud %s : %s", target_node_id, exc)
+            return False
+
     async def send_confirm_response(
         self,
         req_id: str,
@@ -438,6 +531,27 @@ class NodeHub:
         node_id: Optional[str] = None,
     ) -> bool:
         """Envoie la décision de confirmation (allow ou deny) au nœud client."""
+        owner_loop = self._find_owner_loop(req_id, node_id)
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if owner_loop is not None and owner_loop.is_running() and owner_loop is not current_loop:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._send_confirm_response_in_loop(req_id, decision, code, node_id),
+                owner_loop,
+            )
+            return await asyncio.wrap_future(fut)
+        return await self._send_confirm_response_in_loop(req_id, decision, code, node_id)
+
+    async def _send_confirm_response_in_loop(
+        self,
+        req_id: str,
+        decision: str,
+        code: Optional[str] = None,
+        node_id: Optional[str] = None,
+    ) -> bool:
         self._purge_expired_confirmations()
         conf = None
         if node_id:
@@ -486,16 +600,7 @@ class NodeHub:
                 self._notify_session_update(target_node_id, None, prev_sess.get("origin"))
 
         try:
-            try:
-                current_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                current_loop = None
-
-            if node.loop is not None and node.loop.is_running() and node.loop is not current_loop:
-                fut = asyncio.run_coroutine_threadsafe(node.websocket.send_json(payload), node.loop)
-                await asyncio.wrap_future(fut)
-            else:
-                await node.websocket.send_json(payload)
+            await node.websocket.send_json(payload)
             logger.info("confirm_response envoyée avec succès pour req_id %s au nœud %s (decision=%s)", req_id, target_node_id, decision_clean)
             return True
         except Exception as exc:
@@ -504,17 +609,21 @@ class NodeHub:
 
     def get_pending_confirmation(self, req_id: Optional[str] = None, node_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Retourne la demande de confirmation active correspondante si non expirée."""
-        self._purge_expired_confirmations()
+        now = time.time()
+        snapshot = [(k, c) for k, c in list(self._pending_confirmations.items()) if now <= c.get("expires_at", 0)]
 
         if req_id and node_id:
-            return self._pending_confirmations.get((node_id, req_id))
+            for (nid, rid), conf in snapshot:
+                if nid == node_id and rid == req_id:
+                    return conf
+            return None
         if req_id:
-            for (nid, rid), conf in self._pending_confirmations.items():
+            for (nid, rid), conf in snapshot:
                 if rid == req_id:
                     return conf
             return None
-        if len(self._pending_confirmations) == 1:
-            return next(iter(self._pending_confirmations.values()))
+        if len(snapshot) == 1:
+            return snapshot[0][1]
         return None
 
     async def send_action(
@@ -526,7 +635,27 @@ class NodeHub:
         origin: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Envoie une requête d'action au nœud cible et attend la réponse."""
-        if action in ("exec", "write_file"):
+        raw_action = str(action or "").strip()
+        action = ACTION_ALIASES.get(raw_action, raw_action)
+        if action not in ALLOWED_ACTIONS:
+            return {
+                "success": False,
+                "error": f"Action '{raw_action}' non prise en charge sur les nœuds clients.",
+            }
+
+        try:
+            timeout_val = float(timeout)
+        except (TypeError, ValueError):
+            timeout_val = float("nan")
+        if not math.isfinite(timeout_val):
+            return {
+                "success": False,
+                "error": "Délai (timeout) invalide : doit être un nombre fini.",
+            }
+        timeout = max(6.0, min(timeout_val, 600.0))
+
+        sensitive_action = action in ("exec", "write_file")
+        if sensitive_action:
             if not node_id or str(node_id).strip().lower() in ("", "auto", "default", "any"):
                 return {
                     "success": False,
@@ -539,7 +668,7 @@ class NodeHub:
                     "error": "L'exécution distante de commandes (exec) sur les nœuds clients requiert ENABLE_NODE_EXEC=1 côté serveur.",
                 }
 
-        node = self.get_node(node_id)
+        node = self.get_node(node_id, exact_only=sensitive_action)
         if not node:
             available = [n["node_id"] for n in self.list_nodes()]
             return {

@@ -74,12 +74,22 @@ def _default_session() -> dict:
         "turns": 0,
     }
 
+_MAX_SESSIONS = 64
+_ALLOWED_PERMISSION_MODES = frozenset({
+    "always-proceed", "request-review", "default", "auto_edit", "yolo", "ask", "bypass", "plan", "auto"
+})
 _SESSIONS: dict[str, dict] = {}
 
 
 def _get_session(session_key: str = "default") -> dict:
-    key = (session_key or "default").strip()
+    key = (session_key or "default").strip()[:120] or "default"
     if key not in _SESSIONS:
+        if len(_SESSIONS) >= _MAX_SESSIONS:
+            for old_key in list(_SESSIONS.keys()):
+                if old_key != "default" and not (_SESSION_LOCKS.get(old_key) and _SESSION_LOCKS[old_key].locked()):
+                    _SESSIONS.pop(old_key, None)
+                    _SESSION_LOCKS.pop(old_key, None)
+                    break
         _SESSIONS[key] = _default_session()
     elif not _SESSIONS[key].get("session_token"):
         _SESSIONS[key]["session_token"] = uuid.uuid4().hex[:16]
@@ -166,7 +176,10 @@ def update_session(
     if mode:
         cfg["mode"] = mode.strip().lower()
     if permission_mode:
-        cfg["permission_mode"] = permission_mode.strip().lower()
+        clean_perm = permission_mode.strip().lower()
+        if clean_perm not in _ALLOWED_PERMISSION_MODES:
+            raise ValueError(f"permission_mode non autorisé : {permission_mode}")
+        cfg["permission_mode"] = clean_perm
     return dict(cfg)
 
 
@@ -777,13 +790,18 @@ class _AgyStreamWorker:
 
 _WORKERS: dict[str, _AgyStreamWorker] = {}
 _SESSION_LOCKS: dict[str, asyncio.Lock] = {}
-_GLOBAL_SEMAPHORE = asyncio.Semaphore(2)
+_GLOBAL_SEMAPHORE = asyncio.Semaphore(1)
 _WATCHDOG_TASK: Optional[asyncio.Task] = None
 
 
 def _get_session_lock(session_key: str = "default") -> asyncio.Lock:
-    key = (session_key or "default").strip()
+    key = (session_key or "default").strip()[:120] or "default"
     if key not in _SESSION_LOCKS:
+        if len(_SESSION_LOCKS) >= _MAX_SESSIONS:
+            for old_key, old_lock in list(_SESSION_LOCKS.items()):
+                if old_key != "default" and not old_lock.locked():
+                    _SESSION_LOCKS.pop(old_key, None)
+                    break
         _SESSION_LOCKS[key] = asyncio.Lock()
     return _SESSION_LOCKS[key]
 

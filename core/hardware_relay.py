@@ -25,6 +25,7 @@ def _sanitize_output_path(
     user_path: Optional[str],
     default_prefix: str = "nc_screenshot_",
     default_suffix: str = ".png",
+    initial_bytes: Optional[bytes] = None,
 ) -> Tuple[Optional[Path], Optional[str]]:
     """Sanitise le chemin de sortie dans un dossier temporaire fixe (O_NOFOLLOW|O_EXCL) et nettoie les vieux temporaires."""
     tmp_dir = Path(tempfile.gettempdir()).resolve()
@@ -39,6 +40,9 @@ def _sanitize_output_path(
 
     if not user_path:
         with tempfile.NamedTemporaryFile(prefix=default_prefix, suffix=default_suffix, dir=str(tmp_dir), delete=False) as tmp_f:
+            if initial_bytes is not None:
+                tmp_f.write(initial_bytes)
+                tmp_f.flush()
             return Path(tmp_f.name), None
 
     raw_path = Path(user_path).expanduser()
@@ -62,14 +66,17 @@ def _sanitize_output_path(
     except OSError:
         return None, f"Chemin de sortie interdit : {user_path}"
 
-    # N'autorise l'écriture que directement sous /tmp avec O_NOFOLLOW
+    # N'autorise l'écriture que directement sous /tmp avec O_NOFOLLOW | O_EXCL
     if resolved.parent != tmp_dir or is_sym:
         return None, f"Chemin de sortie interdit (seul {tmp_dir} est autorisé) : {user_path}"
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(str(resolved), flags, 0o600)
-        os.close(fd)
+        with os.fdopen(fd, "wb") as f:
+            if initial_bytes is not None:
+                f.write(initial_bytes)
+                f.flush()
     except OSError:
         return None, f"Chemin de sortie interdit : {user_path}"
 
@@ -84,6 +91,7 @@ class HardwareRelay:
         action: str,
         params: Optional[Dict[str, Any]] = None,
         timeout: float = 80.0,
+        session_key: Optional[str] = None,
     ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """Exécute une action matérielle directement sur le système hôte."""
         params = params or {}
@@ -110,19 +118,20 @@ class HardwareRelay:
                 if remote_action == "exec":
                     if os.getenv("ENABLE_NODE_EXEC", "0").lower() not in ("1", "true", "yes"):
                         return False, "L'exécution distante de commandes (exec) sur les nœuds clients requiert ENABLE_NODE_EXEC=1 côté serveur.", None
-                origin = params.get("origin") or (
-                    NODE_HUB.build_origin(session_key=params.get("session_key"))
-                    if params.get("session_key")
-                    else None
-                )
+                origin = NODE_HUB.build_origin(session_key=session_key) if session_key else None
                 res = await NODE_HUB.send_action(target_node.node_id, remote_action, params, timeout=timeout, origin=origin)
                 if action == "screenshot" and res.get("success") and res.get("image_base64"):
                     user_out = params.get("output_path")
                     if user_out:
-                        out_path, err = _sanitize_output_path(user_out, default_prefix="nc_screenshot_", default_suffix=".png")
+                        img_bytes = base64.b64decode(res["image_base64"])
+                        out_path, err = _sanitize_output_path(
+                            user_out,
+                            default_prefix="nc_screenshot_",
+                            default_suffix=".png",
+                            initial_bytes=img_bytes,
+                        )
                         if err or not out_path:
                             return False, err or "Chemin de sortie invalide.", None
-                        out_path.write_bytes(base64.b64decode(res["image_base64"]))
                         return True, f"Capture effectuée sur le nœud {target_node.node_id}.", {
                             "file_path": str(out_path),
                             "image_base64": res["image_base64"],

@@ -22,22 +22,25 @@ MAX_RESPONSE_LENGTH: int = int(os.getenv("MAX_RESPONSE_LENGTH", "50000"))
 
 _SHARED_CLIENT: Optional[httpx.AsyncClient] = None
 _SHARED_CLIENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_CLIENTS_BY_LOOP: dict[Optional[asyncio.AbstractEventLoop], httpx.AsyncClient] = {}
 
 
 def _get_http_client() -> httpx.AsyncClient:
-    """Retourne un client HTTP partagé avec pool de connexions keep-alive."""
+    """Retourne un client HTTP partagé par boucle d'événements avec pool de connexions keep-alive."""
     global _SHARED_CLIENT, _SHARED_CLIENT_LOOP
     try:
         current_loop = asyncio.get_running_loop()
     except RuntimeError:
         current_loop = None
 
-    if (
-        _SHARED_CLIENT is None
-        or _SHARED_CLIENT.is_closed
-        or _SHARED_CLIENT_LOOP is not current_loop
-    ):
-        _SHARED_CLIENT = httpx.AsyncClient(
+    client = _CLIENTS_BY_LOOP.get(current_loop)
+    if client is None or client.is_closed:
+        if len(_CLIENTS_BY_LOOP) >= 4:
+            old_loop, old_client = next(iter(_CLIENTS_BY_LOOP.items()))
+            _CLIENTS_BY_LOOP.pop(old_loop, None)
+            if old_client is not None and not old_client.is_closed and old_loop is current_loop:
+                asyncio.create_task(old_client.aclose())
+        client = httpx.AsyncClient(
             timeout=10.0,
             limits=httpx.Limits(
                 max_keepalive_connections=10,
@@ -45,13 +48,26 @@ def _get_http_client() -> httpx.AsyncClient:
                 keepalive_expiry=60.0,
             ),
         )
-        _SHARED_CLIENT_LOOP = current_loop
-    return _SHARED_CLIENT
+        _CLIENTS_BY_LOOP[current_loop] = client
+
+    _SHARED_CLIENT = client
+    _SHARED_CLIENT_LOOP = current_loop
+    return client
 
 
 async def close_http_client() -> None:
-    """Ferme proprement le client HTTP partagé à l'arrêt de la Gateway."""
+    """Ferme proprement les clients HTTP partagés à l'arrêt de la Gateway."""
     global _SHARED_CLIENT, _SHARED_CLIENT_LOOP
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    for loop_key, client in list(_CLIENTS_BY_LOOP.items()):
+        if client is not None and not client.is_closed:
+            if loop_key is current_loop or loop_key is None:
+                await client.aclose()
+    _CLIENTS_BY_LOOP.clear()
     if _SHARED_CLIENT is not None and not _SHARED_CLIENT.is_closed:
         await _SHARED_CLIENT.aclose()
     _SHARED_CLIENT = None

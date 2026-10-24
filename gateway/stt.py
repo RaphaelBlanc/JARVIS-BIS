@@ -67,7 +67,7 @@ async def _transcribe_groq(
                 "model": "whisper-large-v3-turbo",
                 "response_format": "text",
             }
-            if not language or language.lower().startswith("fr"):
+            if language and language.lower().startswith("fr"):
                 data["prompt"] = "Transcription en français."
             if language:
                 data["language"] = language
@@ -92,7 +92,7 @@ async def _transcribe_openai(
                 "model": "whisper-1",
                 "response_format": "text",
             }
-            if not language or language.lower().startswith("fr"):
+            if language and language.lower().startswith("fr"):
                 data["prompt"] = "Transcription en français."
             if language:
                 data["language"] = language
@@ -119,7 +119,7 @@ def _transcribe_local_sync(
             "beam_size": 3,
             "vad_filter": True,  # Supprime les blancs/silences
         }
-        if not language or language.lower().startswith("fr"):
+        if language and language.lower().startswith("fr"):
             kwargs["initial_prompt"] = "Transcription en français."
         if language:
             kwargs["language"] = language

@@ -12,6 +12,7 @@ transparente par :
 
 import asyncio
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,6 +30,7 @@ async def execute_tool_action(
     action: str,
     params: Optional[Dict[str, Any]] = None,
     platform: str = "generic",  # "telegram", "discord", "desktop", "generic"
+    session_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Point d'entrée universel pour exécuter une action d'un module/tool."""
     params = params or {}
@@ -45,7 +47,7 @@ async def execute_tool_action(
 
     # 2. Si le module requiert le matériel local, passer par HARDWARE_RELAY
     if tool and tool.requires_local_hardware:
-        ok, msg, data = await HARDWARE_RELAY.execute(action, params)
+        ok, msg, data = await HARDWARE_RELAY.execute(action, params, session_key=session_key)
         return {
             "success": ok,
             "message": msg,
@@ -273,11 +275,7 @@ async def execute_tool_action(
         # ── NODES & MULTI-PC ─────────────────────────────────────────────────────
         elif tool_id == "nodes":
             from core.node_hub import NODE_HUB
-            origin = params.get("origin") or (
-                NODE_HUB.build_origin(session_key=params.get("session_key"))
-                if params.get("session_key")
-                else None
-            )
+            origin = NODE_HUB.build_origin(session_key=session_key) if session_key else None
             if action in ("list", "status"):
                 nodes = NODE_HUB.list_nodes()
                 if not nodes:
@@ -311,7 +309,13 @@ async def execute_tool_action(
                         "message": "⚠️ Précisez la machine cible (ex: node_id='laptop').",
                     }
                 cmd = str(params.get("command", "")).strip()
-                timeout = float(params.get("timeout", 60.0))
+                try:
+                    raw_timeout = float(params.get("timeout", 60.0))
+                except (TypeError, ValueError):
+                    raw_timeout = 60.0
+                if not math.isfinite(raw_timeout):
+                    raw_timeout = 60.0
+                timeout = max(6.0, min(raw_timeout, 595.0))
                 res = await NODE_HUB.exec_cmd(cmd, node_id=node_id, timeout=timeout, origin=origin)
                 return {
                     "success": res.get("success", False),

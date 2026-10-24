@@ -160,11 +160,28 @@ def identifier(value):
     return quote(value,safe='')
 
 
+ALLOWED_PERMISSION_MODES = frozenset({
+    'always-proceed', 'request-review', 'default', 'auto_edit', 'yolo', 'ask', 'bypass', 'plan', 'auto'
+})
+ALLOWED_MODES = frozenset({
+    'agent', 'auto', 'plan', 'accept-edits', 'ask'
+})
+
+
+def cle_session(value):
+    """Valide la clé de session du PC appelant ('desktop:<pc>' ou 'default')."""
+    if value is None or value == 'default':
+        return 'default'
+    if not isinstance(value, str) or not re.fullmatch(r'desktop:[\w.@-]{1,180}', value, flags=re.ASCII):
+        raise ValueError
+    return value
+
+
 async def dispatch(op, p, confirmed=False, session_key='default'):
     read = {'capabilities','models','session','memory','conversations','usage','conversation.history','services','logs','quick-settings','google.status','google.calendar'}
     write = {'session.update','session.reset','conversation.resume','conversation.delete','memory.add','memory.delete','profile.set','profile.delete','config.update','config.clear','service.restart','notify','noctalia','node.session_end'}
     if op not in read|write: raise ValueError
-    raw_s_key = str(session_key or p.get('session_key') or 'default').strip()[:120]
+    raw_s_key = cle_session(session_key if session_key not in (None, 'default') else p.get('session_key'))
     s_key = quote(raw_s_key, safe=':_-')
     if op in ('google.status','google.calendar'):
         try:
@@ -198,7 +215,11 @@ async def dispatch(op, p, confirmed=False, session_key='default'):
     if op=='session.update':
         clean_p = {k: v for k, v in p.items() if k != 'session_key'}
         if not clean_p or set(clean_p)-{'engine','model','effort','mode','permission_mode'} or any(not isinstance(v,str) or len(v)>200 for v in clean_p.values()): raise ValueError
-        body_p = dict(clean_p, session_key=str(session_key or p.get('session_key') or 'default').strip()[:120])
+        if 'permission_mode' in clean_p and clean_p['permission_mode'] not in ALLOWED_PERMISSION_MODES:
+            raise ValueError
+        if 'mode' in clean_p and clean_p['mode'] not in ALLOWED_MODES:
+            raise ValueError
+        body_p = dict(clean_p, session_key=raw_s_key)
         return await runner('POST','/nc/engine' if 'engine' in clean_p else '/session',body_p)
     if op=='session.reset':
         try:

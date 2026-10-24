@@ -1133,9 +1133,17 @@ async def cmd_meteo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Effectue une recherche web via DuckDuckGo."""
+    if not update.message:
+        return
     user = update.effective_user
     if not _is_allowed(user.id):
         await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    if _get_pending_totp_entry_for_chat(update.effective_chat.id) is not None:
+        await update.message.reply_text(
+            "⏳ Une demande de confirmation est en attente. Saisis ton code à 6 chiffres (en répondant au message de la demande) ou clique sur « ❌ Refuser »."
+        )
         return
 
     args = context.args
@@ -1160,9 +1168,17 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_summarize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Récupère une page web et la résume."""
+    if not update.message:
+        return
     user = update.effective_user
     if not _is_allowed(user.id):
         await update.message.reply_text("⛔ Accès non autorisé.")
+        return
+
+    if _get_pending_totp_entry_for_chat(update.effective_chat.id) is not None:
+        await update.message.reply_text(
+            "⏳ Une demande de confirmation est en attente. Saisis ton code à 6 chiffres (en répondant au message de la demande) ou clique sur « ❌ Refuser »."
+        )
         return
 
     args = context.args
@@ -1552,12 +1568,19 @@ async def _cleanup_pending_totp_request(req_id: str, update_messages: bool = Tru
     """Nettoie une requête TOTP terminée (réponse, refus ou annulation)."""
     task = _pending_totp_tasks.pop(req_id, None)
     if task and not task.done():
-        task.cancel()
+        try:
+            t_loop = task.get_loop()
+            if t_loop.is_running():
+                t_loop.call_soon_threadsafe(task.cancel)
+            else:
+                task.cancel()
+        except Exception:
+            task.cancel()
 
     prompts = _pending_totp_prompts.pop(req_id, [])
     for cid, entry in list(_pending_totp_by_chat.items()):
         if entry.get("req_id") == req_id:
-            del _pending_totp_by_chat[cid]
+            _pending_totp_by_chat.pop(cid, None)
 
     if update_messages:
         for cid, mid, text in prompts:
@@ -1571,7 +1594,7 @@ async def _expire_pending_totp(req_id: str) -> None:
     prompts = _pending_totp_prompts.pop(req_id, [])
     for cid, entry in list(_pending_totp_by_chat.items()):
         if entry.get("req_id") == req_id:
-            del _pending_totp_by_chat[cid]
+            _pending_totp_by_chat.pop(cid, None)
 
     for cid, mid, text in prompts:
         await _call_in_telegram_loop(_edit_totp_message_impl, cid, mid, f"{text}\n\n⏱ Expiré.")
@@ -1602,31 +1625,36 @@ async def handle_node_confirm_request(node_id: str, message: Dict[str, Any]) -> 
     if not target_chats:
         logger.warning("confirm_request : TELEGRAM_ALLOWED_USER_IDS est vide, aucun relais effectué.")
         from core.node_hub import NODE_HUB
-        await NODE_HUB.send_confirm_response(req_id, decision="deny", node_id=node_id)
+        await NODE_HUB.send_confirm_unavailable(req_id, node_id=node_id)
         return
 
     prompts_list: List[Tuple[int, int, str]] = []
     expires_at = _time.time() + expires_in
 
     for cid in target_chats:
-        # Une seule demande active à la fois par conversation : ne JAMAIS remplacer une demande en cours
+        # Une seule demande active à la fois par conversation : réserver l'entrée AVANT l'await d'envoi
         if _get_pending_totp_entry_for_chat(cid) is not None:
             logger.warning("confirm_request (%s) refusée dans le chat %s : une demande est déjà en attente.", req_id, cid)
             continue
 
+        _pending_totp_by_chat[cid] = {
+            "node_id": node_id,
+            "req_id": req_id,
+            "message_id": None,
+            "expires_at": expires_at,
+        }
         msg_id = await _call_in_telegram_loop(_send_totp_request_impl, cid, text, req_id)
         if msg_id:
-            _pending_totp_by_chat[cid] = {
-                "node_id": node_id,
-                "req_id": req_id,
-                "message_id": msg_id,
-                "expires_at": expires_at,
-            }
+            if _pending_totp_by_chat.get(cid, {}).get("req_id") == req_id:
+                _pending_totp_by_chat[cid]["message_id"] = msg_id
             prompts_list.append((cid, msg_id, text))
+        else:
+            if _pending_totp_by_chat.get(cid, {}).get("req_id") == req_id:
+                _pending_totp_by_chat.pop(cid, None)
 
     if not prompts_list:
         from core.node_hub import NODE_HUB
-        await NODE_HUB.send_confirm_response(req_id, decision="deny", node_id=node_id)
+        await NODE_HUB.send_confirm_unavailable(req_id, node_id=node_id)
         return
 
     _pending_totp_prompts[req_id] = prompts_list
@@ -2181,6 +2209,8 @@ async def _process_prompt_and_reply(update: Update, prompt: str, waiting_msg) ->
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Traite les messages texte entrants avec mémoire de contexte conversationnel et mise en page riche."""
+    if not update.message or not update.message.text:
+        return
     user = update.effective_user
     if not _is_allowed(user.id):
         logger.warning("Message refusé de l'utilisateur Telegram %d.", user.id)
@@ -2507,13 +2537,13 @@ def get_application() -> Application:
     app.add_handler(CallbackQueryHandler(on_callback_query))
 
     # Handler messages texte normaux
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Handler images et photos
-    app.add_handler(MessageHandler(filters.PHOTO | (filters.Document.IMAGE), handle_photo))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & (filters.PHOTO | (filters.Document.IMAGE)), handle_photo))
 
     # Handler messages vocaux et fichiers audio
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & (filters.VOICE | filters.AUDIO), handle_voice))
 
     # Handlers modulaires (Moodle, Budget, Courses, Obsidian, PC, etc.)
     from core.tools.bot_telegram_handlers import register_modular_telegram_commands
