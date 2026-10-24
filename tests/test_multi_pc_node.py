@@ -681,23 +681,25 @@ class TestTrustSessionOrigin(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(normalize_origin({"via": "", "chat": 123, "conversation": "abc"}))
 
     def test_agy_bridge_session_token_rotation(self):
-        from agy_bridge import resume_conversation
+        from agy_bridge import resume_conversation, get_or_set_origin_token, rotate_origin_token
 
-        s1 = get_session_info("desktop:laptop")
-        tok1 = s1["session_token"]
+        tok1 = get_or_set_origin_token("desktop:laptop")
         self.assertTrue(tok1)
+        self.assertTrue(len(tok1) >= 32)
 
         # Même token tant que la session n'est pas réinitialisée
-        self.assertEqual(get_session_info("desktop:laptop")["session_token"], tok1)
+        self.assertEqual(get_or_set_origin_token("desktop:laptop"), tok1)
 
-        # Rotation sur reset_session
-        s2 = reset_session("desktop:laptop")
-        self.assertNotEqual(s2["session_token"], tok1)
+        # Rotation du secret
+        tok2 = rotate_origin_token("desktop:laptop")
+        self.assertNotEqual(tok2, tok1)
 
         # Rotation sur resume_conversation
         resumed = resume_conversation("conv-abc-12345", session_key="desktop:laptop")
-        self.assertNotEqual(resumed["session"]["session_token"], s2["session_token"])
-        self.assertTrue(resumed["session"]["session_token"].startswith("conv-abc-12345"))
+        tok3 = get_or_set_origin_token("desktop:laptop")
+        self.assertNotEqual(tok3, tok2)
+        # Vérifie que le session_token n'est pas exposé dans la réponse publique de session
+        self.assertNotIn("session_token", resumed["session"])
 
     async def test_exec_forwards_origin_and_tracks_active_session_and_session_end(self):
         updates = []
@@ -730,7 +732,10 @@ class TestTrustSessionOrigin(unittest.IsolatedAsyncioTestCase):
         active = self.hub.get_active_session("tour")
         self.assertIsNotNone(active)
         self.assertEqual(active["reste_actions"], 19)
-        self.assertEqual(active["origin"], origin)
+        # origin retiré par défaut des réponses publiques de list_nodes / get_active_session
+        self.assertNotIn("origin", active)
+        active_internal = self.hub.get_active_session("tour", include_origin=True)
+        self.assertEqual(active_internal["origin"], origin)
         self.assertEqual(len(updates), 1)
         self.assertEqual(updates[0][0], "tour")
         self.assertEqual(updates[0][1], {"reste_s": 895, "reste_actions": 19})

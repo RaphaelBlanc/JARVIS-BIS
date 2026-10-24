@@ -8,10 +8,13 @@ des fichiers et exécuter des commandes sur les machines clientes de façon séc
 """
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import math
 import os
 import re
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -118,44 +121,79 @@ class NodeHub:
         self._confirm_cancel_callbacks: List[Callable[[str, Dict[str, Any]], Any]] = []
         self._session_update_callbacks: List[Callable[[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]], Any]] = []
         self._conversation_tokens: Dict[str, str] = {}
+        self._token_to_session_key: Dict[str, str] = {}
+        self._hmac_key: bytes = (os.getenv("SECRET_KEY") or secrets.token_hex(32)).encode("utf-8")
         self._active_sessions: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
+    def derive_conversation_id(self, token: str) -> str:
+        """Dérive l'identifiant de conversation envoyé au nœud : HMAC-SHA256(server_key, token),
+        jamais le secret brut lui-même.
+        """
+        return hmac.new(self._hmac_key, str(token).encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+    def _evict_oldest_token_if_needed(self) -> None:
+        if len(self._conversation_tokens) >= 128:
+            oldest = next(iter(self._conversation_tokens))
+            old_tok = self._conversation_tokens.pop(oldest, None)
+            if old_tok:
+                self._token_to_session_key.pop(old_tok, None)
+
     def get_conversation_token(self, session_key: str) -> str:
-        """Retourne l'identifiant stable de conversation pour session_key (le crée si absent)."""
+        """Retourne le secret de conversation (128 bits) pour session_key (le crée si absent)."""
         key = (session_key or "default").strip()[:120] or "default"
         token = self._conversation_tokens.get(key)
         if not token:
-            if len(self._conversation_tokens) >= 128:
-                oldest = next(iter(self._conversation_tokens))
-                self._conversation_tokens.pop(oldest, None)
-            token = uuid.uuid4().hex[:16]
+            self._evict_oldest_token_if_needed()
+            token = secrets.token_hex(16)
             self._conversation_tokens[key] = token
+            self._token_to_session_key[token] = key
         return token
 
     def set_conversation_token(self, session_key: str, token: str) -> str:
-        """Synchronise l'identifiant de conversation avec celui du runner."""
+        """Synchronise le secret de conversation avec celui du runner."""
         key = (session_key or "default").strip()[:120] or "default"
         clean_token = str(token).strip()[:128]
         if clean_token:
-            if key not in self._conversation_tokens and len(self._conversation_tokens) >= 128:
-                oldest = next(iter(self._conversation_tokens))
-                self._conversation_tokens.pop(oldest, None)
+            prev = self._conversation_tokens.get(key)
+            if prev and prev != clean_token:
+                self._token_to_session_key.pop(prev, None)
+            if key not in self._conversation_tokens:
+                self._evict_oldest_token_if_needed()
             self._conversation_tokens[key] = clean_token
+            self._token_to_session_key[clean_token] = key
         return self.get_conversation_token(key)
 
     def rotate_conversation_token(self, session_key: Optional[str] = None) -> str:
-        """Génère un nouvel identifiant de conversation (ex: /reset, /new, /resume)."""
+        """Génère un nouveau secret de conversation 128 bits (ex: /reset, /new, /resume, delete)."""
         if not session_key or session_key == "all":
             self._conversation_tokens.clear()
-            return uuid.uuid4().hex[:16]
+            self._token_to_session_key.clear()
+            return secrets.token_hex(16)
         key = session_key.strip()[:120] or "default"
-        if key not in self._conversation_tokens and len(self._conversation_tokens) >= 128:
-            oldest = next(iter(self._conversation_tokens))
-            self._conversation_tokens.pop(oldest, None)
-        new_token = uuid.uuid4().hex[:16]
+        prev = self._conversation_tokens.get(key)
+        if prev:
+            self._token_to_session_key.pop(prev, None)
+        if key not in self._conversation_tokens:
+            self._evict_oldest_token_if_needed()
+        new_token = secrets.token_hex(16)
         self._conversation_tokens[key] = new_token
+        self._token_to_session_key[new_token] = key
         return new_token
+
+    def resolve_origin_from_token(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Résout un en-tête secret X-Jarvis-Origin-Token (≥ 128 bits) en origin (via, chat, HMAC(token)).
+        Retourne None si le jeton est absent, mal formé ou inconnu du serveur.
+        """
+        if not token or not isinstance(token, str):
+            return None
+        clean = token.strip()
+        if len(clean) < 32 or len(clean) > 128:
+            return None
+        session_key = self._token_to_session_key.get(clean)
+        if not session_key:
+            return None
+        return self.build_origin(session_key=session_key)
 
     def build_origin(
         self,
@@ -164,7 +202,7 @@ class NodeHub:
         chat: Any = None,
         conversation: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Construit un dictionnaire origin normalisé à partir d'une session_key ou de champs explicites."""
+        """Construit un dictionnaire origin normalisé à partir d'une session_key (avec HMAC du secret)."""
         if session_key and (not via or chat is None):
             if ":" in session_key:
                 prefix, rest = session_key.split(":", 1)
@@ -176,7 +214,10 @@ class NodeHub:
                 if chat is None:
                     chat = session_key
         if not conversation and session_key:
-            conversation = self.get_conversation_token(session_key)
+            raw_token = self.get_conversation_token(session_key)
+            conversation = self.derive_conversation_id(raw_token)
+        elif conversation and conversation in self._token_to_session_key:
+            conversation = self.derive_conversation_id(conversation)
         return normalize_origin({"via": via, "chat": chat, "conversation": conversation})
 
     def on_session_update(
@@ -200,8 +241,10 @@ class NodeHub:
             except Exception as exc:
                 logger.error("Erreur dans callback session_update: %s", exc)
 
-    def get_active_session(self, node_id: str) -> Optional[Dict[str, Any]]:
-        """Retourne l'état de la session de confiance active sur ce nœud (ou None si expirée/absente)."""
+    def get_active_session(self, node_id: str, include_origin: bool = False) -> Optional[Dict[str, Any]]:
+        """Retourne l'état de la session de confiance active sur ce nœud (ou None si expirée/absente).
+        Par sécurité, 'origin' n'est pas exposé dans les réponses publiques (/api/nodes).
+        """
         sess = self._active_sessions.get(node_id)
         if not sess:
             return None
@@ -211,19 +254,33 @@ class NodeHub:
         if now >= expires_at or reste_actions <= 0:
             self._active_sessions.pop(node_id, None)
             return None
-        return {
+        info: Dict[str, Any] = {
             "reste_s": max(0, int(expires_at - now)),
             "reste_actions": reste_actions,
-            "origin": sess.get("origin"),
         }
+        if include_origin:
+            info["origin"] = sess.get("origin")
+        return info
 
-    async def send_session_end(self, node_id: Optional[str] = None) -> List[str]:
+    async def send_session_end(
+        self,
+        node_id: Optional[str] = None,
+        origin: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
         """Envoie {"type": "session_end"} au nœud cible (ou à tous les nœuds si node_id est None/'all')
         pour fermer immédiatement toute session de confiance active.
+        Ne retire la session et ne notifie que les nœuds où l'envoi a effectivement réussi.
         """
         targets: List[ConnectedNode] = []
         if not node_id or str(node_id).strip().lower() in ("", "all", "*"):
-            targets = list(self._nodes.values())
+            for n in self._nodes.values():
+                if origin is not None:
+                    active_s = self._active_sessions.get(n.node_id)
+                    if isinstance(active_s, dict) and isinstance(active_s.get("origin"), dict):
+                        s_orig = active_s["origin"]
+                        if (s_orig.get("via"), s_orig.get("chat")) != (origin.get("via"), origin.get("chat")):
+                            continue
+                targets.append(n)
         else:
             resolved = self.get_node(node_id)
             if resolved:
@@ -237,19 +294,19 @@ class NodeHub:
             current_loop = None
 
         for node in targets:
-            prev_sess = self._active_sessions.pop(node.node_id, None)
-            prev_origin = prev_sess.get("origin") if isinstance(prev_sess, dict) else None
             try:
                 if node.loop is not None and node.loop.is_running() and node.loop is not current_loop:
                     fut = asyncio.run_coroutine_threadsafe(node.websocket.send_json(payload), node.loop)
                     await asyncio.wrap_future(fut)
                 else:
                     await node.websocket.send_json(payload)
+                prev_sess = self._active_sessions.pop(node.node_id, None)
+                prev_origin = prev_sess.get("origin") if isinstance(prev_sess, dict) else None
                 closed_nodes.append(node.node_id)
                 logger.info("session_end envoyé au nœud %s", node.node_id)
+                self._notify_session_update(node.node_id, None, prev_origin)
             except Exception as exc:
                 logger.error("Erreur envoi session_end au nœud %s : %s", node.node_id, exc)
-            self._notify_session_update(node.node_id, None, prev_origin)
 
         return closed_nodes
 

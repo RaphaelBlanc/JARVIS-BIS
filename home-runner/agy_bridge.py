@@ -6,12 +6,15 @@ capture stdout/stderr et retourne un dict structuré.
 """
 
 import asyncio
+import contextlib
 import datetime
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
+import stat
 import time
 import uuid
 from collections import deque
@@ -69,7 +72,7 @@ def _default_session() -> dict:
         "mode": None,
         "has_active_session": False,
         "conversation_id": None,
-        "session_token": uuid.uuid4().hex[:16],
+        "session_token": secrets.token_hex(16),
         "permission_mode": "always-proceed",  # always-proceed | request-review
         "turns": 0,
     }
@@ -79,6 +82,52 @@ _ALLOWED_PERMISSION_MODES = frozenset({
     "always-proceed", "request-review", "default", "auto_edit", "yolo", "ask", "bypass", "plan", "auto"
 })
 _SESSIONS: dict[str, dict] = {}
+
+
+def _origin_runtime_dir() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if base and os.path.isdir(base):
+        d = Path(base) / "jarvis-origin"
+    else:
+        d = Path(f"/tmp/jarvis-origin-{os.getuid()}")
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(d, 0o700)
+    return d
+
+
+@contextlib.contextmanager
+def active_origin_token_scope(token: Optional[str]):
+    """Expose temporairement le jeton d'origine 128 bits dans un fichier 0600 (hors variables d'environnement)
+    uniquement pendant l'exécution d'un tour actif, puis le supprime immédiatement.
+    """
+    clean = (token or "").strip()
+    if not clean or len(clean) < 32:
+        yield
+        return
+    d = _origin_runtime_dir()
+    target = d / "active_token"
+    tmp = d / f"active_token.{secrets.token_hex(6)}.tmp"
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(clean)
+        os.replace(str(tmp), str(target))
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            target.unlink(missing_ok=True)
+
+
+def _public_session(cfg: dict, include_secret: bool = False) -> dict:
+    d = dict(cfg)
+    if not include_secret:
+        d.pop("session_token", None)
+    return d
 
 
 def _get_session(session_key: str = "default") -> dict:
@@ -91,9 +140,29 @@ def _get_session(session_key: str = "default") -> dict:
                     _SESSION_LOCKS.pop(old_key, None)
                     break
         _SESSIONS[key] = _default_session()
-    elif not _SESSIONS[key].get("session_token"):
-        _SESSIONS[key]["session_token"] = uuid.uuid4().hex[:16]
+    elif not _SESSIONS[key].get("session_token") or len(str(_SESSIONS[key].get("session_token"))) < 32:
+        _SESSIONS[key]["session_token"] = secrets.token_hex(16)
     return _SESSIONS[key]
+
+
+def get_or_set_origin_token(session_key: str = "default", token: Optional[str] = None) -> str:
+    """Retourne ou synchronise le jeton secret 128 bits d'une session (usage interne runner/gateway)."""
+    cfg = _get_session(session_key)
+    clean = (token or "").strip()
+    if len(clean) >= 32 and len(clean) <= 128:
+        cfg["session_token"] = clean
+    return str(cfg["session_token"])
+
+
+def rotate_origin_token(session_key: str = "default") -> str:
+    """Fait tourner le jeton secret 128 bits d'une session (ou de toutes les sessions)."""
+    if (session_key or "").strip() == "all":
+        for s in _SESSIONS.values():
+            s["session_token"] = secrets.token_hex(16)
+        return str(_get_session("default")["session_token"])
+    cfg = _get_session(session_key)
+    cfg["session_token"] = secrets.token_hex(16)
+    return str(cfg["session_token"])
 
 
 SESSION_CONFIG = _get_session("default")
@@ -147,9 +216,9 @@ def _normalize_model_effort(
     return model, effort
 
 
-def get_session_info(session_key: str = "default") -> dict:
-    """Retourne la configuration actuelle de la session spécifiée."""
-    return dict(_get_session(session_key))
+def get_session_info(session_key: str = "default", include_secret: bool = False) -> dict:
+    """Retourne la configuration actuelle de la session spécifiée (sans session_token par défaut)."""
+    return _public_session(_get_session(session_key), include_secret=include_secret)
 
 
 def update_session(
@@ -180,7 +249,7 @@ def update_session(
         if clean_perm not in _ALLOWED_PERMISSION_MODES:
             raise ValueError(f"permission_mode non autorisé : {permission_mode}")
         cfg["permission_mode"] = clean_perm
-    return dict(cfg)
+    return _public_session(cfg)
 
 
 def reset_session(session_key: str = "default") -> dict:
@@ -190,15 +259,15 @@ def reset_session(session_key: str = "default") -> dict:
             s = _SESSIONS[k]
             s["has_active_session"] = False
             s["conversation_id"] = None
-            s["session_token"] = uuid.uuid4().hex[:16]
+            s["session_token"] = secrets.token_hex(16)
             s["turns"] = 0
-        return dict(_get_session("default"))
+        return _public_session(_get_session("default"))
     cfg = _get_session(session_key)
     cfg["has_active_session"] = False
     cfg["conversation_id"] = None
-    cfg["session_token"] = uuid.uuid4().hex[:16]
+    cfg["session_token"] = secrets.token_hex(16)
     cfg["turns"] = 0
-    return dict(cfg)
+    return _public_session(cfg)
 
 
 # ── Suivi local des tokens ────────────────────────────────────────────────────
@@ -393,11 +462,11 @@ def resume_conversation(conv_id: str, session_key: str = "default") -> dict:
     cfg = _get_session(session_key)
     cfg["conversation_id"] = clean_id
     cfg["has_active_session"] = True
-    cfg["session_token"] = f"{clean_id[:16]}-{uuid.uuid4().hex[:8]}"
+    cfg["session_token"] = secrets.token_hex(16)
     cfg["turns"] = 0
     history = get_conversation_history(clean_id)
     return {
-        "session": dict(cfg),
+        "session": _public_session(cfg),
         "history": history,
     }
 
@@ -484,6 +553,7 @@ def delete_conversation(conv_id: str) -> dict:
     try:
         shutil.rmtree(target_dir)
         for s_key, s_cfg in list(_SESSIONS.items()):
+            s_cfg["session_token"] = secrets.token_hex(16)
             if s_cfg.get("conversation_id") == clean_id:
                 reset_session(s_key)
         logger.info("Conversation %s supprimée avec succès.", clean_id)
@@ -497,6 +567,7 @@ def delete_all_conversations() -> dict:
     """Supprime toutes les conversations passées (sauf la session courante)."""
     brain_dir = Path.home() / ".gemini" / "antigravity-cli" / "brain"
     if not brain_dir.exists():
+        reset_session("all")
         return {"success": True, "deleted_count": 0}
 
     excluded_ids = {"0e02609b-e140-4ca5-a760-247d880dfa5c"}
@@ -509,7 +580,7 @@ def delete_all_conversations() -> dict:
             except Exception as e:
                 logger.warning("Impossible de supprimer %s : %s", item.name, e)
 
-    reset_session()
+    reset_session("all")
     logger.info("%d conversations passées ont été supprimées.", count)
     return {"success": True, "deleted_count": count}
 
@@ -680,9 +751,9 @@ class _AgyStreamWorker:
             "NO_COLOR": "1",
             "FORCE_COLOR": "0",
             "COLORTERM": "",
-            "JARVIS_SESSION_KEY": self.session_key,
-            "JARVIS_SESSION_TOKEN": self.session_token,
         }
+        env.pop("JARVIS_SESSION_KEY", None)
+        env.pop("JARVIS_SESSION_TOKEN", None)
 
         logger.info(
             "Démarrage worker agy persistant: %s (conversation=%s)",
@@ -916,13 +987,13 @@ async def _run_agy_oneshot(
             "success": False,
             "output": "",
             "error": "agy introuvable dans PATH et dans les emplacements connus.",
-            "session": dict(cfg),
+            "session": _public_session(cfg),
         }
 
     if reset_session_flag:
         cfg["has_active_session"] = False
         cfg["conversation_id"] = None
-        cfg["session_token"] = uuid.uuid4().hex[:16]
+        cfg["session_token"] = secrets.token_hex(16)
 
     # Construction des arguments agy
     cmd = [agy_path, *_sandbox_args()]
@@ -959,32 +1030,33 @@ async def _run_agy_oneshot(
     # Prompt et format
     cmd.extend(["-p", prompt, "--output-format", "text"])
 
-    # Environnement épuré
+    # Environnement épuré (aucun jeton de session dans l'environnement du processus)
     env = {
         **os.environ,
         "TERM": "dumb",
         "NO_COLOR": "1",
         "FORCE_COLOR": "0",
         "COLORTERM": "",
-        "JARVIS_SESSION_KEY": session_key,
-        "JARVIS_SESSION_TOKEN": str(cfg.get("session_token") or ""),
     }
+    env.pop("JARVIS_SESSION_KEY", None)
+    env.pop("JARVIS_SESSION_TOKEN", None)
 
     logger.info("Exécution agy [%s]: %s (timeout=%ds)", session_key, " ".join(cmd[:6]), timeout)
 
     proc: Optional[asyncio.subprocess.Process] = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
+        with active_origin_token_scope(str(cfg.get("session_token") or "")):
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
 
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=timeout,
-        )
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout,
+            )
 
         out = strip_ansi(stdout_bytes.decode(errors="replace")).strip()
         err = strip_ansi(stderr_bytes.decode(errors="replace")).strip()
@@ -1014,7 +1086,7 @@ async def _run_agy_oneshot(
             "success": success,
             "output": out,
             "error": err if err else None,
-            "session": dict(cfg),
+            "session": _public_session(cfg),
         }
 
     except asyncio.TimeoutError:
@@ -1029,7 +1101,7 @@ async def _run_agy_oneshot(
             "success": False,
             "output": "",
             "error": f"Timeout dépassé ({timeout}s). Le processus a été interrompu.",
-            "session": dict(cfg),
+            "session": _public_session(cfg),
         }
 
     except Exception as exc:  # noqa: BLE001
@@ -1038,7 +1110,7 @@ async def _run_agy_oneshot(
             "success": False,
             "output": "",
             "error": str(exc),
-            "session": dict(cfg),
+            "session": _public_session(cfg),
         }
 
 
@@ -1061,14 +1133,14 @@ async def _run_agy_persistent(
             "success": False,
             "output": "",
             "error": "agy introuvable dans PATH et dans les emplacements connus.",
-            "session": dict(cfg),
+            "session": _public_session(cfg),
         }
 
     if reset_session_flag:
         await _stop_worker(session_key)
         cfg["has_active_session"] = False
         cfg["conversation_id"] = None
-        cfg["session_token"] = uuid.uuid4().hex[:16]
+        cfg["session_token"] = secrets.token_hex(16)
 
     active_model = model or cfg.get("model")
     active_effort = effort or cfg.get("effort") or "low"
@@ -1166,7 +1238,8 @@ async def _run_agy_persistent(
         _ensure_watchdog()
 
     try:
-        result = await worker.send(prompt, timeout)
+        with active_origin_token_scope(str(cfg.get("session_token") or "")):
+            result = await worker.send(prompt, timeout)
     except asyncio.TimeoutError:
         logger.error("Worker agy [%s] : timeout de %ds dépassé.", session_key, timeout)
         await _stop_worker(session_key)
@@ -1174,7 +1247,7 @@ async def _run_agy_persistent(
             "success": False,
             "output": "",
             "error": f"Timeout dépassé ({timeout}s). Le processus a été interrompu.",
-            "session": dict(cfg),
+            "session": _public_session(cfg),
         }
     except Exception as exc:  # noqa: BLE001
         logger.exception("Erreur du worker agy [%s] : %s", session_key, exc)
@@ -1183,7 +1256,7 @@ async def _run_agy_persistent(
             "success": False,
             "output": "",
             "error": str(exc),
-            "session": dict(cfg),
+            "session": _public_session(cfg),
         }
 
     status = str(result.get("status", "")).upper()
@@ -1214,7 +1287,7 @@ async def _run_agy_persistent(
         "success": success,
         "output": output,
         "error": None if success else error,
-        "session": dict(cfg),
+        "session": _public_session(cfg),
     }
 
 
@@ -1259,7 +1332,7 @@ async def run_agy(
             "success": False,
             "output": "",
             "error": "Une autre requête est déjà en cours sur cette session. Réessayez dans quelques instants.",
-            "session": dict(_get_session(key)),
+            "session": _public_session(_get_session(key)),
         }
 
     await session_lock.acquire()

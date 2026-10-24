@@ -642,6 +642,10 @@ async def run(request: Request, body: RunRequest):
             ) from exc
 
     s_key = (body.session_key or "default").strip()
+    origin_tok_hdr = request.headers.get("X-Jarvis-Origin-Token", "").strip()
+    if origin_tok_hdr:
+        from agy_bridge import get_or_set_origin_token
+        get_or_set_origin_token(s_key, origin_tok_hdr)
 
     # Injecte la mémoire durable dans les prompts conversationnels normaux,
     # uniquement pour une nouvelle session ou lorsque son contenu a changé.

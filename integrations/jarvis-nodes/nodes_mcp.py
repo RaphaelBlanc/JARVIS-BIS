@@ -12,6 +12,7 @@ Expose à l'agent Antigravity des outils directs (MCP) pour :
 import json
 import logging
 import os
+import stat
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -48,66 +49,47 @@ def _get_secret_key() -> str:
     return ""
 
 
+def _read_origin_token() -> str:
+    """Lit le jeton d'origine secret (128 bits) depuis le fichier d'exécution 0600 (jamais depuis l'environnement)."""
+    candidates = []
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        candidates.append(Path(xdg) / "jarvis-origin" / "active_token")
+    candidates.append(Path(f"/tmp/jarvis-origin-{os.getuid()}") / "active_token")
+    for p in candidates:
+        try:
+            fd = os.open(str(p), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or (st.st_mode & 0o077):
+                continue
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
+                fd = None
+                tok = f.read(256).strip()
+            if len(tok) >= 32:
+                return tok
+        except OSError:
+            pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+    return ""
+
+
 def _headers() -> dict:
     key = _get_secret_key()
     headers = {"Content-Type": "application/json"}
     if key:
         headers["X-Secret-Key"] = key
+    origin_tok = _read_origin_token()
+    if origin_tok:
+        headers["X-Jarvis-Origin-Token"] = origin_tok
     return headers
 
 
-def _read_parent_env() -> dict[str, str]:
-    """Lit /proc/<ppid>/environ en repli si le binaire parent filtre l'environnement."""
-    res: dict[str, str] = {}
-    try:
-        raw = Path(f"/proc/{os.getppid()}/environ").read_bytes()
-        for entry in raw.split(b"\x00"):
-            if b"=" in entry:
-                k, v = entry.split(b"=", 1)
-                res[k.decode("utf-8", errors="ignore")] = v.decode("utf-8", errors="ignore")
-    except Exception:
-        pass
-    return res
-
-
-def _get_session_context() -> tuple[str, str]:
-    """Récupère (session_key, session_token) depuis l'environnement du runner."""
-    session_key = os.getenv("JARVIS_SESSION_KEY", "").strip()
-    session_token = os.getenv("JARVIS_SESSION_TOKEN", "").strip()
-    if not session_key or not session_token:
-        penv = _read_parent_env()
-        session_key = session_key or penv.get("JARVIS_SESSION_KEY", "").strip()
-        session_token = session_token or penv.get("JARVIS_SESSION_TOKEN", "").strip()
-    return session_key, session_token
-
-
-def _get_origin() -> Optional[dict]:
-    """Construit l'identifiant d'origine stable (via, chat, conversation) de la session courante."""
-    session_key, session_token = _get_session_context()
-    if not session_key or not session_token:
-        return None
-
-    if ":" in session_key:
-        via, rest = session_key.split(":", 1)
-        chat: int | str = int(rest) if rest.isdigit() else rest
-    else:
-        via = session_key
-        chat = session_key
-
-    return {
-        "via": via.strip().lower(),
-        "chat": chat,
-        "conversation": session_token,
-    }
-
-
 def _attach_session(payload: dict) -> dict:
-    session_key, _ = _get_session_context()
-    origin = _get_origin()
-    if session_key:
-        payload["session_key"] = session_key
-    if origin:
-        payload["origin"] = origin
     return payload
 
 

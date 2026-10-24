@@ -224,39 +224,35 @@ async def dispatch(op, p, confirmed=False, session_key='default'):
     if op=='session.reset':
         try:
             from core.node_hub import NODE_HUB
+            prev_origin = NODE_HUB.build_origin(session_key=raw_s_key) if raw_s_key != 'default' else None
             NODE_HUB.rotate_conversation_token(raw_s_key)
-            await NODE_HUB.send_session_end()
+            await NODE_HUB.send_session_end(origin=prev_origin)
         except Exception:
             pass
-        res = await runner('POST','/session/reset?session_key='+s_key)
-        if isinstance(res, dict) and isinstance(res.get('session'), dict) and res['session'].get('session_token'):
-            try:
-                from core.node_hub import NODE_HUB
-                NODE_HUB.set_conversation_token(raw_s_key, str(res['session']['session_token']))
-            except Exception:
-                pass
-        return res
+        return await runner('POST','/session/reset?session_key='+s_key)
     if op=='conversation.resume':
         try:
             from core.node_hub import NODE_HUB
+            prev_origin = NODE_HUB.build_origin(session_key=raw_s_key) if raw_s_key != 'default' else None
             NODE_HUB.rotate_conversation_token(raw_s_key)
-            await NODE_HUB.send_session_end()
+            await NODE_HUB.send_session_end(origin=prev_origin)
         except Exception:
             pass
-        res = await runner('POST','/conversation/resume',dict(conversation_id=identifier(p['id']), session_key=raw_s_key))
-        if isinstance(res, dict) and isinstance(res.get('session'), dict) and res['session'].get('session_token'):
-            try:
-                from core.node_hub import NODE_HUB
-                NODE_HUB.set_conversation_token(raw_s_key, str(res['session']['session_token']))
-            except Exception:
-                pass
-        return res
+        return await runner('POST','/conversation/resume',dict(conversation_id=identifier(p['id']), session_key=raw_s_key))
     if op=='node.session_end':
         from core.node_hub import NODE_HUB
         target_nid = str(p.get('node_id') or 'all').strip()[:64]
         closed = await NODE_HUB.send_session_end(node_id=target_nid)
-        return dict(success=True, closed_nodes=closed)
-    if op=='conversation.delete': return await runner('DELETE','/conversation/'+identifier(p['id']))
+        return dict(success=bool(closed), closed_nodes=closed)
+    if op=='conversation.delete':
+        try:
+            from core.node_hub import NODE_HUB
+            prev_origin = NODE_HUB.build_origin(session_key=raw_s_key) if raw_s_key != 'default' else None
+            NODE_HUB.rotate_conversation_token(raw_s_key)
+            await NODE_HUB.send_session_end(origin=prev_origin)
+        except Exception:
+            pass
+        return await runner('DELETE','/conversation/'+identifier(p['id']))
     if op=='memory.add':
         text=p['text']
         if not isinstance(text,str) or not 1<=len(text)<=2000: raise ValueError

@@ -641,21 +641,21 @@ class ActionRequest(BaseModel):
     action: str = Field(..., description="Action à exécuter (ex: list, devoirs, add, screenshot, kb)")
     params: Optional[dict] = Field(default_factory=dict, description="Paramètres spécifiques à l'action")
     platform: str = Field(default="desktop", description="Plateforme appelante (desktop, telegram, discord, noctalia)")
-    session_key: Optional[str] = Field(default=None, description="Clé de session isolée")
-    origin: Optional[dict] = Field(default=None, description="Origine stable de la session (via, chat, conversation)")
 
 
-def _resolve_node_origin(origin: Optional[dict], session_key: Optional[str]) -> Optional[dict]:
-    clean_key = (session_key or "").strip()[:120]
-    if clean_key:
-        if clean_key not in NODE_HUB._conversation_tokens and isinstance(origin, dict) and origin.get("conversation"):
-            NODE_HUB.set_conversation_token(clean_key, str(origin.get("conversation")))
-        return NODE_HUB.build_origin(session_key=clean_key)
-    return NODE_HUB.build_origin(
-        via=origin.get("via") if isinstance(origin, dict) else None,
-        chat=origin.get("chat") if isinstance(origin, dict) else None,
-        conversation=origin.get("conversation") if isinstance(origin, dict) else None,
-    ) if isinstance(origin, dict) else None
+def _resolve_request_origin(request: Request) -> Optional[dict]:
+    """Résout l'origine authentifiée uniquement à partir de l'en-tête secret X-Jarvis-Origin-Token (≥ 128 bits),
+    jamais depuis le corps JSON de la requête.
+    """
+    token = request.headers.get("X-Jarvis-Origin-Token", "").strip()
+    return NODE_HUB.resolve_origin_from_token(token)
+
+
+def _resolve_request_session_key(request: Request) -> Optional[str]:
+    token = request.headers.get("X-Jarvis-Origin-Token", "").strip()
+    if token and len(token) >= 32:
+        return NODE_HUB._token_to_session_key.get(token)
+    return None
 
 
 @app.post(
@@ -664,7 +664,7 @@ def _resolve_node_origin(origin: Optional[dict], session_key: Optional[str]) -> 
     summary="Exécuter une action d'un module modulaire (style MCP)",
     dependencies=[Depends(require_secret)],
 )
-async def api_action(payload: ActionRequest) -> dict:
+async def api_action(request: Request, payload: ActionRequest) -> dict:
     """Permet au bureau Noctalia ou à des scripts d'exécuter directement
     n'importe quelle action de module (courses, devoirs Moodle, finances, capture d'écran, etc.).
     """
@@ -676,7 +676,7 @@ async def api_action(payload: ActionRequest) -> dict:
         action=payload.action,
         params=params,
         platform=payload.platform,
-        session_key=payload.session_key,
+        session_key=_resolve_request_session_key(request),
     )
 
 
@@ -686,27 +686,19 @@ class NodeActionRequest(BaseModel):
     action: str = Field(..., description="Action à exécuter (exec, read_file, write_file, screenshot, lock, etc.)")
     params: Optional[dict] = Field(default_factory=dict, description="Paramètres de l'action")
     timeout: float = Field(default=80.0, gt=5.0, le=600.0, allow_inf_nan=False, description="Délai maximum en secondes")
-    origin: Optional[dict] = Field(default=None, description="Origine stable de la session (via, chat, conversation)")
-    session_key: Optional[str] = Field(default=None, description="Clé de session isolée")
 
 class NodeExecRequest(BaseModel):
     command: str = Field(..., description="Commande shell à exécuter")
     timeout: float = Field(default=75.0, gt=5.0, le=600.0, allow_inf_nan=False, description="Délai maximum en secondes")
-    origin: Optional[dict] = Field(default=None, description="Origine stable de la session (via, chat, conversation)")
-    session_key: Optional[str] = Field(default=None, description="Clé de session isolée")
 
 class NodeReadFileRequest(BaseModel):
     path: str = Field(..., description="Chemin absolu ou relatif du fichier à lire")
     timeout: float = Field(default=80.0, gt=5.0, le=600.0, allow_inf_nan=False, description="Délai maximum en secondes")
-    origin: Optional[dict] = Field(default=None, description="Origine stable de la session (via, chat, conversation)")
-    session_key: Optional[str] = Field(default=None, description="Clé de session isolée")
 
 class NodeWriteFileRequest(BaseModel):
     path: str = Field(..., description="Chemin du fichier à écrire")
     content: str = Field(..., description="Contenu du fichier")
     timeout: float = Field(default=80.0, gt=5.0, le=600.0, allow_inf_nan=False, description="Délai maximum en secondes")
-    origin: Optional[dict] = Field(default=None, description="Origine stable de la session (via, chat, conversation)")
-    session_key: Optional[str] = Field(default=None, description="Clé de session isolée")
 
 
 @app.get(
@@ -726,13 +718,13 @@ async def api_list_nodes() -> dict:
     summary="Envoyer une action à une machine cliente",
     dependencies=[Depends(require_secret)],
 )
-async def api_node_action(node_id: str, payload: NodeActionRequest) -> dict:
+async def api_node_action(node_id: str, request: Request, payload: NodeActionRequest) -> dict:
     return await NODE_HUB.send_action(
         node_id=node_id,
         action=payload.action,
         params=payload.params,
         timeout=payload.timeout,
-        origin=_resolve_node_origin(payload.origin, payload.session_key),
+        origin=_resolve_request_origin(request),
     )
 
 
@@ -742,12 +734,12 @@ async def api_node_action(node_id: str, payload: NodeActionRequest) -> dict:
     summary="Exécuter une commande shell sur une machine cliente",
     dependencies=[Depends(require_secret)],
 )
-async def api_node_exec(node_id: str, payload: NodeExecRequest) -> dict:
+async def api_node_exec(node_id: str, request: Request, payload: NodeExecRequest) -> dict:
     return await NODE_HUB.exec_cmd(
         command=payload.command,
         node_id=node_id,
         timeout=payload.timeout,
-        origin=_resolve_node_origin(payload.origin, payload.session_key),
+        origin=_resolve_request_origin(request),
     )
 
 
@@ -757,12 +749,12 @@ async def api_node_exec(node_id: str, payload: NodeExecRequest) -> dict:
     summary="Lire un fichier sur une machine cliente",
     dependencies=[Depends(require_secret)],
 )
-async def api_node_read_file(node_id: str, payload: NodeReadFileRequest) -> dict:
+async def api_node_read_file(node_id: str, request: Request, payload: NodeReadFileRequest) -> dict:
     return await NODE_HUB.read_file(
         path=payload.path,
         node_id=node_id,
         timeout=payload.timeout,
-        origin=_resolve_node_origin(payload.origin, payload.session_key),
+        origin=_resolve_request_origin(request),
     )
 
 
@@ -772,13 +764,13 @@ async def api_node_read_file(node_id: str, payload: NodeReadFileRequest) -> dict
     summary="Écrire un fichier sur une machine cliente",
     dependencies=[Depends(require_secret)],
 )
-async def api_node_write_file(node_id: str, payload: NodeWriteFileRequest) -> dict:
+async def api_node_write_file(node_id: str, request: Request, payload: NodeWriteFileRequest) -> dict:
     return await NODE_HUB.write_file(
         path=payload.path,
         content=payload.content,
         node_id=node_id,
         timeout=payload.timeout,
-        origin=_resolve_node_origin(payload.origin, payload.session_key),
+        origin=_resolve_request_origin(request),
     )
 
 

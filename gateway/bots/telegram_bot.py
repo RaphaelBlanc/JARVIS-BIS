@@ -670,14 +670,20 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if data.startswith("node_session_end:"):
-        target_nid = data.split(":", 1)[1].strip() or "all"
+        raw_token = data.split(":", 1)[1].strip() or "all"
+        target_nid = _session_end_cb_targets.get(raw_token, raw_token)
         from core.node_hub import NODE_HUB
         closed = await NODE_HUB.send_session_end(node_id=target_nid)
-        label = ", ".join(closed) if closed else target_nid
-        try:
-            await query.edit_message_text(f"🛑 Session de confiance fermée sur {label}.", reply_markup=None)
-        except Exception:
-            pass
+        if closed:
+            try:
+                await query.edit_message_text(f"🛑 Session de confiance fermée sur {', '.join(closed)}.", reply_markup=None)
+            except Exception:
+                pass
+        else:
+            try:
+                await query.answer("⚠️ Échec : impossible de joindre le PC, arrête la session sur le PC.", show_alert=True)
+            except Exception:
+                pass
         return
 
     if data.startswith("reminder:"):
@@ -1275,8 +1281,10 @@ async def cmd_fin_session(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     target_nid = (context.args[0].strip() if context.args else "all") or "all"
     from core.node_hub import NODE_HUB
     closed = await NODE_HUB.send_session_end(node_id=target_nid)
-    label = ", ".join(closed) if closed else "aucun nœud actif"
-    await update.message.reply_text(f"🛑 Session de confiance fermée sur : `{label}`.", parse_mode="Markdown")
+    if closed:
+        await update.message.reply_text(f"🛑 Session de confiance fermée sur : {', '.join(closed)}.")
+    else:
+        await update.message.reply_text("⚠️ Aucune session active n'a pu être fermée (ou machine injoignable : arrête-la sur le PC).")
 
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1674,6 +1682,19 @@ async def handle_node_confirm_cancel(node_id: str, message: Dict[str, Any]) -> N
 
 
 _active_session_messages: Dict[Tuple[int, str], int] = {}
+_session_end_cb_targets: Dict[str, str] = {}
+
+
+def _session_end_callback_data(node_id: str) -> str:
+    import hashlib
+    if len(node_id.encode("utf-8")) <= 32 and ":" not in node_id:
+        cb_key = node_id
+    else:
+        cb_key = hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:16]
+    if len(_session_end_cb_targets) >= 128 and cb_key not in _session_end_cb_targets:
+        _session_end_cb_targets.pop(next(iter(_session_end_cb_targets)), None)
+    _session_end_cb_targets[cb_key] = node_id
+    return f"node_session_end:{cb_key}"
 
 
 async def _upsert_session_message_impl(
@@ -1686,7 +1707,7 @@ async def _upsert_session_message_impl(
         app = get_application()
         kb = (
             InlineKeyboardMarkup([
-                [InlineKeyboardButton("🛑 Fin de session", callback_data=f"node_session_end:{node_id}")]
+                [InlineKeyboardButton("🛑 Fin de session", callback_data=_session_end_callback_data(node_id))]
             ])
             if active
             else None
