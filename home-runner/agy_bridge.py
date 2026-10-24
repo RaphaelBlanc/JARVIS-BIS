@@ -238,7 +238,8 @@ def update_session(
     if permission_mode:
         clean_perm = permission_mode.strip().lower()
         if clean_perm not in _ALLOWED_PERMISSION_MODES:
-            raise ValueError(f"permission_mode non autorisé : {permission_mode}")
+            logger.warning("permission_mode non autorisé (%s) ; repli sur 'default'.", permission_mode)
+            clean_perm = "default"
         cfg["permission_mode"] = clean_perm
     return _public_session(cfg)
 
