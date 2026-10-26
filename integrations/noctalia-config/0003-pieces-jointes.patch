@@ -1,0 +1,596 @@
+diff --git a/home/.config/quickshell/nc-ile/Assistant.qml b/home/.config/quickshell/nc-ile/Assistant.qml
+index 5005159..c7d4045 100644
+--- a/home/.config/quickshell/nc-ile/Assistant.qml
++++ b/home/.config/quickshell/nc-ile/Assistant.qml
+@@ -67,6 +67,9 @@ Item {
+     onVisibleChanged: if (visible) { bas(); Qt.callLater(chargerReglagesRapides) }
+     onAnimationsActivesChanged: if (animationsActives) bas()
+     function reglages() { information = ""; ecouteVocale = false; AssistantEtat.ouvrirReglages() }
++    function ouvrirSelecteurFichiers() {
++        if (!dialogueFichiers.running && !AssistantEtat.enCours) dialogueFichiers.running = true
++    }
+     // Haut-parleur : pas de synthèse vocale sur ce client, le bouton le dit
+     function sortieVocale() {
+         ecouteVocale = false
+@@ -136,6 +139,33 @@ Item {
+         height: parent.height
+         anchors.horizontalCenter: parent.horizontalCenter
+ 
++        DropArea {
++            id: zoneDepotFichiers
++            anchors.fill: parent
++            onDropped: drop => {
++                var trouves = false
++                if (drop.hasUrls && drop.urls.length > 0) {
++                    for (let i = 0; i < drop.urls.length; i++) {
++                        AssistantEtat.ajouterFichier(String(drop.urls[i]))
++                        trouves = true
++                    }
++                } else if (drop.hasText && drop.text) {
++                    var lignes = drop.text.split("\n")
++                    for (let i = 0; i < lignes.length; i++) {
++                        let l = lignes[i].trim()
++                        if (l.indexOf("/") === 0 || l.indexOf("file://") === 0) {
++                            AssistantEtat.ajouterFichier(l)
++                            trouves = true
++                        }
++                    }
++                }
++                if (trouves) {
++                    page.historiqueOuvert = true
++                    drop.acceptProposedAction()
++                }
++            }
++        }
++
+         // En-tête : style J.A.R.V.I.S. dans la Dynamic Island uniquement, en-tête de conversation sobre dans le cockpit
+         Item {
+             id: tete
+@@ -229,7 +259,7 @@ Item {
+         Item {
+             id: accueil
+             anchors.top: tete.bottom; anchors.topMargin: 10
+-            anchors.bottom: page.dansDashboard ? statutDashboard.top : (page.historiqueOuvert ? saisie.top : resume.top); anchors.bottomMargin: 8
++            anchors.bottom: page.dansDashboard ? statutDashboard.top : (page.historiqueOuvert ? (previsualisationFichiers.visible ? previsualisationFichiers.top : saisie.top) : resume.top); anchors.bottomMargin: 8
+             width: parent.width; visible: !AssistantEtat.reglagesOuverts
+ 
+             AssistantOrbe {
+@@ -299,6 +329,29 @@ Item {
+                                     onLinkActivated: lien => page.ouvrirLien(lien)
+                                     HoverHandler { cursorShape: parent.hoveredLink ? Qt.PointingHandCursor : Qt.IBeamCursor }
+                                 }
++                                Flow {
++                                    id: fichiersMessage
++                                    objectName: "nc-jarvis-message-files"
++                                    visible: (modelData.fichiers || []).length > 0
++                                    width: parent.width; spacing: 6; topPadding: 2
++                                    Repeater {
++                                        model: fichiersMessage.visible ? modelData.fichiers : []
++                                        Rectangle {
++                                            required property string modelData
++                                            height: 22
++                                            width: etiquetteFichier.implicitWidth + 16
++                                            radius: 11
++                                            color: Qt.alpha(page.cyan, 0.15)
++                                            border.width: 1; border.color: Qt.alpha(page.cyan, 0.35)
++                                            Row {
++                                                id: etiquetteFichier
++                                                anchors.centerIn: parent; spacing: 4
++                                                Ico { taille: 12; nom: "attach_file"; color: page.cyan }
++                                                Texte { text: modelData; font.pixelSize: 11; color: Couleurs.texte; font.weight: Font.DemiBold }
++                                            }
++                                        }
++                                    }
++                                }
+                                 // Choix proposés par JARVIS (issue #7), sous sa dernière réponse seulement et pas pendant une
+                                 // demande : un clic (ou Tab puis Entrée) l'envoie comme message ; ensuite, le choix fait reste
+                                 // marqué et les autres se grisent
+@@ -417,7 +470,7 @@ Item {
+         Rectangle {
+             id: modeles
+             visible: !page.dansDashboard && !AssistantEtat.reglagesOuverts && !page.historiqueOuvert
+-            anchors.bottom: saisie.top; anchors.bottomMargin: 12
++            anchors.bottom: previsualisationFichiers.visible ? previsualisationFichiers.top : saisie.top; anchors.bottomMargin: 12
+             width: parent.width; height: 140; radius: 18
+             color: Couleurs.carte; border.width: 1; border.color: Couleurs.gris3
+             Texte {
+@@ -487,7 +540,7 @@ Item {
+         Texte {
+             id: statutDashboard
+             visible: page.dansDashboard && !AssistantEtat.reglagesOuverts
+-            anchors.bottom: saisie.top; anchors.bottomMargin: 8
++            anchors.bottom: previsualisationFichiers.visible ? previsualisationFichiers.top : saisie.top; anchors.bottomMargin: 8
+             width: parent.width
+             text: AssistantEtat.enCours ? Reglages.t("Réflexion en cours…", "Thinking…") : AssistantEtat.erreur
+             color: AssistantEtat.erreur ? Couleurs.rouge : Couleurs.texteSec
+@@ -495,6 +548,56 @@ Item {
+             height: visible && text ? (AssistantEtat.erreur ? 64 : 20) : 0
+         }
+ 
++        // Prévisualisation des pièces jointes en attente
++        Flow {
++            id: previsualisationFichiers
++            objectName: "nc-jarvis-attachments-preview"
++            visible: !AssistantEtat.reglagesOuverts && AssistantEtat.fichiersEnAttente.length > 0
++            anchors.bottom: saisie.top; anchors.bottomMargin: 8
++            width: parent.width; spacing: 6
++            Repeater {
++                model: AssistantEtat.fichiersEnAttente
++                Rectangle {
++                    required property var modelData
++                    required property int index
++                    height: 26
++                    width: Math.min(previsualisationFichiers.width, pastilleContenu.implicitWidth + 28)
++                    radius: 13
++                    color: Couleurs.carte
++                    border.width: 1; border.color: Couleurs.gris3
++                    Row {
++                        id: pastilleContenu
++                        anchors.verticalCenter: parent.verticalCenter
++                        anchors.left: parent.left; anchors.leftMargin: 8
++                        spacing: 5
++                        Ico {
++                            taille: 14; nom: "attach_file"; color: page.cyan
++                            anchors.verticalCenter: parent.verticalCenter
++                        }
++                        Texte {
++                            text: modelData.nom
++                            font.pixelSize: 11
++                            color: Couleurs.texte
++                            anchors.verticalCenter: parent.verticalCenter
++                            elide: Text.ElideMiddle
++                            width: Math.min(implicitWidth, previsualisationFichiers.width - 58)
++                        }
++                    }
++                    MouseArea {
++                        id: zoneSuppr
++                        anchors.right: parent.right; anchors.rightMargin: 6
++                        anchors.verticalCenter: parent.verticalCenter
++                        width: 16; height: 16; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
++                        Ico {
++                            anchors.centerIn: parent; taille: 12; nom: "close"
++                            color: zoneSuppr.containsMouse ? Couleurs.rouge : Couleurs.texteSec
++                        }
++                        onClicked: AssistantEtat.retirerFichier(parent.index)
++                    }
++                }
++            }
++        }
++
+         // Barre de saisie
+         Item {
+             id: saisie
+@@ -503,7 +606,7 @@ Item {
+             width: parent.width; height: 46
+             Rectangle {
+                 anchors.left: parent.left
+-                anchors.right: page.dansDashboard ? envoi.left : micro.left
++                anchors.right: trombone.left
+                 anchors.rightMargin: 8; height: parent.height
+                 radius: page.dansDashboard ? 16 : height / 2
+                 color: Couleurs.gris2
+@@ -576,6 +679,19 @@ Item {
+                     }
+                 }
+             }
++            AssistantCommande {
++                id: trombone
++                objectName: "nc-jarvis-attach"
++                visible: true
++                anchors.right: (page.dansDashboard || !micro.visible) ? envoi.left : micro.left
++                anchors.rightMargin: 8
++                rond: true; width: 46; height: 46
++                icone: "attach_file"
++                choisi: AssistantEtat.fichiersEnAttente.length > 0
++                aide: Reglages.t("Joindre des fichiers", "Attach files")
++                enabled: !AssistantEtat.enCours && !AssistantEtat.ecritureReglagesEnCours
++                onClic: page.ouvrirSelecteurFichiers()
++            }
+             AssistantCommande {
+                 id: micro
+                 objectName: "nc-jarvis-mic"
+@@ -595,9 +711,9 @@ Item {
+                 icone: "arrow_upward"
+                 occupe: AssistantEtat.enCours
+                 animationsActives: page.animationsActives
+-                choisi: !AssistantEtat.enCours && AssistantEtat.brouillon.trim().length > 0
++                choisi: !AssistantEtat.enCours && (AssistantEtat.brouillon.trim().length > 0 || AssistantEtat.fichiersEnAttente.length > 0)
+                 aide: AssistantEtat.enCours ? Reglages.t("Traitement en cours", "Request in progress") : Reglages.t("Envoyer", "Send")
+-                enabled: !AssistantEtat.enCours && !AssistantEtat.ecritureReglagesEnCours && AssistantEtat.brouillon.trim().length > 0
++                enabled: !AssistantEtat.enCours && !AssistantEtat.ecritureReglagesEnCours && (AssistantEtat.brouillon.trim().length > 0 || AssistantEtat.fichiersEnAttente.length > 0)
+                 onClic: { page.historiqueOuvert = true; AssistantEtat.envoyer() }
+             }
+         }
+@@ -633,4 +749,24 @@ Item {
+         }
+         stderr: StdioCollector {}
+     }
++
++    // Explorateur de fichiers : nc-assistant selectionner-fichiers, renvoie { ok: true, files: [...] }
++    Process {
++        id: dialogueFichiers
++        command: [AssistantEtat.bin + "nc-assistant", "selectionner-fichiers"]
++        stdout: StdioCollector {
++            onStreamFinished: {
++                try {
++                    let d = JSON.parse(text)
++                    if (d && d.ok === true && Array.isArray(d.files)) {
++                        for (let i = 0; i < d.files.length; i++) {
++                            AssistantEtat.ajouterFichier(d.files[i])
++                        }
++                        if (d.files.length > 0) page.historiqueOuvert = true
++                    }
++                } catch (_) {}
++            }
++        }
++        stderr: StdioCollector {}
++    }
+ }
+diff --git a/home/.config/quickshell/nc-ile/AssistantEtat.qml b/home/.config/quickshell/nc-ile/AssistantEtat.qml
+index 1f2052f..2c93fbf 100644
+--- a/home/.config/quickshell/nc-ile/AssistantEtat.qml
++++ b/home/.config/quickshell/nc-ile/AssistantEtat.qml
+@@ -14,6 +14,36 @@ Singleton {
+         return s
+     }
+     property string brouillon: ""
++    property var fichiersEnAttente: []
++    property var fichiersEnCours: []
++    function nomFichier(chemin) {
++        var p = String(chemin || "").split("/").pop()
++        return p || chemin
++    }
++    function ajouterFichier(chemin) {
++        if (!chemin || typeof chemin !== "string") return
++        var c = chemin.trim()
++        if (c.indexOf("file://") === 0) {
++            try { c = decodeURIComponent(c.replace(/^file:\/\//, "")) } catch (_) { c = c.replace(/^file:\/\//, "") }
++        }
++        if (!c) return
++        if (fichiersEnAttente.some(f => f.chemin === c)) return
++        if (fichiersEnAttente.length >= 5) {
++            erreur = Reglages.t("5 fichiers maximum par envoi.", "5 files maximum per request.")
++            return
++        }
++        fichiersEnAttente = fichiersEnAttente.concat([{chemin: c, nom: nomFichier(c)}])
++    }
++    function retirerFichier(index) {
++        if (index >= 0 && index < fichiersEnAttente.length) {
++            var f = fichiersEnAttente.slice()
++            f.splice(index, 1)
++            fichiersEnAttente = f
++        }
++    }
++    function effacerFichiers() {
++        fichiersEnAttente = []
++    }
+     property var messages: []
+     property string erreur: ""
+     property bool enCours: false
+@@ -363,8 +393,15 @@ Singleton {
+         return (Array.isArray(c) ? c : []).filter(x => typeof x === "string" && x.trim() !== "")
+             .map(x => x.trim().slice(0, 80)).filter((x, i, l) => l.indexOf(x) === i).slice(0, 5)
+     }
+-    function ajouter(role, texte, choix) {
+-        var m = messages.concat([{role: role, texte: texte, num: ++dernierId, choix: nettoyerChoix(choix), choixFait: ""}]).slice(-24)
++    function ajouter(role, texte, choix, fichiers) {
++        var m = messages.concat([{
++            role: role,
++            texte: texte,
++            num: ++dernierId,
++            choix: nettoyerChoix(choix),
++            choixFait: "",
++            fichiers: Array.isArray(fichiers) ? fichiers : []
++        }]).slice(-24)
+         var total = m.reduce((n, x) => n + x.texte.length, 0)
+         while (total > 48000 && m.length > 1) total -= m.shift().texte.length
+         messages = m
+@@ -373,19 +410,23 @@ Singleton {
+     function envoyer(texte) {
+         var duBrouillon = typeof texte !== "string"
+         var q = (duBrouillon ? brouillon : texte).trim()
+-        if (enCours || ecritureReglagesEnCours || !q) return
++        if (enCours || ecritureReglagesEnCours) return
++        if (!q && (!duBrouillon || fichiersEnAttente.length === 0)) return
+         if (q.length > 8000) {
+             erreur = Reglages.t("8 000 caractères maximum.", "8,000 characters maximum.")
+             return
+         }
+-        question = q
++        question = q || (duBrouillon && fichiersEnAttente.length > 0 ? Reglages.t("Analyse ces fichiers", "Analyze these files") : "")
++        if (!question) return
+         erreur = ""
+         reponse = ""
+         sortieFinie = false
+         processusFini = false
+         code = -1
+         enCours = true
+-        ajouter("vous", q)
++        fichiersEnCours = duBrouillon ? fichiersEnAttente.slice() : []
++        if (duBrouillon) fichiersEnAttente = []
++        ajouter("vous", question, [], fichiersEnCours.map(f => f.nom))
+         if (duBrouillon) brouillon = ""
+         requete.stdinEnabled = true
+         requete.running = true
+@@ -404,6 +445,7 @@ Singleton {
+             // Réponse de JARVIS, ou de l'IA du bureau (le champ engine) : la suite part vers la même
+             a.suiteParIA = typeof r.engine === "string" && r.engine !== ""
+             a.nomChat = a.suiteParIA ? r.engine : "JARVIS"; if (!a.suiteParIA) a.agentChat = "assistant"
++            fichiersEnCours = []
+             finReponse.restart()
+         } else {
+             erreur = r && typeof r.error === "string" ? r.error.slice(0, 1000)
+@@ -411,6 +453,10 @@ Singleton {
+                                  "Unable to receive the answer. Check the connection and configuration.")
+             // Permet de corriger ou renvoyer manuellement ; aucune répétition automatique.
+             if (!brouillon) brouillon = question
++            if (fichiersEnAttente.length === 0 && fichiersEnCours.length > 0) {
++                fichiersEnAttente = fichiersEnCours
++            }
++            fichiersEnCours = []
+         }
+         question = ""
+         reponse = ""
+@@ -474,7 +520,13 @@ Singleton {
+                 if ((total += t.length) > 16000) break
+                 h.unshift({role: a.messages[i].role === "vous" ? "user" : "assistant", texte: t})
+             }
+-            write(JSON.stringify({session_id: a.session, question: a.question, historique: h, ia_du_bureau: a.suiteParIA}) + "\n")
++            write(JSON.stringify({
++                session_id: a.session,
++                question: a.question,
++                historique: h,
++                ia_du_bureau: a.suiteParIA,
++                fichiers: a.fichiersEnCours.map(f => f.chemin)
++            }) + "\n")
+             stdinEnabled = false
+         }
+         stdout: StdioCollector {
+diff --git a/home/.local/bin/nc-assistant b/home/.local/bin/nc-assistant
+index f052a6e..725d17a 100755
+--- a/home/.local/bin/nc-assistant
++++ b/home/.local/bin/nc-assistant
+@@ -16,6 +16,7 @@ Une URL 192.168.x.x / 10.x / *.local ne fonctionne que sur le réseau local ;
+ pour un autre réseau, configure l'URL HTTPS d'un tunnel côté serveur.
+ """
+ import argparse
++import base64
+ import contextlib
+ from datetime import datetime, timedelta, timezone
+ import fcntl
+@@ -1058,7 +1059,7 @@ def chronometrer(mesures, cle):
+         mesures[cle] = round(mesures.get(cle, 0) + (time.perf_counter() - debut) * 1000, 3)
+ 
+ 
+-def demander(c, sid, question, chat=False, briefing=False, suivi=True, mesures=None, choix=None):
++def demander(c, sid, question, chat=False, briefing=False, suivi=True, mesures=None, choix=None, fichiers=None):
+     """choix : une liste, remplie avec les choix que propose la réponse (issue #7)."""
+     if not briefing and not question.strip():
+         raise Erreur(T("La question est vide.", "The question is empty."))
+@@ -1083,6 +1084,8 @@ def demander(c, sid, question, chat=False, briefing=False, suivi=True, mesures=N
+                     # y était coupée alors qu'on attendait jusqu'à TIMEOUT (issue #6). Il accepte de 5 à 600 s
+                     delai = max(5, min(600, round(c["TIMEOUT"])))
+                     corps = dict(prompt=question, platform="desktop", user_id=c["USER_ID"], continue_session=True, timeout=delai)
++                    if fichiers:
++                        corps["files"] = fichiers
+                     # Une conversation par PC pour un même USER_ID (issue #12) ; sans nom d'hôte utilisable, le serveur
+                     # se rabat sur USER_ID
+                     pc = client_id(c)
+@@ -1258,6 +1261,42 @@ def repondre_par_ia(ia, historique, question, echec_jarvis=None):
+     print(json.dumps(dict(ok=True, text=texte, truncated=False, engine=ia.nom(qui)), ensure_ascii=False), flush=True)
+ 
+ 
++def selectionner_fichiers():
++    """Ouvre l'explorateur de fichiers natif (zenity, kdialog...) et renvoie du JSON sur stdout."""
++    res = {"ok": True, "files": []}
++    fichiers = []
++    if shutil.which("zenity"):
++        try:
++            r = subprocess.run(
++                ["zenity", "--file-selection", "--multiple", "--separator=|",
++                 f"--title={T('Choisir des fichiers à joindre', 'Select files to attach')}"],
++                capture_output=True, text=True, timeout=120
++            )
++            if r.returncode == 0 and r.stdout.strip():
++                fichiers = [f.strip() for f in r.stdout.strip().split("|") if f.strip()]
++        except Exception:
++            pass
++    elif shutil.which("kdialog"):
++        try:
++            r = subprocess.run(
++                ["kdialog", "--getopenfilename", "--multiple",
++                 f"--title={T('Choisir des fichiers à joindre', 'Select files to attach')}"],
++                capture_output=True, text=True, timeout=120
++            )
++            if r.returncode == 0 and r.stdout.strip():
++                fichiers = [f.strip() for f in r.stdout.strip().split() if f.strip()]
++        except Exception:
++            pass
++    valides = []
++    for f in fichiers:
++        p = Path(f).expanduser().resolve()
++        if p.is_file():
++            valides.append(str(p))
++    res["files"] = valides[:5]
++    print(json.dumps(res, ensure_ascii=False), flush=True)
++    return 0
++
++
+ def requete_ile():
+     # Une ligne JSON sur stdin : la question ne figure ni dans argv ni dans un fichier.
+     try:
+@@ -1275,6 +1314,31 @@ def requete_ile():
+         raise Erreur(T("Question invalide ou trop longue (8 000 caractères maximum).",
+                        "Invalid question or too long (8,000 characters maximum).")) from None
+     historique = r.get("historique") if isinstance(r.get("historique"), list) else []
++    fichiers_bruts = r.get("fichiers") if isinstance(r.get("fichiers"), list) else []
++    fichiers_payload = []
++    for f in fichiers_bruts[:5]:
++        if not isinstance(f, str) or not f.strip():
++            continue
++        ch = f.strip()
++        if ch.startswith("file://"):
++            ch = urllib.parse.unquote(urllib.parse.urlsplit(ch).path)
++        p = Path(ch).expanduser().resolve()
++        if not p.is_file():
++            continue
++        taille = p.stat().st_size
++        if taille > 20 * 1024 * 1024:
++            raise Erreur(T(f"Fichier trop volumineux ({p.name}) : maximum 20 Mo.",
++                           f"File too large ({p.name}): maximum 20 MB."))
++        try:
++            data = p.read_bytes()
++            fichiers_payload.append({
++                "filename": p.name,
++                "content_base64": base64.b64encode(data).decode("ascii"),
++            })
++        except OSError:
++            raise Erreur(T(f"Impossible de lire le fichier {p.name}.",
++                           f"Cannot read file {p.name}.")) from None
++
+     # JARVIS répond s'il est relié, sauf si une autre IA est choisie à la main (nc-reglages → Intelligence artificielle) ;
+     # sinon, ou s'il est injoignable en mode automatique, l'IA du bureau (nc-ia) répond à sa place
+     ia = ia_du_bureau()
+@@ -1288,7 +1352,7 @@ def requete_ile():
+     proposes = []
+     try:
+         # AssistantEtat suit déjà cette demande : aucun hook Coucou à attendre avant/après HTTP.
+-        texte = demander(configuration_question(question), sid, question, suivi=False, choix=proposes)
++        texte = demander(configuration_question(question), sid, question, suivi=False, choix=proposes, fichiers=fichiers_payload)
+     except Erreur as e:
+         if ia and par_jarvis and not commande and ia.mode() == "auto" and [i for i in ia.candidats("question") if i != "jarvis"]:
+             return repondre_par_ia(ia, historique, question, echec_jarvis=e)
+@@ -1314,8 +1378,10 @@ def main():
+             p.add_argument("--flux", action="store_true")
+             p.add_argument("--stdin", action="store_true", help=T("La question vient de l'entrée standard (invisible dans la liste des processus)", "The question comes from standard input (not visible in the process list)"))
+             p.add_argument("--mesurer", "--timings", action="store_true", help=T("Mesures de durée sur stderr (JSON, sans requête supplémentaire)", "Timings on stderr (JSON, no extra request)"))
++            p.add_argument("-f", "--fichier", "--file", dest="fichiers", action="append", default=[], help=T("Joindre un fichier", "Attach a file"))
+     sous.add_parser("briefing")
+     sous.add_parser("requete-ile", help=argparse.SUPPRESS)
++    sous.add_parser("selectionner-fichiers", help=argparse.SUPPRESS)
+     p = sous.add_parser("rappel-notifier", help=argparse.SUPPRESS)
+     p.add_argument("ident")
+     p = sous.add_parser("verifier", aliases=["check", "diagnostic"])
+@@ -1336,6 +1402,8 @@ def main():
+             raise Erreur(message_ia_coupee())
+         elif commande == "ouvrir":
+             ouvrir(a.question)
++        elif commande == "selectionner-fichiers":
++            return selectionner_fichiers()
+         elif commande == "requete-ile":
+             requete_ile()
+         elif commande == "rappel-notifier":
+@@ -1359,9 +1427,20 @@ def main():
+             else:
+                 mesures = {} if getattr(a, "mesurer", False) else None
+                 proposes = []                          # choix proposés par JARVIS (issue #7) : en flux, pour le Spotlight
++                fichiers_payload = []
++                for ch in getattr(a, "fichiers", []):
++                    p_file = Path(ch).expanduser().resolve()
++                    if p_file.is_file():
++                        if p_file.stat().st_size > 20 * 1024 * 1024:
++                            raise Erreur(T(f"Fichier trop volumineux ({p_file.name}) : maximum 20 Mo.",
++                                           f"File too large ({p_file.name}): maximum 20 MB."))
++                        fichiers_payload.append({
++                            "filename": p_file.name,
++                            "content_base64": base64.b64encode(p_file.read_bytes()).decode("ascii"),
++                        })
+                 try:
+                     t = demander(c, uuid.uuid4().hex, " ".join(getattr(a, "question", [])), briefing=commande == "briefing",
+-                                 mesures=mesures, choix=proposes)
++                                 mesures=mesures, choix=proposes, fichiers=fichiers_payload or None)
+                 finally:
+                     if mesures:
+                         print(json.dumps({"timings_ms": mesures}), file=sys.stderr, flush=True)
+diff --git a/tests/test_assistant.py b/tests/test_assistant.py
+index 090b31c..3148dee 100644
+--- a/tests/test_assistant.py
++++ b/tests/test_assistant.py
+@@ -641,6 +641,52 @@ class Assistant(unittest.TestCase):
+         r=self.cli('rappel-notifier','../invalid')
+         self.assertNotEqual(r.returncode,0)
+ 
++    def test_selectionner_fichiers_cli(self):
++        f1 = self.root / "fichier1.txt"
++        f1.write_text("un")
++        f2 = self.root / "fichier2.pdf"
++        f2.write_bytes(b"%PDF")
++        zenity = self.bin / "zenity"
++        zenity.write_text(f'#!/bin/sh\nprintf "{f1}|{f2}\\n"\n')
++        zenity.chmod(0o755)
++        r = self.cli("selectionner-fichiers")
++        self.assertEqual(r.returncode, 0, r.stderr)
++        d = json.loads(r.stdout)
++        self.assertTrue(d.get("ok"))
++        self.assertEqual(d.get("files"), [str(f1.resolve()), str(f2.resolve())])
++
++    def test_requete_ile_forwards_attachments_to_server(self):
++        f = self.root / "notes.txt"
++        f.write_text("contenu secret")
++        entree = json.dumps({
++            "session_id": "a" * 32,
++            "question": "regarde ce fichier",
++            "fichiers": [str(f)]
++        })
++        r = self.cli("requete-ile", input=entree)
++        self.assertEqual(r.returncode, 0, r.stderr)
++        self.assertTrue(json.loads(r.stdout)["ok"])
++        self.assertTrue(self.server.recus)
++        body = self.server.recus[-1][3]
++        self.assertIn("files", body)
++        self.assertEqual(len(body["files"]), 1)
++        self.assertEqual(body["files"][0]["filename"], "notes.txt")
++        self.assertIn("content_base64", body["files"][0])
++
++    def test_requete_ile_rejects_oversized_file(self):
++        gros = self.root / "gros.bin"
++        with gros.open("wb") as fp:
++            fp.seek(21 * 1024 * 1024)
++            fp.write(b"\0")
++        entree = json.dumps({
++            "session_id": "a" * 32,
++            "question": "fichier trop gros",
++            "fichiers": [str(gros)]
++        })
++        r = self.cli("requete-ile", input=entree)
++        self.assertEqual(r.returncode, 1)
++        self.assertTrue(any(mot in json.loads(r.stdout)["error"] for mot in ("trop volumineux", "too large", "20 M")))
++
+ 
+ class InstallationPortable(unittest.TestCase):
+     @unittest.skipUnless(shutil.which("lua"), "Lua requis pour le lanceur de repli")
+diff --git a/tests/test_assistant_page.py b/tests/test_assistant_page.py
+index 776a6d4..588cd4b 100644
+--- a/tests/test_assistant_page.py
++++ b/tests/test_assistant_page.py
+@@ -548,3 +548,30 @@ if(etape===0){creer();trouver(page,"nc-jarvis-mic").clic();verifier(page.ecouteV
+ else if(etape===1&&!page.ecouteVocale){verifier(page.information==="Micro coupé","erreur : "+page.information);Qt.quit()}
+ ''', dictee={"start": {"ok": False, "error": "Micro coupé"}})
+ 
++    def test_attachments_workflow_and_payload(self):
++        recus = self.executer('''
++if(etape===0){
++    creer();
++    var trombone = trouver(page, "nc-jarvis-attach");
++    verifier(trombone !== null, "bouton trombone introuvable");
++    AssistantEtat.ajouterFichier("/tmp/test_doc.pdf");
++    verifier(AssistantEtat.fichiersEnAttente.length === 1, "fichier non ajouté");
++    verifier(AssistantEtat.fichiersEnAttente[0].nom === "test_doc.pdf", "nom de fichier incorrect");
++    var apercu = trouver(page, "nc-jarvis-attachments-preview");
++    verifier(apercu !== null && apercu.visible, "prévisualisation non visible");
++    AssistantEtat.brouillon = "analyse ce document";
++    AssistantEtat.envoyer();
++    verifier(AssistantEtat.fichiersEnAttente.length === 0, "fichiers en attente non vidés après envoi");
++    etape++;
++} else if(etape===1 && !AssistantEtat.enCours) {
++    verifier(AssistantEtat.messages.length === 2, "messages manquants");
++    verifier(AssistantEtat.messages[0].fichiers.length === 1, "badge fichier absent du message");
++    verifier(AssistantEtat.messages[0].fichiers[0] === "test_doc.pdf", "nom de fichier du message incorrect");
++    Qt.quit();
++}
++''')
++        self.assertEqual(len(recus), 1)
++        self.assertEqual(recus[0]["payload"]["question"], "analyse ce document")
++        self.assertEqual(recus[0]["payload"]["fichiers"], ["/tmp/test_doc.pdf"])
++
++
