@@ -10,7 +10,7 @@ import httpx
 import os
 import logging
 import time
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +85,7 @@ async def forward_to_runner(
     permission_mode: str | None = None,
     image_base64: str | None = None,
     image_filename: str | None = None,
+    files: list[Any] | None = None,
     session_key: str | None = None,
 ) -> dict:
     """Transmet un prompt au home-runner et retourne sa réponse."""
@@ -128,6 +129,11 @@ async def forward_to_runner(
         if image_base64:
             payload["image_base64"] = image_base64
             payload["image_filename"] = image_filename or "upload.png"
+        if files:
+            payload["files"] = [
+                f.model_dump() if hasattr(f, "model_dump") else (f.dict() if hasattr(f, "dict") else f)
+                for f in files
+            ]
 
         req_headers = {"X-Secret-Key": SECRET_KEY}
         try:

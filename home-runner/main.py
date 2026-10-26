@@ -62,8 +62,11 @@ SECRET_KEY: str = os.environ.get("SECRET_KEY", "")
 PORT: int = int(os.environ.get("PORT", "8080"))
 AGY_TIMEOUT: int = int(os.environ.get("AGY_TIMEOUT", "600"))
 MAX_PROMPT_CHARS: int = int(os.environ.get("MAX_PROMPT_CHARS", "20000"))
-MAX_IMAGE_MB: int = int(os.environ.get("MAX_IMAGE_MB", "10"))
+MAX_IMAGE_MB: int = int(os.environ.get("MAX_IMAGE_MB", "20"))
 MAX_IMAGE_BYTES: int = max(1, MAX_IMAGE_MB) * 1024 * 1024
+MAX_FILE_MB: int = int(os.environ.get("MAX_FILE_MB", "20"))
+MAX_FILE_BYTES: int = max(1, MAX_FILE_MB) * 1024 * 1024
+MAX_FILES_COUNT: int = int(os.environ.get("MAX_FILES_COUNT", "5"))
 
 if not SECRET_KEY:
     raise RuntimeError(
@@ -195,6 +198,14 @@ async def log_requests(request: Request, call_next):
 # ---------------------------------------------------------------------------
 
 
+class FileAttachment(BaseModel):
+    """Fichier joint envoyé par un client (image, pdf, texte, code...)."""
+
+    filename: str = Field(..., max_length=255, description="Nom original du fichier.")
+    content_base64: str = Field(..., description="Contenu encodé en base64.")
+    mime_type: str | None = Field(default=None, max_length=128, description="Type MIME.")
+
+
 class RunRequest(BaseModel):
     """Corps de la requête POST /run."""
 
@@ -225,6 +236,10 @@ class RunRequest(BaseModel):
         default=None,
         max_length=255,
         description="Nom original du fichier image.",
+    )
+    files: list[FileAttachment] | None = Field(
+        default=None,
+        description="Liste des fichiers joints encodés en base64 (max 5).",
     )
     session_key: str | None = Field(
         default="default",
@@ -600,46 +615,69 @@ async def run(request: Request, body: RunRequest):
     )
 
     active_prompt = body.prompt
-    if body.image_base64:
-        try:
-            image_bytes = base64.b64decode(body.image_base64, validate=True)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=400, detail="Image base64 invalide."
-            ) from exc
-        if len(image_bytes) > MAX_IMAGE_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"Image trop volumineuse ({len(image_bytes) / 1024 / 1024:.1f} Mo, "
-                    f"maximum {MAX_IMAGE_MB} Mo)."
-                ),
-            )
 
-        try:
-            upload_dir = Path("/tmp/assistant_uploads")
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            safe_name = re.sub(
-                r"[^a-zA-Z0-9_\.-]", "_", body.image_filename or "image.png"
-            )
-            unique_filename = f"{uuid.uuid4().hex[:8]}_{safe_name}"
-            saved_img_path = upload_dir / unique_filename
-            with open(saved_img_path, "wb") as img_file:
-                img_file.write(image_bytes)
-            logger.info(
-                "Image utilisateur enregistrée: %s (%d octets)",
-                saved_img_path,
-                len(image_bytes),
-            )
-            active_prompt = (
-                f"[Image fournie par l'utilisateur: {saved_img_path}]\n\n"
-                f"{active_prompt}"
-            )
-        except Exception as exc:
-            logger.error("Erreur lors de l'enregistrement de l'image utilisateur: %s", exc)
+    # Rassemble les fichiers à traiter (support rétrocompatible image_base64 + nouveau tableau files)
+    attachments: list[FileAttachment] = []
+    if body.files:
+        if len(body.files) > MAX_FILES_COUNT:
             raise HTTPException(
-                status_code=500, detail="Impossible d'enregistrer l'image."
-            ) from exc
+                status_code=400,
+                detail=f"Trop de fichiers joints ({len(body.files)} > maximum {MAX_FILES_COUNT}).",
+            )
+        attachments.extend(body.files)
+    elif body.image_base64:
+        attachments.append(
+            FileAttachment(
+                filename=body.image_filename or "image.png",
+                content_base64=body.image_base64,
+            )
+        )
+
+    if attachments:
+        upload_dir = Path("/tmp/assistant_uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        file_notices: list[str] = []
+
+        for att in attachments:
+            try:
+                file_bytes = base64.b64decode(att.content_base64, validate=True)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"Contenu base64 invalide pour '{att.filename}'."
+                ) from exc
+
+            if len(file_bytes) > MAX_FILE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Fichier '{att.filename}' trop volumineux ({len(file_bytes) / 1024 / 1024:.1f} Mo, "
+                        f"maximum {MAX_FILE_MB} Mo)."
+                    ),
+                )
+
+            try:
+                safe_name = re.sub(r"[^a-zA-Z0-9_\.-]", "_", att.filename or "fichier")
+                unique_filename = f"{uuid.uuid4().hex[:8]}_{safe_name}"
+                saved_path = upload_dir / unique_filename
+                with open(saved_path, "wb") as f_out:
+                    f_out.write(file_bytes)
+                logger.info(
+                    "Fichier utilisateur enregistré: %s (%d octets)",
+                    saved_path,
+                    len(file_bytes),
+                )
+                ext = saved_path.suffix.lower()
+                is_img = ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")
+                tag = "Image" if is_img else "Fichier"
+                file_notices.append(f"[{tag} fournie par l'utilisateur: {saved_path}]" if is_img else f"[{tag} fourni par l'utilisateur: {saved_path}]")
+            except Exception as exc:
+                logger.error("Erreur lors de l'enregistrement du fichier utilisateur: %s", exc)
+                raise HTTPException(
+                    status_code=500, detail=f"Impossible d'enregistrer le fichier '{att.filename}'."
+                ) from exc
+
+        if file_notices:
+            active_prompt = "\n".join(file_notices) + "\n\n" + active_prompt
 
     s_key = (body.session_key or "default").strip()
     origin_tok_hdr = request.headers.get("X-Jarvis-Origin-Token", "").strip() or None

@@ -456,6 +456,14 @@ async def limit_desktop_api(request: Request, call_next):
 _ASK_SESSION_KEY_RE = re.compile(r'^(?:default|desktop:[\w.@-]{1,180})$', re.ASCII)
 
 
+class FileAttachment(BaseModel):
+    """Fichier joint encodé en base64 pour l'assistant."""
+
+    filename: str = Field(..., max_length=255, description="Nom original du fichier.")
+    content_base64: str = Field(..., description="Contenu du fichier encodé en base64.")
+    mime_type: Optional[str] = Field(default=None, max_length=128, description="Type MIME optionnel.")
+
+
 class AskRequest(BaseModel):
     """Corps d'une requête de question depuis un client externe."""
 
@@ -474,6 +482,9 @@ class AskRequest(BaseModel):
     )
     model: Optional[str] = Field(default=None, description="Modèle à utiliser")
     effort: Optional[str] = Field(default=None, description="Niveau d'effort")
+    files: Optional[list[FileAttachment]] = Field(default=None, description="Fichiers joints encodés en base64")
+    image_base64: Optional[str] = Field(default=None, description="Image encodée en base64 (compatibilité)")
+    image_filename: Optional[str] = Field(default=None, description="Nom original de l'image (compatibilité)")
 
 
 class BriefingRequest(BaseModel):
@@ -533,6 +544,9 @@ async def api_ask(payload: AskRequest) -> dict:
         continue_session=payload.continue_session,
         reset_session=payload.reset_session,
         session_key=effective_session_key,
+        files=payload.files,
+        image_base64=payload.image_base64,
+        image_filename=payload.image_filename,
     )
 
     output = result.get("output", "")

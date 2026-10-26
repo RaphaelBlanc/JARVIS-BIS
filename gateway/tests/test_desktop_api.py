@@ -46,6 +46,39 @@ class TestDesktopAPI(unittest.TestCase):
         self.assertEqual(data["output"], "Bonjour depuis le runner !")
         mock_forward.assert_awaited_once()
 
+    @patch("gateway.forward_to_runner", new_callable=AsyncMock)
+    def test_ask_with_files(self, mock_forward):
+        mock_forward.return_value = {
+            "success": True,
+            "output": "Fichiers reçus !",
+            "error": None,
+        }
+        resp = self.client.post(
+            "/api/ask",
+            json={
+                "prompt": "Analyse ces fichiers",
+                "platform": "desktop",
+                "user_id": "test_user",
+                "files": [
+                    {
+                        "filename": "doc.pdf",
+                        "content_base64": "JVBERi0xLjQK",
+                        "mime_type": "application/pdf",
+                    }
+                ],
+            },
+            headers=self.auth_headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["success"])
+        self.assertEqual(data["output"], "Fichiers reçus !")
+        mock_forward.assert_awaited_once()
+        _, kwargs = mock_forward.call_args
+        self.assertIsNotNone(kwargs.get("files"))
+        self.assertEqual(len(kwargs["files"]), 1)
+        self.assertEqual(kwargs["files"][0].filename, "doc.pdf")
+
     @patch("gateway.fetch_health", new_callable=AsyncMock)
     @patch("gateway.fetch_session", new_callable=AsyncMock)
     def test_status_endpoint(self, mock_session, mock_health):
