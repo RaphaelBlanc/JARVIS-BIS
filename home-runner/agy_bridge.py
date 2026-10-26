@@ -726,8 +726,8 @@ class _AgyStreamWorker:
             cmd.extend(["--effort", self.effort])
         if self.mode:
             cmd.extend(["--mode", self.mode])
-        if self.permission_mode and self.permission_mode != "default":
-            cmd.extend(["--permission-mode", self.permission_mode])
+        if self.permission_mode != "request-review":
+            cmd.append("--dangerously-skip-permissions")
 
         env = {
             **os.environ,
@@ -1006,11 +1006,11 @@ async def _run_agy_oneshot(
     if active_mode:
         cmd.extend(["--mode", active_mode])
 
-    # Permissions strictement validées contre _ALLOWED_PERMISSION_MODES
+    # Permissions : auto-approbation requise en mode headless sauf en revue explicite
     raw_perm = (permission_mode or cfg.get("permission_mode") or "default").strip().lower()
     perm = raw_perm if raw_perm in _ALLOWED_PERMISSION_MODES else "default"
-    if perm != "default":
-        cmd.extend(["--permission-mode", perm])
+    if perm != "request-review":
+        cmd.append("--dangerously-skip-permissions")
 
     # Prompt et format
     cmd.extend(["-p", prompt, "--output-format", "text"])
