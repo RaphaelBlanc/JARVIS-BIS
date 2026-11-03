@@ -15,13 +15,13 @@ import httpx
 
 load_dotenv()
 
-MOODLE_URL = os.getenv("MOODLE_URL", "https://moodle.epita.fr").rstrip("/")
+MOODLE_URL = os.getenv("MOODLE_URL", "").rstrip("/")
 MOODLE_API_KEY = os.getenv("MOODLE_API_KEY", "").strip()
 
 
 def is_moodle_configured() -> bool:
-  """Checks if Moodle API key or session cookie is set."""
-  return bool(MOODLE_API_KEY)
+  """Checks if Moodle URL and API key or session cookie are set."""
+  return bool(MOODLE_URL and MOODLE_API_KEY)
 
 
 def is_session_cookie(key: str) -> bool:
@@ -33,17 +33,22 @@ def is_session_cookie(key: str) -> bool:
 
 async def call_moodle_ajax(wsfunction: str, params: dict | None = None) -> Any:
   """Calls Moodle AJAX service.php using MoodleSession cookie."""
-  if not MOODLE_API_KEY:
+  if not is_moodle_configured():
     return None
+
+  moodle_url = MOODLE_URL if MOODLE_URL.startswith(("http://", "https://")) else f"https://{MOODLE_URL}"
+  host = httpx.URL(moodle_url).host
+  jar = httpx.Cookies()
+  jar.set("MoodleSession", MOODLE_API_KEY, domain=host)
 
   async with httpx.AsyncClient(
       timeout=15.0,
-      cookies={"MoodleSession": MOODLE_API_KEY},
+      cookies=jar,
       follow_redirects=True,
   ) as client:
     # 1. Retrieve sesskey from dashboard
     try:
-      resp = await client.get(f"{MOODLE_URL}/my/")
+      resp = await client.get(f"{moodle_url}/my/")
       if resp.status_code != 200:
         raise ValueError(f"Impossible de joindre Moodle (code {resp.status_code}).")
     except httpx.HTTPError:
@@ -55,7 +60,7 @@ async def call_moodle_ajax(wsfunction: str, params: dict | None = None) -> Any:
     sesskey = m.group(1)
 
     # 2. Call AJAX endpoint
-    endpoint = f"{MOODLE_URL}/lib/ajax/service.php"
+    endpoint = f"{moodle_url}/lib/ajax/service.php"
     query_params = {"sesskey": sesskey, "info": wsfunction}
     payload = [{
         "index": 0,
@@ -88,13 +93,14 @@ async def call_moodle_ajax(wsfunction: str, params: dict | None = None) -> Any:
 
 async def call_moodle_ws(wsfunction: str, params: dict | None = None) -> Any:
   """Calls a Moodle WebService REST function, or falls back to AJAX session if cookie is used."""
-  if not MOODLE_API_KEY:
+  if not is_moodle_configured():
     return None
 
   if is_session_cookie(MOODLE_API_KEY):
     return await call_moodle_ajax(wsfunction, params)
 
-  endpoint = f"{MOODLE_URL}/webservice/rest/server.php"
+  moodle_url = MOODLE_URL if MOODLE_URL.startswith(("http://", "https://")) else f"https://{MOODLE_URL}"
+  endpoint = f"{moodle_url}/webservice/rest/server.php"
   data = {
       "wstoken": MOODLE_API_KEY,
       "wsfunction": wsfunction,
@@ -125,7 +131,7 @@ async def get_upcoming_assignments() -> dict[str, Any]:
   """
   if not is_moodle_configured():
     msg = (
-        "⚠️ <b>Clé API ou cookie Moodle non configuré.</b>\n\n"
+        "⚠️ <b>Moodle non configuré.</b>\n\n"
         "Pour synchroniser vos devoirs et TPs :\n"
         "1. Connectez-vous sur votre espace Moodle\n"
         "2. Renseignez votre token ou cookie <code>MoodleSession</code> dans <code>.env</code> sous <code>MOODLE_API_KEY=...</code>\n\n"
@@ -134,7 +140,7 @@ async def get_upcoming_assignments() -> dict[str, Any]:
     return {
         "success": False,
         "message": msg,
-        "output": "⚠️ Clé API ou cookie Moodle non configuré.",
+        "output": "⚠️ Moodle non configuré (MOODLE_URL ou MOODLE_API_KEY manquant).",
         "assignments": [],
     }
 
@@ -247,13 +253,13 @@ async def get_enrolled_courses() -> dict[str, Any]:
   """Retrieves list of enrolled courses from Moodle."""
   if not is_moodle_configured():
     msg = (
-        "⚠️ <b>Cookie ou clé API Moodle non configuré.</b>\n"
+        "⚠️ <b>Moodle non configuré.</b>\n"
         "Ajoutez votre cookie <code>MoodleSession</code> ou clé dans <code>.env</code> sous <code>MOODLE_API_KEY=...</code>"
     )
     return {
         "success": False,
         "message": msg,
-        "output": "⚠️ Cookie ou clé API Moodle non configuré.",
+        "output": "⚠️ Moodle non configuré (MOODLE_URL ou MOODLE_API_KEY manquant).",
         "courses": [],
     }
 

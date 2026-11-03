@@ -6,11 +6,30 @@ import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import httpx
+
 from core.tools import moodle_client
 from core.tools.dispatcher import execute_tool_action
 
 
 class TestMoodleClient(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        self.patch_url = patch.object(moodle_client, "MOODLE_URL", "https://moodle.example.com")
+        self.patch_url.start()
+
+    def tearDown(self):
+        self.patch_url.stop()
+
+    def test_is_moodle_configured(self):
+        with patch.object(moodle_client, "MOODLE_URL", ""), patch.object(moodle_client, "MOODLE_API_KEY", ""):
+            self.assertFalse(moodle_client.is_moodle_configured())
+        with patch.object(moodle_client, "MOODLE_URL", "https://moodle.example.com"), patch.object(moodle_client, "MOODLE_API_KEY", ""):
+            self.assertFalse(moodle_client.is_moodle_configured())
+        with patch.object(moodle_client, "MOODLE_URL", ""), patch.object(moodle_client, "MOODLE_API_KEY", "dummy_key"):
+            self.assertFalse(moodle_client.is_moodle_configured())
+        with patch.object(moodle_client, "MOODLE_URL", "https://moodle.example.com"), patch.object(moodle_client, "MOODLE_API_KEY", "dummy_key"):
+            self.assertTrue(moodle_client.is_moodle_configured())
 
     def test_is_session_cookie(self):
         # 32 caractères hexadécimaux -> wstoken classique
@@ -21,6 +40,35 @@ class TestMoodleClient(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(moodle_client.is_session_cookie("fake_moodle_session_test_xyz123"))
         self.assertTrue(moodle_client.is_session_cookie("dummy_cookie_session_abc"))
         self.assertTrue(moodle_client.is_session_cookie("short_token"))
+
+    @patch("httpx.AsyncClient")
+    async def test_call_moodle_ajax_cookie_domain_restriction(self, mock_client_cls):
+        """Vérifie que le cookie de session Moodle est strictement restreint au domaine configuré."""
+        from unittest.mock import MagicMock
+        with patch.object(moodle_client, "MOODLE_URL", "https://moodle.example.com"), \
+             patch.object(moodle_client, "MOODLE_API_KEY", "dummy_session_cookie"):
+            mock_client = AsyncMock()
+            mock_client_cls.return_value.__aenter__.return_value = mock_client
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.text = '{"sesskey":"mock_dummy_sesskey_98765"}'
+            mock_client.get.return_value = mock_resp
+            mock_post_resp = MagicMock()
+            mock_post_resp.json.return_value = [{"data": "ok"}]
+            mock_post_resp.raise_for_status.return_value = None
+            mock_client.post.return_value = mock_post_resp
+
+            await moodle_client.call_moodle_ajax("core_test_func")
+
+            _, kwargs = mock_client_cls.call_args
+            jar = kwargs.get("cookies")
+            self.assertIsNotNone(jar)
+            cookies_list = list(jar.jar)
+            self.assertEqual(len(cookies_list), 1)
+            cookie = cookies_list[0]
+            self.assertEqual(cookie.name, "MoodleSession")
+            self.assertEqual(cookie.value, "dummy_session_cookie")
+            self.assertEqual(cookie.domain, "moodle.example.com")
 
     @patch("core.tools.moodle_client.call_moodle_ws")
     async def test_get_upcoming_assignments_filters_past_and_escapes_html(self, mock_call):
@@ -80,12 +128,12 @@ class TestMoodleClient(unittest.IsolatedAsyncioTestCase):
 
     @patch("core.tools.moodle_client.call_moodle_ws")
     async def test_error_message_sanitizes_sesskey(self, mock_call):
-        mock_call.side_effect = Exception("Erreur critique sesskey=WyueSecretSessKey123 dans l'appel")
+        mock_call.side_effect = Exception("Erreur critique sesskey=mock_dummy_sesskey_98765 dans l'appel")
         with patch.object(moodle_client, "MOODLE_API_KEY", "dummy_test_session_cookie"):
             res = await moodle_client.get_enrolled_courses()
             self.assertFalse(res["success"])
-            self.assertNotIn("WyueSecretSessKey123", res["message"])
-            self.assertNotIn("WyueSecretSessKey123", res["output"])
+            self.assertNotIn("mock_dummy_sesskey_98765", res["message"])
+            self.assertNotIn("mock_dummy_sesskey_98765", res["output"])
 
     @patch("core.tools.moodle_client.get_enrolled_courses")
     async def test_dispatcher_moodle_cours(self, mock_courses):
