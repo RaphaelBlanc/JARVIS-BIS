@@ -1,0 +1,63 @@
+diff --git a/home/.config/quickshell/nc-ile/AssistantEtat.qml b/home/.config/quickshell/nc-ile/AssistantEtat.qml
+index 3b39f03..776c661 100644
+--- a/home/.config/quickshell/nc-ile/AssistantEtat.qml
++++ b/home/.config/quickshell/nc-ile/AssistantEtat.qml
+@@ -41,6 +41,7 @@ Singleton {
+         {nom:Reglages.t("/courses","/shopping"), alias:["/courses","/shopping"], arguments:true, description:Reglages.t("Voir les courses ou ajouter des articles", "View groceries or add items")},
+         {nom:Reglages.t("/depenses","/expenses"), alias:["/depenses","/expenses"], arguments:true, description:Reglages.t("Bilan ou ajout d’une dépense", "Summary or add an expense")},
+         {nom:Reglages.t("/devoirs","/moodle"), alias:["/devoirs","/moodle"], arguments:false, description:Reglages.t("Consulter les devoirs", "View homework")},
++        {nom:Reglages.t("/cours","/moodle-cours"), alias:["/cours","/moodle-cours"], arguments:false, description:Reglages.t("Consulter les cours Moodle", "View Moodle courses")},
+         {nom:Reglages.t("/rappel","/remind"), alias:["/rappel","/remind"], arguments:true, description:Reglages.t("Rappel : /rappel [bureau|telegram|discord] [tous les jours|chaque samedi|toutes les 3 heures] <délai ou heure> <message>", "Reminder: /remind [desktop|telegram|discord] [every day|every saturday|every 3 hours] <delay or time> <message>")},
+         {nom:Reglages.t("/rappels","/reminders"), alias:["/rappels","/reminders"], arguments:false, description:Reglages.t("Rappels en attente sur le serveur", "Pending reminders on the server")},
+         {nom:"/supprimer", alias:["/supprimer","/delrappel"], arguments:true, description:Reglages.t("Supprimer un rappel : /supprimer <numéro>", "Delete a reminder: /supprimer <number>")},
+diff --git a/home/.local/bin/nc-assistant b/home/.local/bin/nc-assistant
+index 47ee811..4b9c574 100755
+--- a/home/.local/bin/nc-assistant
++++ b/home/.local/bin/nc-assistant
+@@ -883,6 +883,7 @@ def executer_commande(c, sid, cmd_brute):
+             "• `/courses` [ajouter <articles>] — Consulter ou ajouter des courses\n"
+             "• `/depenses` [montant desc] — Bilan mensuel ou ajout d'une dépense\n"
+             "• `/devoirs` — Consulter les devoirs (Moodle)\n"
++            "• `/cours` — Consulter la liste des cours (Moodle)\n"
+             "• `/rappel [bureau|telegram|discord] [tous les jours|chaque samedi|toutes les 3 heures] <délai ou heure> <message>` — Rappel (bureau par défaut ; récurrent : telegram ou discord)\n"
+             "• `/rappels` — Rappels en attente sur le serveur ; `/supprimer <numéro>` en retire un\n"
+             "• `/memoire` [texte] — Consulter ou enregistrer un fait en mémoire",
+@@ -897,6 +898,7 @@ def executer_commande(c, sid, cmd_brute):
+             "• `/shopping` [add <text>] — View or add grocery items\n"
+             "• `/expenses` [amount desc] — Monthly summary or add an expense\n"
+             "• `/moodle` — View homework\n"
++            "• `/cours` — View enrolled Moodle courses\n"
+             "• `/remind [desktop|telegram|discord] [every day|every saturday|every 3 hours] <delay or time> <message>` — Reminder (desktop by default; recurring: telegram or discord)\n"
+             "• `/rappels` — Pending reminders on the server; `/supprimer <number>` removes one\n"
+             "• `/memory` [text] — View or record a fact in memory"
+@@ -1015,6 +1017,13 @@ def executer_commande(c, sid, cmd_brute):
+         except Exception as e:
+             return T(f"Erreur consultation devoirs : {e}", f"Error viewing homework: {e}")
+ 
++    if nom_cmd in ("/cours", "/courses-moodle"):
++        try:
++            res = api(c, "/api/action", {"tool": "moodle", "action": "cours", "params": {}, "platform": "desktop"})
++            return f"📚 **{T('Cours Moodle EPITA', 'Moodle Courses')} :**\n\n{texte_sortie(res)}"
++        except Exception as e:
++            return T(f"Erreur consultation cours : {e}", f"Error viewing courses: {e}")
++
+     if nom_cmd in ("/rappel", "/remind"):
+         plateformes, recurrence, delai, echeance, msg = lire_rappel(arg)
+         quand = T(f"dans {delai}", f"in {delai}") if delai else T("le ", "on ") + echeance.strftime("%d/%m %H:%M")
+diff --git a/home/.local/share/nc-jarvis/actions.json b/home/.local/share/nc-jarvis/actions.json
+index 9f21cf4..ee3103d 100644
+--- a/home/.local/share/nc-jarvis/actions.json
++++ b/home/.local/share/nc-jarvis/actions.json
+@@ -49,6 +49,12 @@
+       "label": "Voir les devoirs",
+       "fields": [],
+       "readonly": true
++    },
++    {
++      "id": "cours",
++      "label": "Consulter les cours",
++      "fields": [],
++      "readonly": true
+     }
+   ],
+   "expenses": [
