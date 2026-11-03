@@ -22,12 +22,12 @@ class SystemPcTool(BaseTool):
 
 class MoodleTool(BaseTool):
     id = "moodle"
-    name = "Moodle EPITA"
+    name = "Moodle"
     description = "Synchronisation automatique des devoirs, TPs et échéances académiques."
     icon = "🎓"
     requires_local_hardware = False
     params = [
-        ToolParam("MOODLE_URL", "URL du serveur Moodle", default="https://moodle.epita.fr"),
+        ToolParam("MOODLE_URL", "URL du serveur Moodle", default=""),
         ToolParam("MOODLE_API_KEY", "Token WebService ou cookie MoodleSession", secret=True),
     ]
 

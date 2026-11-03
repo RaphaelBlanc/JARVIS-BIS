@@ -41,7 +41,7 @@ OBSIDIAN_VAULT_PATH = Path(
 )
 
 # Moodle
-MOODLE_URL = os.getenv("MOODLE_URL", "https://moodle.epita.fr").rstrip("/")
+MOODLE_URL = os.getenv("MOODLE_URL", "").rstrip("/")
 MOODLE_API_KEY = os.getenv("MOODLE_API_KEY", "").strip()
 
 # Gemini API pour OCR direct
