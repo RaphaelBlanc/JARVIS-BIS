@@ -197,20 +197,24 @@ async def get_upcoming_assignments() -> dict[str, Any]:
       lines.append(f"   📚 <i>{item['course']}</i>")
       lines.append(f"   ⏳ Échéance : <b>{item['due_date']}</b>\n")
 
+    msg = "\n".join(lines).strip()
     return {
         "success": True,
-        "message": "\n".join(lines).strip(),
+        "message": msg,
+        "output": msg,
         "assignments": events_list,
     }
 
   except Exception as e:
     logging.error(f"Error fetching Moodle assignments: {e}", exc_info=True)
+    err_msg = (
+        "⚠️ <b>Erreur de connexion à Moodle EPITA :</b>\n"
+        f"<code>{str(e)}</code>\nVérifiez votre clé API ou cookie MoodleSession dans .env."
+    )
     return {
         "success": False,
-        "message": (
-            "⚠️ <b>Erreur de connexion à Moodle EPITA :</b>\n"
-            f"<code>{str(e)}</code>\nVérifiez votre clé API ou cookie MoodleSession dans .env."
-        ),
+        "message": err_msg,
+        "output": err_msg,
         "assignments": [],
     }
 
@@ -255,19 +259,23 @@ async def get_enrolled_courses() -> dict[str, Any]:
     if len(courses) > 15:
       lines.append(f"\n<i>... et {len(courses) - 15} autres cours.</i>")
 
+    msg = "\n".join(lines).strip()
     return {
         "success": True,
-        "message": "\n".join(lines).strip(),
+        "message": msg,
+        "output": msg,
         "courses": courses,
     }
 
   except Exception as e:
     logging.error(f"Error fetching Moodle courses: {e}", exc_info=True)
+    err_msg = (
+        "⚠️ <b>Erreur de connexion à Moodle EPITA :</b>\n"
+        f"<code>{str(e)}</code>"
+    )
     return {
         "success": False,
-        "message": (
-            "⚠️ <b>Erreur de connexion à Moodle EPITA :</b>\n"
-            f"<code>{str(e)}</code>"
-        ),
+        "message": err_msg,
+        "output": err_msg,
         "courses": [],
     }
