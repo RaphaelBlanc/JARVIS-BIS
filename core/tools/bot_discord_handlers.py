@@ -42,6 +42,14 @@ async def devoirs_slash(interaction: discord.Interaction) -> None:
     await interaction.followup.send(msg[:2000])
 
 
+@app_commands.command(name="cours", description="Consulter les cours inscrits sur Moodle EPITA")
+async def cours_slash(interaction: discord.Interaction) -> None:
+    await interaction.response.defer()
+    res = await execute_tool_action("moodle", "cours", platform="discord")
+    msg = _clean_html_for_discord(res.get("message", "Aucun cours trouvé."))
+    await interaction.followup.send(msg[:2000])
+
+
 @app_commands.command(name="depense", description="Enregistrer une dépense et vérifier le budget")
 @app_commands.describe(montant="Montant en euros (€)", description="Description ou commerçant")
 async def depense_slash(interaction: discord.Interaction, montant: float, description: str = "Dépense") -> None:
@@ -215,6 +223,7 @@ def register_modular_discord_commands(tree: app_commands.CommandTree) -> None:
     """Ajoute les commandes slash modulaires au CommandTree de Discord."""
     commands = [
         devoirs_slash,
+        cours_slash,
         depense_slash,
         budget_slash,
         courses_slash,

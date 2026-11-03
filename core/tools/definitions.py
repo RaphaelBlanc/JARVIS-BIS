@@ -28,7 +28,7 @@ class MoodleTool(BaseTool):
     requires_local_hardware = False
     params = [
         ToolParam("MOODLE_URL", "URL du serveur Moodle", default="https://moodle.epita.fr"),
-        ToolParam("MOODLE_API_KEY", "Token WebService Moodle", secret=True),
+        ToolParam("MOODLE_API_KEY", "Token WebService ou cookie MoodleSession", secret=True),
     ]
 
 

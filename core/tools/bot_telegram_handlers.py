@@ -253,6 +253,12 @@ async def cmd_devoirs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(res.get("message", "Aucun devoir trouvé."), parse_mode=ParseMode.HTML)
 
 
+async def cmd_cours(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Commande /cours : affiche la liste des cours Moodle EPITA."""
+    res = await execute_tool_action("moodle", "cours", platform="telegram")
+    await update.message.reply_text(res.get("message", "Aucun cours trouvé."), parse_mode=ParseMode.HTML)
+
+
 async def cmd_depense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Commande /depense <montant> [description] : enregistre une dépense."""
     args = context.args or []
@@ -490,6 +496,7 @@ def register_modular_telegram_commands(app: Any) -> None:
 
     handlers = [
         ("devoirs", cmd_devoirs),
+        ("cours", cmd_cours),
         ("depense", cmd_depense),
         ("depenses", cmd_depense),
         ("budget", cmd_budget),

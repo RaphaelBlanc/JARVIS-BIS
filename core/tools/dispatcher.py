@@ -62,6 +62,9 @@ async def execute_tool_action(
             if action in ("devoirs", "assignments"):
                 res = await moodle_client.get_upcoming_assignments()
                 return res
+            elif action in ("cours", "courses"):
+                res = await moodle_client.get_enrolled_courses()
+                return res
 
         # ── FINANCES & BUDGET ────────────────────────────────────────────────────
         elif tool_id == "expenses":
