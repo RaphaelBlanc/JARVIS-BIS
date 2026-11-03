@@ -146,6 +146,7 @@ async def get_upcoming_assignments() -> dict[str, Any]:
 
   try:
     now_ts = int(datetime.now().timestamp())
+    moodle_url = MOODLE_URL if MOODLE_URL.startswith(("http://", "https://")) else f"https://{MOODLE_URL}"
     # 1. First attempt: calendar action events (best for upcoming deadlines)
     events_data = await call_moodle_ws(
         "core_calendar_get_action_events_by_timesort",
@@ -162,7 +163,7 @@ async def get_upcoming_assignments() -> dict[str, Any]:
         name = ev.get("name", "Devoir")
         course_name = ev.get("course", {}).get("fullname", "Cours")
         due_dt = datetime.fromtimestamp(timesort)
-        url = ev.get("url", f"{MOODLE_URL}/calendar/view.php")
+        url = ev.get("url", f"{moodle_url}/calendar/view.php")
         events_list.append({
             "title": name,
             "course": course_name,
@@ -173,27 +174,30 @@ async def get_upcoming_assignments() -> dict[str, Any]:
 
     # 2. If no calendar events or alternative: query mod_assign_get_assignments
     if not events_list:
-      assign_data = await call_moodle_ws("mod_assign_get_assignments")
-      if isinstance(assign_data, dict) and "courses" in assign_data:
-        for course in assign_data.get("courses", []):
-          c_name = course.get("fullname", "Cours")
-          for assign in course.get("assignments", []):
-            duedate = assign.get("duedate", 0)
-            if duedate > now_ts:
-              due_dt = datetime.fromtimestamp(duedate)
-              cmid = assign.get("cmid")
-              url = (
-                  f"{MOODLE_URL}/mod/assign/view.php?id={cmid}"
-                  if cmid
-                  else MOODLE_URL
-              )
-              events_list.append({
-                  "title": assign.get("name", "Devoir"),
-                  "course": c_name,
-                  "due_date": due_dt.strftime("%d/%m/%Y à %H:%M"),
-                  "timestamp": duedate,
-                  "url": url,
-              })
+      try:
+        assign_data = await call_moodle_ws("mod_assign_get_assignments")
+        if isinstance(assign_data, dict) and "courses" in assign_data:
+          for course in assign_data.get("courses", []):
+            c_name = course.get("fullname", "Cours")
+            for assign in course.get("assignments", []):
+              duedate = assign.get("duedate", 0)
+              if duedate > now_ts:
+                due_dt = datetime.fromtimestamp(duedate)
+                cmid = assign.get("cmid")
+                url = (
+                    f"{moodle_url}/mod/assign/view.php?id={cmid}"
+                    if cmid
+                    else moodle_url
+                )
+                events_list.append({
+                    "title": assign.get("name", "Devoir"),
+                    "course": c_name,
+                    "due_date": due_dt.strftime("%d/%m/%Y à %H:%M"),
+                    "timestamp": duedate,
+                    "url": url,
+                })
+      except Exception as e:
+        logging.debug(f"mod_assign_get_assignments non disponible ou ignoré: {e}")
 
     # Sort chronologically
     events_list.sort(key=lambda x: x["timestamp"])
@@ -287,7 +291,8 @@ async def get_enrolled_courses() -> dict[str, Any]:
     for c in courses[:15]:
       fullname = html.escape(str(c.get("fullname", "Cours")))
       cid = c.get("id")
-      raw_url = f"{MOODLE_URL}/course/view.php?id={cid}" if cid else MOODLE_URL
+      moodle_url = MOODLE_URL if MOODLE_URL.startswith(("http://", "https://")) else f"https://{MOODLE_URL}"
+      raw_url = f"{moodle_url}/course/view.php?id={cid}" if cid else moodle_url
       safe_url = html.escape(raw_url, quote=True)
       lines.append(f"• <b><a href=\"{safe_url}\">{fullname}</a></b>")
 
