@@ -1,6 +1,7 @@
-"""Tests unitaires pour le client Moodle EPITA (support wstoken et MoodleSession)."""
+"""Tests unitaires pour le client Moodle (support wstoken et MoodleSession)."""
 
 import asyncio
+from datetime import datetime
 import os
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -12,49 +13,83 @@ from core.tools.dispatcher import execute_tool_action
 class TestMoodleClient(unittest.IsolatedAsyncioTestCase):
 
     def test_is_session_cookie(self):
-        # 32 hex chars -> wstoken classique
-        self.assertFalse(moodle_client.is_session_cookie("56c3a54b0d46d40d405933cff0bc9a6d"))
+        # 32 caractères hexadécimaux -> wstoken classique
         self.assertFalse(moodle_client.is_session_cookie("0123456789abcdef0123456789abcdef"))
+        self.assertFalse(moodle_client.is_session_cookie("abcdef0123456789abcdef0123456789"))
 
-        # Cookie de session Moodle (26 chars alphanum avec lettres > f)
-        self.assertTrue(moodle_client.is_session_cookie("omgd5j6bc030dp8ccfie476aem"))
+        # Cookie de session Moodle (chaîne non strictement hexadécimale de 32 chars)
+        self.assertTrue(moodle_client.is_session_cookie("fake_moodle_session_test_xyz123"))
+        self.assertTrue(moodle_client.is_session_cookie("dummy_cookie_session_abc"))
         self.assertTrue(moodle_client.is_session_cookie("short_token"))
 
     @patch("core.tools.moodle_client.call_moodle_ws")
-    async def test_get_upcoming_assignments(self, mock_call):
+    async def test_get_upcoming_assignments_filters_past_and_escapes_html(self, mock_call):
+        future_ts = int(datetime.now().timestamp()) + 3600
+        past_ts = int(datetime.now().timestamp()) - 3600
+
         mock_call.return_value = {
             "events": [
                 {
-                    "name": "TP1 IA Générative",
-                    "course": {"fullname": "IA S1 2025"},
-                    "timesort": 1765148400,
-                    "url": "https://moodle.epita.fr/mod/assign/view.php?id=123",
-                }
+                    "name": "Devoir & TP <Special>",
+                    "course": {"fullname": "Cours & Travaux <Dirigés>"},
+                    "timesort": future_ts,
+                    "url": "https://moodle.example.com/mod/assign/view.php?id=10&tab=1",
+                },
+                {
+                    "name": "Ancien Devoir Passé",
+                    "course": {"fullname": "Ancien Cours"},
+                    "timesort": past_ts,
+                    "url": "https://moodle.example.com/mod/assign/view.php?id=5",
+                },
             ]
         }
-        with patch.object(moodle_client, "MOODLE_API_KEY", "omgd5j6bc030dp8ccfie476aem"):
+        with patch.object(moodle_client, "MOODLE_API_KEY", "dummy_test_session_cookie"):
             res = await moodle_client.get_upcoming_assignments()
             self.assertTrue(res["success"])
+            # L'ancien devoir passé doit être exclu (pas de repli sur le passé)
             self.assertEqual(len(res["assignments"]), 1)
-            self.assertIn("TP1 IA Générative", res["message"])
+            self.assertEqual(res["assignments"][0]["title"], "Devoir & TP <Special>")
+            # Les caractères HTML doivent être échappés dans le message
+            self.assertIn("Devoir &amp; TP &lt;Special&gt;", res["message"])
+            self.assertIn("Cours &amp; Travaux &lt;Dirigés&gt;", res["message"])
+            self.assertNotIn("Ancien Devoir Passé", res["message"])
 
     @patch("core.tools.moodle_client.call_moodle_ws")
-    async def test_get_enrolled_courses(self, mock_call):
+    async def test_get_upcoming_assignments_empty(self, mock_call):
+        mock_call.return_value = {"events": []}
+        with patch.object(moodle_client, "MOODLE_API_KEY", "dummy_test_session_cookie"):
+            res = await moodle_client.get_upcoming_assignments()
+            self.assertTrue(res["success"])
+            self.assertEqual(len(res["assignments"]), 0)
+            self.assertIn("Aucun devoir", res["message"])
+
+    @patch("core.tools.moodle_client.call_moodle_ws")
+    async def test_get_enrolled_courses_escapes_html(self, mock_call):
         mock_call.return_value = {
             "courses": [
-                {"id": 6945, "fullname": "[algo] Graphs"},
-                {"id": 6189, "fullname": "Analyse, séries numériques"},
+                {"id": 101, "fullname": "Algorithmique & Graphes <Avancés>"},
+                {"id": 102, "fullname": "Maths & Séries"},
             ]
         }
-        with patch.object(moodle_client, "MOODLE_API_KEY", "omgd5j6bc030dp8ccfie476aem"):
+        with patch.object(moodle_client, "MOODLE_API_KEY", "dummy_test_session_cookie"):
             res = await moodle_client.get_enrolled_courses()
             self.assertTrue(res["success"])
             self.assertEqual(len(res["courses"]), 2)
-            self.assertIn("[algo] Graphs", res["message"])
+            self.assertIn("Algorithmique &amp; Graphes &lt;Avancés&gt;", res["message"])
+            self.assertIn("output", res)
+
+    @patch("core.tools.moodle_client.call_moodle_ws")
+    async def test_error_message_sanitizes_sesskey(self, mock_call):
+        mock_call.side_effect = Exception("Erreur critique sesskey=WyueSecretSessKey123 dans l'appel")
+        with patch.object(moodle_client, "MOODLE_API_KEY", "dummy_test_session_cookie"):
+            res = await moodle_client.get_enrolled_courses()
+            self.assertFalse(res["success"])
+            self.assertNotIn("WyueSecretSessKey123", res["message"])
+            self.assertNotIn("WyueSecretSessKey123", res["output"])
 
     @patch("core.tools.moodle_client.get_enrolled_courses")
     async def test_dispatcher_moodle_cours(self, mock_courses):
-        mock_courses.return_value = {"success": True, "message": "Cours ok", "courses": []}
+        mock_courses.return_value = {"success": True, "message": "Cours ok", "output": "Cours ok", "courses": []}
         with patch.dict(os.environ, {"ENABLE_TOOL_MOODLE": "1"}):
             res = await execute_tool_action("moodle", "cours")
             self.assertTrue(res["success"])

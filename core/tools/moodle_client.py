@@ -1,10 +1,11 @@
-"""Moodle EPITA Client for JARVIS.
+"""Moodle Client for JARVIS.
 
-Handles retrieval of upcoming assignments, deadlines and announcements via
-Moodle REST Web Services API.
+Handles retrieval of upcoming assignments, deadlines and enrolled courses via
+Moodle REST Web Services API or AJAX session-authenticated API.
 """
 
 from datetime import datetime
+import html
 import logging
 import os
 import re
@@ -14,12 +15,12 @@ import httpx
 
 load_dotenv()
 
-MOODLE_URL = os.getenv("MOODLE_URL", "https://moodle.epita.fr/").rstrip("/")
+MOODLE_URL = os.getenv("MOODLE_URL", "https://moodle.epita.fr").rstrip("/")
 MOODLE_API_KEY = os.getenv("MOODLE_API_KEY", "").strip()
 
 
 def is_moodle_configured() -> bool:
-  """Checks if Moodle API key is set."""
+  """Checks if Moodle API key or session cookie is set."""
   return bool(MOODLE_API_KEY)
 
 
@@ -37,32 +38,50 @@ async def call_moodle_ajax(wsfunction: str, params: dict | None = None) -> Any:
 
   async with httpx.AsyncClient(
       timeout=15.0,
-      headers={"Cookie": f"MoodleSession={MOODLE_API_KEY}"},
+      cookies={"MoodleSession": MOODLE_API_KEY},
       follow_redirects=True,
   ) as client:
     # 1. Retrieve sesskey from dashboard
-    resp = await client.get(f"{MOODLE_URL}/my/")
-    if resp.status_code != 200:
-      raise ValueError(f"Impossible de joindre Moodle EPITA (code {resp.status_code}).")
+    try:
+      resp = await client.get(f"{MOODLE_URL}/my/")
+      if resp.status_code != 200:
+        raise ValueError(f"Impossible de joindre Moodle (code {resp.status_code}).")
+    except httpx.HTTPError:
+      raise RuntimeError("Erreur réseau lors de la communication avec Moodle.") from None
+
     m = re.search(r'"sesskey":"([^"]+)"', resp.text)
     if not m:
       raise ValueError("Session Moodle expirée ou invalide. Veuillez renouveler votre cookie MoodleSession dans .env.")
     sesskey = m.group(1)
 
     # 2. Call AJAX endpoint
-    endpoint = f"{MOODLE_URL}/lib/ajax/service.php?sesskey={sesskey}&info={wsfunction}"
+    endpoint = f"{MOODLE_URL}/lib/ajax/service.php"
+    query_params = {"sesskey": sesskey, "info": wsfunction}
     payload = [{
         "index": 0,
         "methodname": wsfunction,
         "args": params or {},
     }]
-    r = await client.post(endpoint, json=payload)
-    r.raise_for_status()
-    data = r.json()
+    try:
+      r = await client.post(endpoint, params=query_params, json=payload)
+      r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+      # Ne jamais exposer l'URL avec sesskey dans le message d'erreur
+      raise RuntimeError(f"Erreur HTTP {e.response.status_code} sur le service Moodle AJAX.") from None
+    except httpx.RequestError:
+      raise RuntimeError("Erreur de connexion au service Moodle AJAX.") from None
+
+    try:
+      data = r.json()
+    except Exception:
+      raise RuntimeError("Réponse Moodle AJAX invalide.") from None
+
     if isinstance(data, list) and len(data) > 0:
       if data[0].get("error"):
         exc = data[0].get("exception", {})
-        raise RuntimeError(exc.get("message") or exc.get("errorcode") or "Erreur API Moodle AJAX")
+        err_msg = exc.get("message") or exc.get("errorcode") or "Erreur API Moodle AJAX"
+        err_msg = err_msg.replace(sesskey, "[masqué]")
+        raise RuntimeError(err_msg)
       return data[0].get("data")
     return data
 
@@ -85,55 +104,57 @@ async def call_moodle_ws(wsfunction: str, params: dict | None = None) -> Any:
     data.update(params)
 
   async with httpx.AsyncClient(timeout=15.0) as client:
-    response = await client.post(endpoint, data=data)
-    response.raise_for_status()
-    res = response.json()
+    try:
+      response = await client.post(endpoint, data=data)
+      response.raise_for_status()
+      res = response.json()
+    except httpx.HTTPStatusError as e:
+      raise RuntimeError(f"Erreur HTTP {e.response.status_code} sur Moodle REST.") from None
+    except httpx.RequestError:
+      raise RuntimeError("Erreur réseau lors de la requête Moodle REST.") from None
+
     if isinstance(res, dict) and res.get("errorcode") == "invalidtoken":
       return await call_moodle_ajax(wsfunction, params)
     return res
 
 
 async def get_upcoming_assignments() -> dict[str, Any]:
-  """Retrieves upcoming assignments and deadlines from Moodle EPITA.
+  """Retrieves upcoming assignments and deadlines from Moodle.
 
   Returns a dictionary with status, assignments list, and formatted message.
   """
   if not is_moodle_configured():
+    msg = (
+        "⚠️ <b>Clé API ou cookie Moodle non configuré.</b>\n\n"
+        "Pour synchroniser vos devoirs et TPs :\n"
+        "1. Connectez-vous sur votre espace Moodle\n"
+        "2. Renseignez votre token ou cookie <code>MoodleSession</code> dans <code>.env</code> sous <code>MOODLE_API_KEY=...</code>\n\n"
+        "Dès qu'il est renseigné, JARVIS affichera automatiquement vos devoirs et rappels d'échéances !"
+    )
     return {
         "success": False,
-        "message": (
-            "⚠️ <b>Clé API Moodle non configurée.</b>\n\n"
-            "Pour synchroniser vos devoirs et TPs EPITA :\n"
-            "1. Connectez-vous sur <a"
-            ' href="https://moodle.epita.fr/">moodle.epita.fr</a>\n'
-            "2. Allez dans <b>Préférences > Clés de sécurité</b> (Web Services"
-            " token)\n"
-            "3. Ajoutez la clé dans <code>Documents/JARVIS/.env</code> sous"
-            " <code>MOODLE_API_KEY=...</code>\n\n"
-            "Dès qu'elle est renseignée, JARVIS affichera automatiquement vos"
-            " devoirs et rappels d'échéances !"
-        ),
+        "message": msg,
+        "output": "⚠️ Clé API ou cookie Moodle non configuré.",
         "assignments": [],
     }
 
   try:
+    now_ts = int(datetime.now().timestamp())
     # 1. First attempt: calendar action events (best for upcoming deadlines)
     events_data = await call_moodle_ws(
         "core_calendar_get_action_events_by_timesort",
-        {"timesortfrom": int(datetime.now().timestamp()), "limitnum": 20},
+        {"timesortfrom": now_ts, "limitnum": 20},
     )
-    if not events_data or not events_data.get("events"):
-      events_data = await call_moodle_ws(
-          "core_calendar_get_action_events_by_timesort",
-          {"timesortfrom": 0, "limitnum": 20},
-      )
 
     events_list = []
     if isinstance(events_data, dict) and "events" in events_data:
       for ev in events_data.get("events", []):
-        name = ev.get("name", "Devoir")
-        course_name = ev.get("course", {}).get("fullname", "Cours EPITA")
         timesort = ev.get("timesort", 0)
+        # Ne garder strictement que les devoirs futurs
+        if timesort < now_ts:
+          continue
+        name = ev.get("name", "Devoir")
+        course_name = ev.get("course", {}).get("fullname", "Cours")
         due_dt = datetime.fromtimestamp(timesort)
         url = ev.get("url", f"{MOODLE_URL}/calendar/view.php")
         events_list.append({
@@ -147,7 +168,6 @@ async def get_upcoming_assignments() -> dict[str, Any]:
     # 2. If no calendar events or alternative: query mod_assign_get_assignments
     if not events_list:
       assign_data = await call_moodle_ws("mod_assign_get_assignments")
-      now_ts = datetime.now().timestamp()
       if isinstance(assign_data, dict) and "courses" in assign_data:
         for course in assign_data.get("courses", []):
           c_name = course.get("fullname", "Cours")
@@ -173,17 +193,15 @@ async def get_upcoming_assignments() -> dict[str, Any]:
     events_list.sort(key=lambda x: x["timestamp"])
 
     if not events_list:
+      empty_msg = "🎉 <b>Aucun devoir ou TP en attente sur Moodle !</b>\nTout est à jour."
       return {
           "success": True,
-          "message": (
-              "🎉 <b>Aucun devoir ou TP en attente sur Moodle EPITA !</b>\nTout"
-              " est à jour."
-          ),
+          "message": empty_msg,
+          "output": "Aucun devoir ou TP en attente sur Moodle. Tout est à jour.",
           "assignments": [],
       }
 
-    lines = ["🎓 <b>Devoirs & Échéances Moodle EPITA</b>", ""]
-    now_ts = datetime.now().timestamp()
+    lines = ["🎓 <b>Devoirs & Échéances Moodle</b>", ""]
     for item in events_list[:8]:
       diff_hours = (item["timestamp"] - now_ts) / 3600
       urgency = (
@@ -191,10 +209,13 @@ async def get_upcoming_assignments() -> dict[str, Any]:
           if diff_hours < 24
           else ("⚠️ " if diff_hours < 72 else "📌 ")
       )
+      clean_title = html.escape(str(item["title"]))
+      clean_course = html.escape(str(item["course"]))
+      safe_url = html.escape(str(item["url"]), quote=True)
       lines.append(
-          f"{urgency}<b><a href=\"{item['url']}\">{item['title']}</a></b>"
+          f"{urgency}<b><a href=\"{safe_url}\">{clean_title}</a></b>"
       )
-      lines.append(f"   📚 <i>{item['course']}</i>")
+      lines.append(f"   📚 <i>{clean_course}</i>")
       lines.append(f"   ⏳ Échéance : <b>{item['due_date']}</b>\n")
 
     msg = "\n".join(lines).strip()
@@ -207,9 +228,12 @@ async def get_upcoming_assignments() -> dict[str, Any]:
 
   except Exception as e:
     logging.error(f"Error fetching Moodle assignments: {e}", exc_info=True)
+    clean_err = str(e)
+    if "sesskey" in clean_err.lower():
+      clean_err = "Erreur de session Moodle."
     err_msg = (
-        "⚠️ <b>Erreur de connexion à Moodle EPITA :</b>\n"
-        f"<code>{str(e)}</code>\nVérifiez votre clé API ou cookie MoodleSession dans .env."
+        "⚠️ <b>Erreur de connexion à Moodle :</b>\n"
+        f"<code>{html.escape(clean_err)}</code>\nVérifiez votre clé API ou cookie MoodleSession dans .env."
     )
     return {
         "success": False,
@@ -220,14 +244,16 @@ async def get_upcoming_assignments() -> dict[str, Any]:
 
 
 async def get_enrolled_courses() -> dict[str, Any]:
-  """Retrieves list of enrolled courses from Moodle EPITA."""
+  """Retrieves list of enrolled courses from Moodle."""
   if not is_moodle_configured():
+    msg = (
+        "⚠️ <b>Cookie ou clé API Moodle non configuré.</b>\n"
+        "Ajoutez votre cookie <code>MoodleSession</code> ou clé dans <code>.env</code> sous <code>MOODLE_API_KEY=...</code>"
+    )
     return {
         "success": False,
-        "message": (
-            "⚠️ <b>Cookie ou clé API Moodle non configuré.</b>\n"
-            "Ajoutez votre cookie <code>MoodleSession</code> dans <code>.env</code> sous <code>MOODLE_API_KEY=...</code>"
-        ),
+        "message": msg,
+        "output": "⚠️ Cookie ou clé API Moodle non configuré.",
         "courses": [],
     }
 
@@ -243,18 +269,21 @@ async def get_enrolled_courses() -> dict[str, Any]:
       courses = data
 
     if not courses:
+      empty_msg = "📚 <b>Aucun cours trouvé sur Moodle !</b>"
       return {
           "success": True,
-          "message": "📚 <b>Aucun cours trouvé sur Moodle EPITA !</b>",
+          "message": empty_msg,
+          "output": "Aucun cours trouvé sur Moodle.",
           "courses": [],
       }
 
-    lines = [f"📚 <b>Mes Cours Moodle EPITA ({len(courses)})</b>", ""]
+    lines = [f"📚 <b>Mes Cours Moodle ({len(courses)})</b>", ""]
     for c in courses[:15]:
-      fullname = c.get("fullname", "Cours")
+      fullname = html.escape(str(c.get("fullname", "Cours")))
       cid = c.get("id")
-      url = f"{MOODLE_URL}/course/view.php?id={cid}" if cid else MOODLE_URL
-      lines.append(f"• <b><a href=\"{url}\">{fullname}</a></b>")
+      raw_url = f"{MOODLE_URL}/course/view.php?id={cid}" if cid else MOODLE_URL
+      safe_url = html.escape(raw_url, quote=True)
+      lines.append(f"• <b><a href=\"{safe_url}\">{fullname}</a></b>")
 
     if len(courses) > 15:
       lines.append(f"\n<i>... et {len(courses) - 15} autres cours.</i>")
@@ -269,9 +298,12 @@ async def get_enrolled_courses() -> dict[str, Any]:
 
   except Exception as e:
     logging.error(f"Error fetching Moodle courses: {e}", exc_info=True)
+    clean_err = str(e)
+    if "sesskey" in clean_err.lower():
+      clean_err = "Erreur de session Moodle."
     err_msg = (
-        "⚠️ <b>Erreur de connexion à Moodle EPITA :</b>\n"
-        f"<code>{str(e)}</code>"
+        "⚠️ <b>Erreur de connexion à Moodle :</b>\n"
+        f"<code>{html.escape(clean_err)}</code>"
     )
     return {
         "success": False,
