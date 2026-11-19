@@ -86,7 +86,7 @@ journalctl -u assistant-home-runner -f
 
 ## Endpoints de l'API
 
-### Catalogue AGY et sélection Hydrogen / Argon
+### Catalogue AGY et sélection Neon / Hydrogen / Argon
 
 Le runner natif (`main:app`) lit le catalogue du compte avec `agy models`, dans
 un thread en arrière-plan : les routes HTTP n'attendent pas cette commande.
@@ -95,7 +95,10 @@ sous le compte qui exécute le service. La sortie attendue est une ligne
 `identifiant<TAB>nom` par modèle ; aucune famille inaccessible au compte n'est
 ajoutée artificiellement.
 
-La lecture démarre au lancement sans cache, puis à la demande via `/models` ou
+Une relecture démarre en arrière-plan à chaque lancement, même si le cache est
+récent : un modèle nouvellement publié comme Neon est ainsi découvert après
+redémarrage, tandis que l'ancienne liste répond immédiatement. Ensuite, la
+lecture démarre à la demande via `/models` ou
 `/nc/engines` quand la liste a plus de six heures. Après un échec, le runner
 attend quinze minutes avant de réessayer et conserve la dernière bonne liste,
 ou la liste historique de repli si aucune lecture n'a réussi. Le cache privé
@@ -105,12 +108,16 @@ le runner permet de relire immédiatement le compte.
 
 `/nc/engines` annonce `catalogue_compte`, `catalogue_en_cours`, les identifiants
 réels et l'effort `xhigh` quand une variante `-xhigh` existe. L'île peut ainsi
-activer Hydrogen et Argon et relire le catalogue à la fin du chargement.
+activer Neon, Hydrogen et Argon et relire le catalogue à la fin du chargement.
 L'alignement modèle/effort vaut pour les réglages, leur restauration et `/run` :
 
 - Hydrogen avec `xhigh` ou `max` choisit `gemini-4-hydrogen-xhigh` si annoncé,
   avec l'effort `xhigh` ; sans cette variante, le runner utilise `-high` si disponible.
 - Un modèle `-xhigh` donné sans effort prend `xhigh`.
+- Les variantes Neon `gemini-4-neon-low`, `-medium`, `-high` et `-xhigh` sont
+  reprises du catalogue du compte. `max` sélectionne `gemini-4-neon-xhigh`
+  lorsqu'il existe ; `gemini-pro-orchestrator-neon` reste un autre identifiant,
+  sans substitution vers ce modèle.
 - Une variante absente n'est pas inventée : le modèle conserve son suffixe et
   l'effort est aligné dessus. Opus Thinking continue d'ignorer l'effort.
 

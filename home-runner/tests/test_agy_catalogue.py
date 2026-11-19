@@ -1,4 +1,4 @@
-"""Catalogue natif et contrat Hydrogen/xhigh, sans compte AGY ni serveur réseau."""
+"""Catalogue natif et contrats Hydrogen/Neon/xhigh, sans compte AGY ni serveur réseau."""
 import asyncio
 import json
 import os
@@ -17,9 +17,10 @@ import nc_engines
 
 
 MODELS = [dict(id=f'{family}-{level}', name=f'{family} ({level})')
-          for family in ('gemini-4-hydrogen', 'gemini-4-argon', 'gemini-3.8-flash')
+          for family in ('gemini-4-neon', 'gemini-4-hydrogen', 'gemini-4-argon', 'gemini-3.8-flash')
           for level in ('low', 'medium', 'high')]
 MODELS += [dict(id='gemini-4-hydrogen-xhigh', name='Hydrogen (Xhigh)')]
+MODELS += [dict(id='gemini-4-neon-xhigh', name='Gemini 4 Neon (XHigh)')]
 LISTING = ''.join(m['id'] + '\t' + m['name'] + '\n' for m in MODELS)
 
 
@@ -155,6 +156,18 @@ class CatalogueTests(unittest.TestCase):
         self.assertEqual(obj.updated, 0)
         self.assertFalse(self.path.exists())
 
+    def test_startup_refresh_discovers_neon_despite_a_fresh_cache_and_keeps_retry_limit(self):
+        previous = [m for m in MODELS if 'neon' not in m['id']]
+        catalogue.write_cache(self.path, previous, time.time())
+        obj = self.manager()
+        self.assertFalse(any('neon' in m['id'] for m in obj.models))
+        with patch.object(catalogue, 'run_cli', side_effect=['  models List\n', LISTING]) as cli:
+            obj.refresh(force=True); obj.thread.join(3)
+            obj.refresh(force=True)
+            self.assertEqual(cli.call_count, 2, 'une relecture, même si plusieurs appels forcent le cache')
+        self.assertIn('gemini-4-neon-xhigh', [m['id'] for m in obj.models])
+        self.assertEqual(catalogue.read_cache(self.path)[0], MODELS)
+
     def test_old_cli_does_not_receive_models_as_a_prompt(self):
         obj = self.manager()
         with patch.object(catalogue, 'run_cli', return_value='Usage: agy -p PROMPT\n') as cli:
@@ -201,6 +214,21 @@ class NativeEngineTests(unittest.TestCase):
         self.assertEqual(self.engine.session(session_key=self.key)['model'], 'gemini-4-hydrogen-xhigh')
         self.assertEqual(self.engine.session(session_key='desktop:other')['model'], 'gemini-3.8-flash-low')
         self.assertFalse(self.engine.snapshot(self.key)['shared_session'])
+
+    def test_neon_levels_max_and_model_without_effort(self):
+        for level in ('low', 'medium', 'high', 'xhigh', 'max'):
+            with self.subTest(level=level):
+                selected = self.choose(model='gemini-4-neon-low', effort=level)
+                expected = 'xhigh' if level == 'max' else level
+                self.assertEqual((selected['model'], selected['effort']), (f'gemini-4-neon-{expected}', expected))
+        selected = self.choose(model='gemini-4-neon-xhigh')
+        self.assertEqual(selected['effort'], 'xhigh')
+        self.assertIn('gemini-4-neon-xhigh', [m['id'] for m in self.engine.snapshot(self.key)['engines'][0]['models']])
+
+    def test_startup_requests_one_refresh_even_with_a_fresh_cache(self):
+        with patch.object(self.engine.agy_catalogue, 'refresh') as refresh:
+            self.engine.catalogue_au_demarrage()
+            refresh.assert_called_once_with(force=True)
 
     def test_effort_max_and_model_without_effort(self):
         self.choose(model='gemini-4-hydrogen-low')
@@ -267,15 +295,16 @@ class NativeEngineTests(unittest.TestCase):
         cli.write_text('#!' + sys.executable + '\nimport json,sys\n'
                        f'open({str(args_file)!r}, "w").write(json.dumps(sys.argv[1:]))\nprint("OK")\n')
         cli.chmod(0o700)
-        self.choose(model='gemini-4-hydrogen-xhigh')
         # Le vrai bridge et son sous-processus, mais aucun compte ni appel réseau.
-        with patch.object(agy_bridge, 'find_agy', return_value=str(cli)):
-            response = asyncio.run(self.engine.run('Réponds simplement OK.', continue_session=False,
-                                                   permission_mode='request-review', session_key=self.key))
-        self.assertTrue(response['success'], response)
-        args = json.loads(args_file.read_text())
-        self.assertEqual(args[args.index('--model') + 1], 'gemini-4-hydrogen-xhigh')
-        self.assertEqual(args[args.index('--effort') + 1], 'xhigh')
+        for family in ('hydrogen', 'neon'):
+            with self.subTest(family=family), patch.object(agy_bridge, 'find_agy', return_value=str(cli)):
+                self.choose(model=f'gemini-4-{family}-xhigh')
+                response = asyncio.run(self.engine.run('Réponds simplement OK.', continue_session=False,
+                                                       permission_mode='request-review', session_key=self.key))
+                self.assertTrue(response['success'], response)
+                args = json.loads(args_file.read_text())
+                self.assertEqual(args[args.index('--model') + 1], f'gemini-4-{family}-xhigh')
+                self.assertEqual(args[args.index('--effort') + 1], 'xhigh')
 
 
 if __name__ == '__main__':

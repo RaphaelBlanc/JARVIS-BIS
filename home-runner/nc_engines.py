@@ -146,13 +146,15 @@ class Engines:
             settings = self.aligner_agy({k:v for k,v in self.state['settings']['agy'].items() if k in ('model','effort','mode','permission_mode')})
             self.original['update_session'](**settings)
 
-    def rafraichir_agy(self):
+    def rafraichir_agy(self, force=False):
         if self.state['engine'] == 'agy':
-            self.agy_catalogue.refresh()
+            self.agy_catalogue.refresh(force=force)
 
     def catalogue_au_demarrage(self):
-        if not self.agy_catalogue.updated:
-            self.rafraichir_agy()
+        # Un nouveau modèle (Neon, par exemple) doit apparaître après un
+        # redémarrage même si le cache précédent a moins de six heures.
+        # Le cache répond immédiatement pendant cette unique relecture.
+        self.rafraichir_agy(force=True)
 
     def aligner_agy(self, values, session_key='default'):
         values = dict(values)

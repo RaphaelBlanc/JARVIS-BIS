@@ -147,9 +147,9 @@ class CatalogueAGY:
         self.thread = None
         self.supports_models = None
 
-    def refresh(self):
+    def refresh(self, force=False):
         now = time.time()
-        if self.updated and 0 <= now - self.updated < TTL:
+        if not force and self.updated and 0 <= now - self.updated < TTL:
             return
         if self.attempt is not None and time.monotonic() - self.attempt < RETRY:
             return
