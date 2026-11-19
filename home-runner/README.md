@@ -86,6 +86,50 @@ journalctl -u assistant-home-runner -f
 
 ## Endpoints de l'API
 
+### Catalogue AGY et sélection Hydrogen / Argon
+
+Le runner natif (`main:app`) lit le catalogue du compte avec `agy models`, dans
+un thread en arrière-plan : les routes HTTP n'attendent pas cette commande.
+Le CLI doit annoncer la sous-commande `models` dans son aide et être connecté
+sous le compte qui exécute le service. La sortie attendue est une ligne
+`identifiant<TAB>nom` par modèle ; aucune famille inaccessible au compte n'est
+ajoutée artificiellement.
+
+La lecture démarre au lancement sans cache, puis à la demande via `/models` ou
+`/nc/engines` quand la liste a plus de six heures. Après un échec, le runner
+attend quinze minutes avant de réessayer et conserve la dernière bonne liste,
+ou la liste historique de repli si aucune lecture n'a réussi. Le cache privé
+`home-runner/.nc-jarvis-agy-models.json` utilise le même format que l'adaptateur
+Noctalia. Après une nouvelle connexion AGY, supprimer ce cache puis redémarrer
+le runner permet de relire immédiatement le compte.
+
+`/nc/engines` annonce `catalogue_compte`, `catalogue_en_cours`, les identifiants
+réels et l'effort `xhigh` quand une variante `-xhigh` existe. L'île peut ainsi
+activer Hydrogen et Argon et relire le catalogue à la fin du chargement.
+L'alignement modèle/effort vaut pour les réglages, leur restauration et `/run` :
+
+- Hydrogen avec `xhigh` ou `max` choisit `gemini-4-hydrogen-xhigh` si annoncé,
+  avec l'effort `xhigh` ; sans cette variante, le runner utilise `-high` si disponible.
+- Un modèle `-xhigh` donné sans effort prend `xhigh`.
+- Une variante absente n'est pas inventée : le modèle conserve son suffixe et
+  l'effort est aligné dessus. Opus Thinking continue d'ignorer l'effort.
+
+Les protections et routes de l'overlay Noctalia restent nécessaires à son
+déploiement : cette correction du moteur natif ne remplace pas l'overlay.
+Le mainteneur de noctalia-config doit examiner et ajouter la révision du
+correctif à `VALIDATED_REVISIONS` avant de la déployer avec son outil.
+
+Tests sans compte ni réseau, depuis la racine du dépôt :
+
+```sh
+PYTHONPATH=home-runner python3 -B -m unittest discover -s home-runner/tests -p test_agy_catalogue.py -v
+```
+
+Ces tests vérifient le catalogue, le cache, la sélection et les arguments du
+vrai bridge avec un faux exécutable. Ils ne prouvent pas qu'un compte réel
+accepte Hydrogen/xhigh : après déploiement et redémarrage, appliquer ce choix,
+vérifier `/session`, puis envoyer un message réel reste nécessaire.
+
 | Méthode | Chemin | Auth | Description |
 |---|---|---|---|
 | `GET` | `/ping` | ✗ | Vérification de vie rapide (`{"status":"ok"}`) |

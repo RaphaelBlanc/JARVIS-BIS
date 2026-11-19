@@ -42,6 +42,8 @@ render-gateway/reminders.db-wal
 # Mémoire durable locale
 home-runner/memory.json
 home-runner/memory.json.tmp
+home-runner/.nc-jarvis-agy-models.json
+home-runner/.nc-jarvis-engines.json
 
 # Données locales des modules
 data/*

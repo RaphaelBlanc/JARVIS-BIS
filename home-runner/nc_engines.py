@@ -7,13 +7,17 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import tempfile
 import uuid
 
+from agy_catalogue import CatalogueAGY
+
 ENGINES = {'agy': 'Antigravity', 'codex': 'Codex', 'claude': 'Claude Code', 'opencode': 'OpenCode'}
 EFFORTS = {'', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'}
+AGY_SUFFIX = re.compile(r'(.+)-(low|medium|high|xhigh)')
 
 
 def executable(engine):
@@ -125,6 +129,8 @@ class Engines:
         self.should_inject = getattr(upstream, '_should_inject_memory', lambda v, *a, **kw: True)
         self.agy_models = list(getattr(upstream, 'KNOWN_MODELS', []))
         self.path = Path(upstream.__file__).resolve().parent/'.nc-jarvis-engines.json'
+        self.agy_catalogue = CatalogueAGY(self.path.with_name('.nc-jarvis-agy-models.json'),
+                                          self.agy_models, lambda: executable('agy'))
         self.lock = asyncio.Lock()
         initial=os.getenv('NC_JARVIS_ENGINE','agy')
         if initial not in ENGINES: raise ValueError('NC_JARVIS_ENGINE invalide.')
@@ -137,7 +143,36 @@ class Engines:
             if not isinstance(data,dict) or data.get('engine') not in ENGINES: raise ValueError('État moteur invalide.')
             self.state.update(data)
         if self.state['engine']=='agy' and self.state['settings'].get('agy'):
-            self.original['update_session'](**{k:v for k,v in self.state['settings']['agy'].items() if k in ('model','effort','mode','permission_mode')})
+            settings = self.aligner_agy({k:v for k,v in self.state['settings']['agy'].items() if k in ('model','effort','mode','permission_mode')})
+            self.original['update_session'](**settings)
+
+    def rafraichir_agy(self):
+        if self.state['engine'] == 'agy':
+            self.agy_catalogue.refresh()
+
+    def catalogue_au_demarrage(self):
+        if not self.agy_catalogue.updated:
+            self.rafraichir_agy()
+
+    def aligner_agy(self, values, session_key='default'):
+        values = dict(values)
+        model = (values.get('model') or '').strip()
+        effort = (values.get('effort') or '').strip().lower()
+        if not effort:
+            suffix = AGY_SUFFIX.fullmatch(model)
+            if suffix: values['effort'] = suffix[2]
+            return values
+        current = model or self.original['get_session_info'](session_key=session_key).get('model') or ''
+        suffix = AGY_SUFFIX.fullmatch(current)
+        if not suffix: return values
+        ids = {m['id'] for m in self.models('agy')}
+        level = ('xhigh' if f'{suffix[1]}-xhigh' in ids else 'high') if effort in ('xhigh', 'max') else effort
+        candidate = f'{suffix[1]}-{level}'
+        if level in ('low', 'medium', 'high', 'xhigh') and candidate in ids:
+            values.update(model=candidate, effort=level)
+        else:
+            values['effort'] = suffix[2]
+        return values
 
     def session(self, *args, **kwargs):
         engine = self.state['engine']
@@ -153,7 +188,7 @@ class Engines:
 
     def models(self, engine=None):
         engine = engine or self.state['engine']
-        if engine == 'agy': return self.agy_models
+        if engine == 'agy': return self.agy_catalogue.models
         if engine == 'codex':
             path = Path.home()/'.codex/models_cache.json'
             if path.is_file() and path.stat().st_size < 8*1024*1024:
@@ -166,8 +201,10 @@ class Engines:
 
     def snapshot(self, session_key='default'):
         return dict(session=self.session(session_key=session_key), engines=[dict(id=k,name=v,installed=bool(executable(k)),models=self.models(k),
-            efforts=(['low','medium','high'] if k=='agy' else ['low','medium','high','xhigh','max'] if k=='claude' else ['low','medium','high','xhigh','max','ultra'] if k=='codex' else [])) for k,v in ENGINES.items()],
-            shared_session=True, context_limit=32000)
+            catalogue_compte=k=='agy' and bool(self.agy_catalogue.updated),
+            catalogue_en_cours=k=='agy' and self.agy_catalogue.lock.locked(),
+            efforts=(['low','medium','high'] + (['xhigh'] if any(m['id'].endswith('-xhigh') for m in self.models('agy')) else []) if k=='agy' else ['low','medium','high','xhigh','max'] if k=='claude' else ['low','medium','high','xhigh','max','ultra'] if k=='codex' else [])) for k,v in ENGINES.items()],
+            shared_session=self.state['engine']!='agy', context_limit=32000)
 
     def choose(self, *args, **values):
         if self.lock.locked(): raise ValueError('Une réponse est en cours ; attends avant de changer de moteur.')
@@ -177,7 +214,10 @@ class Engines:
         if engine not in ENGINES: raise ValueError('Moteur inconnu.')
         if engine != self.state['engine'] and not executable(engine): raise ValueError('Installe et authentifie ce CLI sur la machine du runner.')
         if engine == 'agy':
-            result = self.original['update_session'](session_key=session_key, **{k:v for k,v in values.items() if k!='engine'})
+            aligned = self.aligner_agy({k:v for k,v in values.items() if k!='engine'}, session_key)
+            self.original['update_session'](session_key=session_key, **aligned)
+            result = {k:v for k,v in self.state['settings'].get('agy',{}).items() if k in ('model','effort','mode','permission_mode')}
+            result.update({k:v for k,v in aligned.items() if v})
         else:
             if any(values.get(k) not in (None,'',v) for k,v in (('mode','plan'),('permission_mode','request-review'))):
                 raise ValueError('Ce moteur utilise le mode plan avec ses protections habituelles.')
@@ -247,13 +287,15 @@ class Engines:
         engine=self.state['engine']
         if engine=='agy':
             # Délègue directement à run_agy qui gère son verrou par session_key et son sémaphore global.
-            return await self.original['run_agy'](prompt=prompt,timeout=timeout,model=model,effort=effort,mode=mode,
+            aligned = self.aligner_agy(dict(model=model, effort=effort), session_key)
+            return await self.original['run_agy'](prompt=prompt,timeout=timeout,model=aligned.get('model'),effort=aligned.get('effort'),mode=mode,
                 continue_session=continue_session,reset_session_flag=reset_session_flag,permission_mode=permission_mode, **kwargs)
         if self.lock.locked(): return failure('Une autre requête JARVIS est déjà en cours.')
         async with self.lock:
             engine=self.state['engine']
             if engine=='agy':
-                return await self.original['run_agy'](prompt=prompt,timeout=timeout,model=model,effort=effort,mode=mode,
+                aligned = self.aligner_agy(dict(model=model, effort=effort), session_key)
+                return await self.original['run_agy'](prompt=prompt,timeout=timeout,model=aligned.get('model'),effort=aligned.get('effort'),mode=mode,
                     continue_session=continue_session,reset_session_flag=reset_session_flag,permission_mode=permission_mode, **kwargs)
             path=executable(engine)
             if not path: return failure('CLI '+ENGINES[engine]+' absent sur la machine du runner.')

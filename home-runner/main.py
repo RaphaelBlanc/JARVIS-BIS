@@ -160,6 +160,10 @@ def _cleanup_old_uploads(max_age_seconds: int = 7 * 24 * 3600) -> None:
 async def lifespan(app: FastAPI):
     """Arrête proprement le worker agy persistant lors de l'arrêt du service."""
     _cleanup_old_uploads()
+    # Les anciens overlays Noctalia remplacent le gestionnaire de moteurs et
+    # peuvent ne pas encore exposer les méthodes de catalogue.
+    if callable(getattr(engines, 'catalogue_au_demarrage', None)):
+        engines.catalogue_au_demarrage()
     yield
     await shutdown_agy_worker()
 
@@ -418,6 +422,8 @@ async def health():
 @app.get("/nc/engines", summary="Réglages et moteurs IA pour Noctalia")
 async def nc_get_engines(request: Request, session_key: str = "default"):
     _check_secret(request)
+    if callable(getattr(engines, 'rafraichir_agy', None)):
+        engines.rafraichir_agy()
     return engines.snapshot(session_key=session_key)
 
 
@@ -451,7 +457,9 @@ async def usage_stats(request: Request):
 async def list_models(request: Request):
     """Retourne la liste des modèles Antigravity supportés et le modèle actif."""
     _check_secret(request)
-    return {"models": KNOWN_MODELS, "current": get_session_info().get("model")}
+    if callable(getattr(engines, 'rafraichir_agy', None)):
+        engines.rafraichir_agy()
+    return {"models": engines.models(), "current": get_session_info().get("model")}
 
 
 @app.get("/session", summary="Configuration de session active")

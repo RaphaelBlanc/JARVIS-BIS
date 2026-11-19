@@ -221,16 +221,15 @@ def update_session(
 ) -> dict:
     """Met à jour les paramètres de session."""
     cfg = _get_session(session_key)
-    if model:
-        cfg["model"] = model.strip()
+    if model or effort:
+        # Appliquer le couple une seule fois : l'ancien effort ne doit pas réécrire
+        # un nouveau modèle Flash avant que son nouvel effort soit lu.
+        active_model = model.strip() if model else cfg.get("model")
+        suffix = re.fullmatch(r"(.+)-(low|medium|high|xhigh)", active_model or "")
+        active_effort = (effort.strip().lower() if effort else
+                         suffix[2] if model and suffix else cfg.get("effort"))
         cfg["model"], cfg["effort"] = _normalize_model_effort(
-            cfg["model"], cfg.get("effort")
-        )
-
-    if effort:
-        cfg["effort"] = effort.strip().lower()
-        cfg["model"], cfg["effort"] = _normalize_model_effort(
-            cfg.get("model"), cfg.get("effort")
+            active_model, active_effort
         )
 
     if mode:
