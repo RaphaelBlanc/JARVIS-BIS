@@ -13,6 +13,7 @@ from env_files import EnvFile, private_write
 ROOT = Path(__file__).resolve().parents[1]
 
 COMPOSE_DEFAULTS = {
+    'CLOUD_DAV_WRITE': '0',
     'CLOUD_QUOTA_BYTES': '21474836480',
     'CLOUD_MAX_FILE_BYTES': '5368709120',
     'CLOUD_CHUNK_BYTES': '4194304',
@@ -37,7 +38,7 @@ def compose_environment(env_file):
     return environment
 
 
-def configure(root, rotate_key=False, confirm_history_prune=False):
+def configure(root, rotate_key=False, confirm_history_prune=False, dav_write=None):
     primary = EnvFile(root / '.env')
     gateway = EnvFile(root / 'gateway/.env')
     runner = EnvFile(root / 'home-runner/.env')
@@ -56,6 +57,8 @@ def configure(root, rotate_key=False, confirm_history_prune=False):
         changes['CLOUD_INTERNAL_URL'] = config.get('CLOUD_INTERNAL_URL') or 'http://127.0.0.1:8091'
     # Parse/render every document before touching any of them. Never rewrite other bindings.
     storage_changes = {'CLOUD_INTERNAL_KEY': key}
+    if dav_write is not None:
+        changes['CLOUD_DAV_WRITE'] = storage_changes['CLOUD_DAV_WRITE'] = '1' if dav_write else '0'
     if confirm_history_prune:
         limit = os.environ.get('CLOUD_MAX_VERSIONS', storage.values.get('CLOUD_MAX_VERSIONS', '10'))
         try:
@@ -82,9 +85,14 @@ def main():
     parser.add_argument('action', choices=['configure', 'up', 'down', 'status'])
     parser.add_argument('--rotate-key', action='store_true', help='Rotate the internal key (configure only)')
     parser.add_argument('--confirm-history-prune', action='store_true', help='Approve startup pruning to the configured history limit after backup')
+    dav = parser.add_mutually_exclusive_group()
+    dav.add_argument('--dav-write', dest='dav_write', action='store_true', default=None, help='Enable transactional WebDAV writes (configure only)')
+    dav.add_argument('--dav-read-only', dest='dav_write', action='store_false', help='Restore read-only WebDAV (configure only)')
     args = parser.parse_args()
     if args.confirm_history_prune and args.action != 'configure':
         parser.error('--confirm-history-prune applies to configure only')
+    if args.dav_write is not None and args.action != 'configure':
+        parser.error('--dav-write/--dav-read-only apply to configure only')
     gateway = ROOT / 'gateway/.env'
     config = EnvFile(gateway).values | {k: v for k, v in EnvFile(ROOT / '.env').values.items() if not k.startswith('CLOUD_')} | dict(os.environ)
     if config.get('DEPLOY_MODE', 'local').strip().lower() != 'server':
@@ -92,7 +100,7 @@ def main():
     env_file = ROOT / 'deploy/cloud.env'
     if args.action == 'configure':
         try:
-            rotated = configure(ROOT, args.rotate_key, args.confirm_history_prune)
+            rotated = configure(ROOT, args.rotate_key, args.confirm_history_prune, args.dav_write)
         except ValueError as exc:
             parser.error(str(exc))
         if rotated:

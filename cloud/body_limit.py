@@ -40,12 +40,16 @@ async def bounded_dav_body(scope, receive, limit=DAV_BODY_BYTES, timeout=DAV_BOD
 
 
 class DavBodyLimit:
-    def __init__(self, app):
+    def __init__(self, app, allow_put=False):
         self.app = app
+        self.allow_put = allow_put
 
     async def __call__(self, scope, receive, send):
         path = scope.get('path', '')
         if scope['type'] != 'http' or not (path == '/cloud/dav' or path.startswith('/cloud/dav/')):
+            return await self.app(scope, receive, send)
+        if self.allow_put and scope.get('method') == 'PUT':
+            # This route is handled by the streaming ASGI writer, never WSGI.
             return await self.app(scope, receive, send)
         try:
             body = await bounded_dav_body(scope, receive)
@@ -62,3 +66,29 @@ class DavBodyLimit:
             return await receive()
 
         return await self.app(scope, replay, send)
+
+
+async def bounded_dav_stream(scope, receive, limit, timeout=60):
+    """PUT streaming: cap bytes and idle time without collecting the file."""
+    try:
+        length = int(dict(scope.get('headers', [])).get(b'content-length', b'0'))
+    except ValueError:
+        raise BodyRejected('invalid_length', 400) from None
+    if length < 0 or length > limit:
+        raise BodyRejected('body_too_large', 413)
+    total = 0
+    while True:
+        try:
+            message = await asyncio.wait_for(receive(), timeout)
+        except TimeoutError:
+            raise BodyRejected('body_timeout', 408) from None
+        if message['type'] == 'http.disconnect':
+            raise BodyRejected('client_disconnected', 400)
+        chunk = message.get('body', b'')
+        total += len(chunk)
+        if total > limit:
+            raise BodyRejected('body_too_large', 413)
+        if chunk:
+            yield chunk
+        if not message.get('more_body', False):
+            break

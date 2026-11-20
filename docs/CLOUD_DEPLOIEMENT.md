@@ -77,11 +77,30 @@ nc-cloud fenetre
 
 Le trousseau Secret Service doit être disponible et déverrouillé (`secret-tool`). L’ouverture dans le gestionnaire de fichiers requiert les bindings Python Gio et le backend WebDAV de GVfs. `nc-cloud verifier` contrôle les commandes et bindings disponibles ; si le montage échoue malgré ces composants, vérifier aussi la présence du backend WebDAV de GVfs dans les paquets de votre distribution.
 
-`nc-cloud ouvrir` monte le drive à la demande avec Gio, puis ajoute le favori « Cloud JARVIS » sans toucher aux autres favoris. L’accès natif est en lecture seule. Les envois passent par le glisser-déposer dans la barre/fenêtre, `nc-cloud deposer /chemin/fichier`, ou « Scripts → Envoyer vers Cloud JARVIS » dans Nautilus.
+`nc-cloud ouvrir` monte le drive à la demande avec Gio, puis ajoute le favori « Cloud JARVIS » sans toucher aux autres favoris. Par défaut, l’accès natif est en lecture seule ; l’option d’écriture est décrite plus bas. Les envois passent par le glisser-déposer dans la barre/fenêtre, `nc-cloud deposer /chemin/fichier`, ou « Scripts → Envoyer vers Cloud JARVIS » dans Nautilus.
 
-Le prototype utilise une icône près du centre de la barre. L’intégration officielle prévue par Théo utilise l’île elle-même comme zone de dépôt, puis ajoutera l’ouverture dans Fichiers ; les commandes ci-dessus ne promettent pas que cette interface officielle est déjà disponible.
+Le prototype local intègre désormais l’icône à la pilule et accepte le dépôt sur l’île elle-même. L’intégration officielle reste maintenue par Théo ; les commandes ci-dessus décrivent le prototype et ne promettent pas que cette interface officielle soit déjà disponible.
 
 ## Vérifications avec deux PC
+
+### Gestion complète depuis Fichiers (option explicite)
+
+Pour autoriser aussi création, déplacement et suppression dans le montage de Super + E :
+
+```bash
+./deploy.sh cloud configure --dav-write
+./deploy.sh cloud up
+```
+
+Redémarrer le gateway, puis démonter et remonter le seul drive Cloud JARVIS pour que GVfs relise les capacités. La configuration est conservée dans les fichiers privés du gateway et du stockage. `--dav-read-only` revient au comportement initial, avec la même recréation et le même redémarrage. L’option ne modifie pas les jetons, les autres services ni les données du volume.
+
+Les remplacements DAV conservent l’historique ; les suppressions retirent définitivement le fichier et ses versions. Les déplacements vers un nom occupé sont refusés. Une application qui ne transmet pas son ancienne révision ne permet pas de détecter une copie éditée depuis longtemps ; la fenêtre Cloud contrôle explicitement les révisions. Voir les détails et limites dans le contrat API.
+
+Le prototype local fournit sélection et double-clic, ouverture d’une copie locale vérifiée par SHA-256, création de fichier vide et de dossier, renommage, déplacement avec choix du dossier et suppression confirmée. Il ne republie pas automatiquement les modifications d’une copie locale ouverte : la déposer à nouveau pour les publier. Les fichiers ouverts directement depuis le montage Fichiers peuvent être enregistrés via WebDAV si l’option est activée et si l’application gère les fichiers distants.
+
+Le bouton cloud et la zone de dépôt sont intégrés à l’île ; la fenêtre garde l’écran choisi à son ouverture. Le client officiel reste maintenu séparément par Théo.
+
+### Parcours entre appareils
 
 Associer chaque PC séparément, puis vérifier :
 
@@ -168,6 +187,8 @@ PYTHONPATH=.:gateway python scripts/check-cloud-noctalia.py \
 `--gvfs` requiert `/usr/bin/python3` avec les bindings Gio, le démon GVfs et son backend WebDAV. Il monte le drive réel via une opération Gio avec authentification, liste un nom Unicode, relit le contenu et vérifie son SHA-256, constate le refus d’écriture puis démonte. Le démon isolé utilise `--no-fuse` pour ne pas projeter ce montage sur le répertoire FUSE du bureau. Le script met aussi à jour l’environnement d’activation de sa seule session D-Bus jetable, sans `--systemd`, pour isoler les services activés à la demande. L’essai valide le backend natif utilisé par Fichiers, pas son interface graphique ni le favori officiel Noctalia.
 
 Après mise à jour du serveur personnel et du client officiel, vérifier `nc-cloud verifier` puis `nc-cloud etat` avec l’adresse HTTPS ou Tailscale réelle. Associer chaque PC s’il ne l’est pas déjà, déposer un fichier de test depuis le premier, le télécharger depuis le second et comparer les SHA-256. Un ping Tailscale réussi ne valide que la connectivité ; si `/api/cloud/v1/capabilities` répond 404, l’API cloud n’est pas disponible à cette adresse et le parcours distant ne peut pas encore être validé. Les réglages, le panneau et le dépôt sur l’île sont fournis par l’intégration officielle Noctalia.
+
+Pour le mode d’écriture, `python scripts/check-cloud-gvfs-write.py` lance un stockage et un gateway jetables en boucle locale, puis un vrai montage Gio/GVfs dans une session D-Bus isolée. Le parcours vérifie création, lecture, remplacement et refus d’une ancienne révision, copie depuis un fichier local, renommage, déplacement et suppression, sans utiliser le serveur ou le trousseau personnel. Prérequis : dépendances Python gateway/cloud, Python système avec Gio, backend GVfs WebDAV et D-Bus.
 
 
 Un appareil associé possède des droits de suppression définitive sur l’espace personnel. Révoquer immédiatement un appareil perdu ou un jeton compromis ; conserver des sauvegardes indépendantes. L’historique plafonné peut être évincé par des remplacements répétés et ne protège pas contre le vol d’un jeton.

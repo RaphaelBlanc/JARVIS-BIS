@@ -34,6 +34,7 @@ class Settings:
     max_uploads: int = 8
     max_versions: int = 10
     confirmed_history_limit: int | None = None
+    dav_write: bool = False
 
     @classmethod
     def environment(cls):
@@ -44,7 +45,8 @@ class Settings:
                    int(os.environ.get('CLOUD_UPLOAD_TTL', 86400)),
                    int(os.environ.get('CLOUD_MAX_UPLOADS', 8)),
                    int(os.environ.get('CLOUD_MAX_VERSIONS', 10)),
-                   int(os.environ['CLOUD_CONFIRMED_HISTORY_LIMIT']) if 'CLOUD_CONFIRMED_HISTORY_LIMIT' in os.environ else None)
+                   int(os.environ['CLOUD_CONFIRMED_HISTORY_LIMIT']) if 'CLOUD_CONFIRMED_HISTORY_LIMIT' in os.environ else None,
+                   os.environ.get('CLOUD_DAV_WRITE', '0') == '1')
 
 
 def new_id():
@@ -118,6 +120,7 @@ class Store:
             db.execute('CREATE TABLE IF NOT EXISTS garbage(blob TEXT PRIMARY KEY,size INTEGER NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS tombstones(id TEXT PRIMARY KEY,parent TEXT NOT NULL,name TEXT NOT NULL,revision TEXT NOT NULL,deleted REAL NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS deletions(device TEXT NOT NULL,idem TEXT NOT NULL,file_id TEXT NOT NULL,revision TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(device,idem))')
+            db.execute('CREATE TABLE IF NOT EXISTS mutations(device TEXT NOT NULL,idem TEXT NOT NULL,spec TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(device,idem))')
             if 'cleanup_pending' not in {row[1] for row in db.execute('PRAGMA table_info(uploads)')}:
                 db.execute('ALTER TABLE uploads ADD COLUMN cleanup_pending INTEGER NOT NULL DEFAULT 1')
             if version < 3:
@@ -223,6 +226,8 @@ class Store:
     def features(self):
         return {'file_delete': True, 'delete_if_match': True, 'delete_idempotency': True,
                 'entry_by_id': True, 'early_create_conflict': True,
+                'entry_move': True, 'directory_delete': True, 'delete_preview': True,
+                'webdav_write': self.settings.dav_write,
                 'max_old_versions': self.settings.max_versions}
 
     @staticmethod
@@ -320,6 +325,125 @@ class Store:
             self._touch(db, entry['parent'])
             result = self.envelope(deleted=True, file_id=ident, revision=entry['revision'])
             db.execute('INSERT INTO deletions VALUES (?,?,?,?,?)', (device, idem, ident, revision, json.dumps(result)))
+        self.collect_expired()
+        self.collect_garbage()
+        return result
+
+    @staticmethod
+    def _revision(entry, revision):
+        if not revision:
+            raise CloudError('precondition_required', 428)
+        if revision != '"' + entry['revision'] + '"':
+            raise CloudError('version_conflict', 412, current=Store.public(entry))
+
+    def _receipt(self, db, device, idem, spec):
+        self._active(db, device)
+        if not isinstance(idem, str) or not re.fullmatch('[A-Za-z0-9_-]{16,128}', idem):
+            raise CloudError('invalid_idempotency_key')
+        previous = db.execute('SELECT spec,result FROM mutations WHERE device=? AND idem=?', (device, idem)).fetchone()
+        if previous:
+            if previous['spec'] != spec:
+                raise CloudError('idempotency_conflict', 409)
+            return json.loads(previous['result'])
+
+    @staticmethod
+    def _subtree(db, ident):
+        # IDs survive renames/moves. UNION also bounds traversal if a damaged
+        # database contains a cycle; normal moves reject every such cycle.
+        rows = db.execute('''WITH RECURSIVE tree(id) AS (
+            SELECT id FROM entries WHERE id=? UNION
+            SELECT entries.id FROM entries JOIN tree ON entries.parent=tree.id)
+            SELECT entries.* FROM entries JOIN tree ON entries.id=tree.id ORDER BY entries.id''', (ident,)).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _tree_revision(rows):
+        # Include the complete namespace, not just the top directory revision:
+        # replacing a deeply nested file must invalidate a delete confirmation.
+        snapshot = [(r['id'], r['parent'], r['name'], r['revision']) for r in rows]
+        return hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+
+    def delete_preview(self, device, ident):
+        with self.connection() as db:
+            db.execute('BEGIN')
+            self._active(db, device)
+            entry = self._entry(db, ident)
+            rows = self._subtree(db, ident)
+            return self.envelope(entry=self.public(entry), tree_revision=self._tree_revision(rows),
+                                 files=sum(r['kind'] == 'file' for r in rows),
+                                 directories=sum(r['kind'] == 'directory' for r in rows),
+                                 size=sum(r['size'] for r in rows))
+
+    @staticmethod
+    def _invalidate(db, entries, removed_parents=()):
+        names = {(e['parent'], e['name']) for e in entries}
+        removed_parents = set(removed_parents)
+        for row in db.execute("SELECT id,spec FROM uploads WHERE state='pending'").fetchall():
+            spec = json.loads(row['spec'])
+            if spec['parent_id'] in removed_parents or (spec['parent_id'], spec['name']) in names:
+                db.execute("UPDATE uploads SET state='invalidated' WHERE id=?", (row['id'],))
+
+    def move_entry(self, device, ident, revision, parent, parent_revision, name, idem):
+        name = name_checked(name)
+        spec = json.dumps(['move', ident, revision, parent, parent_revision, name], separators=(',', ':'))
+        with self.transaction() as db:
+            previous = self._receipt(db, device, idem, spec)
+            if previous is not None:
+                return previous
+            entry = self._entry(db, ident)
+            self._revision(entry, revision)
+            if ident == 'root':
+                raise CloudError('root_protected', 409)
+            self._parent(db, parent, parent_revision)
+            ancestor = parent
+            while ancestor is not None:
+                if ancestor == ident:
+                    raise CloudError('invalid_destination', 409)
+                ancestor = self._entry(db, ancestor)['parent']
+            existing = db.execute('SELECT id FROM entries WHERE parent=? AND name=?', (parent, name)).fetchone()
+            if existing and existing['id'] != ident:
+                raise CloudError('name_conflict', 409)
+            if (entry['parent'], entry['name']) != (parent, name):
+                self._invalidate(db, [entry])
+                db.execute('UPDATE entries SET parent=?,name=?,revision=?,modified=? WHERE id=?',
+                           (parent, name, new_id(), time.time(), ident))
+                for directory in {entry['parent'], parent}:
+                    self._touch(db, directory)
+            result = self.envelope(entry=self.public(self._entry(db, ident)), moved=True)
+            db.execute('INSERT INTO mutations VALUES (?,?,?,?)', (device, idem, spec, json.dumps(result)))
+        self.collect_expired()
+        return result
+
+    def delete_entry(self, device, ident, revision, idem, recursive=False, tree_revision=None):
+        spec = json.dumps(['delete', ident, revision, recursive, tree_revision], separators=(',', ':'))
+        with self.transaction() as db:
+            previous = self._receipt(db, device, idem, spec)
+            if previous is not None:
+                return previous
+            entry = self._entry(db, ident)
+            self._revision(entry, revision)
+            if ident == 'root':
+                raise CloudError('root_protected', 409)
+            rows = self._subtree(db, ident)
+            if len(rows) > 1 and not recursive:
+                raise CloudError('directory_not_empty', 409)
+            if entry['kind'] == 'directory' and recursive:
+                if not tree_revision:
+                    raise CloudError('precondition_required', 428)
+                if tree_revision != self._tree_revision(rows):
+                    raise CloudError('tree_changed', 412)
+            self._invalidate(db, rows, [r['id'] for r in rows if r['kind'] == 'directory'])
+            for row in rows:
+                if row['blob']:
+                    db.execute('INSERT OR IGNORE INTO garbage VALUES (?,?)', (row['blob'], row['size']))
+                db.execute('INSERT OR IGNORE INTO garbage SELECT blob,size FROM versions WHERE file_id=?', (row['id'],))
+                db.execute('DELETE FROM versions WHERE file_id=?', (row['id'],))
+                db.execute('INSERT INTO tombstones VALUES (?,?,?,?,?)',
+                           (row['id'], row['parent'], row['name'], row['revision'], time.time()))
+                db.execute('DELETE FROM entries WHERE id=?', (row['id'],))
+            self._touch(db, entry['parent'])
+            result = self.envelope(deleted=True, entry_id=ident, count=len(rows))
+            db.execute('INSERT INTO mutations VALUES (?,?,?,?)', (device, idem, spec, json.dumps(result)))
         self.collect_expired()
         self.collect_garbage()
         return result
@@ -431,7 +555,7 @@ class Store:
             return self.envelope(state='ready', device_id=device, quota_bytes=self.settings.quota,
                                  used_bytes=self._usage(db), reserved_bytes=self._reserved(db),
                                  max_file_bytes=self.settings.max_file, chunk_bytes=self.settings.chunk_size,
-                                 root=self.public(self._entry(db, 'root')), webdav='read_only',
+                                 root=self.public(self._entry(db, 'root')), webdav='read_write' if self.settings.dav_write else 'read_only',
                                  features=self.features(), max_old_versions=self.settings.max_versions,
                                  garbage_bytes=db.execute('SELECT COALESCE(SUM(size),0) FROM garbage').fetchone()[0])
 

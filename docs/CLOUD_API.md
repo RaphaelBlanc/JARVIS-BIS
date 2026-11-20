@@ -66,9 +66,27 @@ Champs de `GET /api/cloud/v1/status` après authentification cloud :
 
 La révision du parent change à chaque mutation d’un enfant direct. Elle est vérifiée à la création d’un dossier ou d’une intention de transfert : une valeur périmée produit `409 destination_changed`. Au commit, le serveur vérifie seulement que le parent existe encore comme dossier et applique la précondition du nom/fichier selon `policy`. Une publication ou création de dossier sans rapport ne fait donc plus échouer un transfert déjà ouvert. La suppression du fichier ciblé continue d’invalider les anciennes intentions, sur tous les appareils. Plusieurs PC peuvent publier des fichiers différents dans le même dossier ; deux écritures concurrentes sur le même fichier restent arbitrées transactionnellement.
 
-Les déplacements, renommages et suppressions de dossiers ne sont pas proposés. Chaque remplacement conserve au plus dix anciennes versions, configurables à la baisse côté serveur ; elles comptent dans le quota. La version courante n’expire pas automatiquement. Il n’existe pas encore d’écran de restauration des versions.
+Les déplacements, renommages et suppressions de dossiers sont disponibles lorsque les capacités correspondantes décrites ci-dessous sont présentes. Chaque remplacement conserve au plus dix anciennes versions, configurables à la baisse côté serveur ; elles comptent dans le quota. La version courante n’expire pas automatiquement. Il n’existe pas encore d’écran de restauration des versions.
 
 ## Suppression de fichiers
+
+### Gestion des fichiers et dossiers
+
+Les capacités additives `entry_move`, `directory_delete` et `delete_preview` annoncent les opérations suivantes. Elles utilisent le jeton cloud habituel ; les anciennes routes restent disponibles.
+
+| Requête | Préconditions / corps | Résultat |
+| --- | --- | --- |
+| `GET /entries/{id}/delete-preview` | Aucune mutation | `entry`, `tree_revision`, `files`, `directories`, `size` |
+| `POST /entries/{id}/move` | `If-Match: "revision"`, `Idempotency-Key` ; `parent_id`, `parent_revision`, `name` | `entry`, `moved=true` |
+| `DELETE /entries/{id}` | `If-Match: "revision"`, `Idempotency-Key` ; `recursive` (faux par défaut), `tree_revision` optionnel | `deleted=true`, `entry_id`, `count` |
+
+Les chemins sont relatifs à `/api/cloud/v1`. Déplacement et renommage sont la même opération : l’identifiant, les octets et l’historique restent conservés. L’opération refuse la racine (`409 root_protected`), un dossier déplacé dans lui-même ou sa descendance (`409 invalid_destination`), et un nom déjà occupé (`409 name_conflict`), sans écraser la destination. Les révisions de la source et de la destination sont vérifiées dans la transaction. Les intentions de transfert visant l’ancien nom sont invalidées ; les transferts visant un enfant d’un dossier déplacé restent liés à son identifiant et peuvent terminer.
+
+Une suppression non récursive de dossier occupé est refusée (`409 directory_not_empty`). Une suppression récursive exige le `tree_revision` du dernier aperçu. Cette empreinte inclut tous les identifiants, parents, noms et révisions du sous-arbre, pas seulement la révision de son sommet : une modification profonde produit `412 tree_changed` et exige un nouvel aperçu puis une nouvelle confirmation. Le compteur `directories` inclut le dossier sélectionné. La transaction retire le contenu et son historique, invalide les transferts dans les dossiers supprimés, et utilise la même file de récupération physique que la suppression de fichiers.
+
+Les reçus de ces opérations sont persistants, liés à l’appareil et à la demande complète. Une reprise explicite avec la même clé et le même corps retrouve le résultat, y compris après suppression ou redémarrage. Un fichier vide se crée avec le protocole d’envoi existant : taille zéro, SHA-256 du contenu vide, aucun morceau, puis commit.
+
+### Route historique de suppression de fichiers
 
 Après confirmation explicite de l’utilisateur, envoyer `DELETE /api/cloud/v1/files/{id}` avec le jeton cloud, l’ETag fort exact `If-Match: "<revision affichée>"` et une nouvelle `Idempotency-Key` au même format que les transferts. L’absence de précondition produit `428 precondition_required` ; une ancienne révision, `*`, un ETag faible ou une liste d’ETags sont refusés avec `412 version_conflict`. Un dossier produit `409 not_a_file`.
 
@@ -144,6 +162,18 @@ Les morceaux sont effacés automatiquement après publication, annulation, révo
 `OPTIONS`, `PROPFIND`, `GET` et `HEAD` sont permis. Toutes les mutations, dont `PUT`, `MKCOL`, `MOVE`, `COPY`, `DELETE`, `LOCK` et `PROPPATCH`, sont refusées. Le contournement du dialogue de conflit par un éditeur ou un gestionnaire de fichiers est ainsi impossible dans cette version. Les écritures s’effectuent par `nc-cloud`, la fenêtre ou le script Nautilus.
 
 Pour toutes les méthodes WebDAV, le gateway et le service refusent un corps dépassant 8 Kio (`413`), même sans Basic Auth et sans `Content-Length`. La lecture du corps est limitée à 5 secondes (`408`). Le contrôle précède le pont WSGI et sa collecte en mémoire. Ces limites ne s’appliquent pas au contenu des réponses de téléchargement ni aux morceaux binaires de l’API de transfert.
+
+### Écritures WebDAV optionnelles
+
+Le mode précédent reste le défaut. Après activation explicite de `CLOUD_DAV_WRITE=1` côté gateway **et** stockage, `features.webdav_write=true` et `/status.webdav=read_write` annoncent l’extension. Les clients existants peuvent continuer d’utiliser l’API d’envoi et ses confirmations.
+
+`PUT`, `MKCOL`, `MOVE` et `DELETE` sont alors acceptés avec la même authentification Basic. Le provider expose les autorisations d’écriture à GVfs. `OPTIONS` annonce uniquement les méthodes disponibles ; les verrous DAV, `COPY` et les propriétés arbitraires ne sont pas implémentés. Un déplacement vers un nom occupé est refusé, y compris avec `Overwrite: T` ; un remplacement de contenu passe par `PUT` et conserve les anciennes versions.
+
+`PUT` est traité en ASGI, sans passer par l’adaptateur WSGI. Le gateway relaie le flux ; le stockage réserve le quota, écrit au plus un morceau en mémoire à la fois, calcule le SHA-256 complet, puis publie avec le même moteur transactionnel que l’API. Sans taille annoncée, la réservation initiale vaut la taille maximale d’un fichier et se réduit à la fin du flux. Une coupure annule le transfert et récupère ses morceaux sans modifier une version publiée. Aucun envoi DAV n’est repris automatiquement. La limite de 8 Kio continue de s’appliquer aux autres méthodes ; les flux PUT ont une limite de taille, 60 secondes d’inactivité et une durée totale maximale d’une heure.
+
+Un `PUT` ou une mutation portant `If-Match` vérifie la révision. Pour interopérer avec GVfs, DAV accepte aussi l’identifiant hexadécimal exact sans guillemets ; les ETags faibles et listes ne sont pas acceptés. L’API JSON conserve son contrat strict avec guillemets. Sans `If-Match`, DAV prend la révision au début de la requête puis vérifie celle-ci au commit : deux écritures concurrentes ne gagnent pas toutes deux. Cela ne peut pas détecter une ancienne copie éditée si l’application n’en transmet pas la révision ; utiliser un éditeur transmettant l’ETag ou la fenêtre Cloud pour une précondition portant sur la version affichée.
+
+Les suppressions DAV de dossiers s’appliquent au contenu présent lors de l’opération, avec contrôle du sous-arbre entre aperçu interne et transaction. La confirmation utilisateur relève du gestionnaire de fichiers. La fenêtre Cloud fournit, elle, un aperçu et une confirmation explicites avant suppression récursive.
 
 ## Erreurs et confidentialité
 

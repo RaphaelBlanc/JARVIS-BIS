@@ -8,6 +8,7 @@ services:
     environment:
       DEPLOY_MODE: server
       CLOUD_ENABLED: '1'
+      CLOUD_DAV_WRITE: ${CLOUD_DAV_WRITE:-0}
       CLOUD_INTERNAL_KEY: ${CLOUD_INTERNAL_KEY:?Set CLOUD_INTERNAL_KEY in deploy/cloud.env}
       CLOUD_DATA_DIR: /data
       CLOUD_QUOTA_BYTES: ${CLOUD_QUOTA_BYTES:-21474836480}

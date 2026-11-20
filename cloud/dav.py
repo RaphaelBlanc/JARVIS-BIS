@@ -1,7 +1,7 @@
-"""Read-only WebDAV view of the transactional namespace.
+"""WebDAV metadata/read view of the transactional namespace.
 
-Mutations intentionally go through the versioned upload API in v1. WsgiDAV
-FilesystemProvider must never be used: it would bypass publication checks.
+Read-only by default. Optional writes use dav_write ASGI routes and Store, never
+FilesystemProvider: direct filesystem writes would bypass publication checks.
 """
 import base64
 import mimetypes
@@ -19,7 +19,7 @@ class Provider(DAVProvider):
         self.store = store
 
     def is_readonly(self):
-        return True
+        return not self.store.settings.dav_write
 
     def get_resource_inst(self, path, environ):
         try:
@@ -99,8 +99,10 @@ def application(store):
                                               ('Content-Type', 'text/plain'), ('Cache-Control', 'no-store')])
             return [b'Cloud authentication required']
         if environ['REQUEST_METHOD'] not in ('OPTIONS', 'PROPFIND', 'GET', 'HEAD'):
-            start_response('403 Forbidden', [('Content-Type', 'text/plain'), ('Cache-Control', 'no-store')])
-            return [b'Read-only WebDAV. Use the Cloud JARVIS upload window.']
+            writable = store.settings.dav_write
+            start_response('405 Method Not Allowed' if writable else '403 Forbidden',
+                           [('Content-Type', 'text/plain'), ('Cache-Control', 'no-store')])
+            return [b'Unsupported WebDAV operation.' if writable else b'Read-only WebDAV. Use the Cloud JARVIS upload window.']
         return dav(environ, start_response)
 
     return authenticated

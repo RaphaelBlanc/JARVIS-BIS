@@ -42,6 +42,15 @@ class Upload(Directory):
     expected_revision: str | None = Field(default=None, max_length=64)
 
 
+class Move(Directory):
+    pass
+
+
+class Removal(Model):
+    recursive: bool = False
+    tree_revision: str | None = Field(default=None, pattern='^[0-9a-f]{64}$')
+
+
 def enabled():
     return os.environ.get('DEPLOY_MODE', 'local').strip().lower() == 'server' and os.environ.get('CLOUD_ENABLED', '0') == '1'
 
@@ -96,7 +105,8 @@ def create_app(settings=None, internal_key=None):
         if not supplied or not hmac.compare_digest(key, supplied):
             return JSONResponse({'error': 'authentication_required'}, status_code=401)
         if request.method in ('POST', 'PUT', 'PATCH'):
-            limit = settings.chunk_size if '/chunks/' in request.url.path else 8192
+            limit = (settings.max_file if settings.dav_write and request.method == 'PUT' and request.url.path.startswith('/cloud/dav/')
+                     else settings.chunk_size if '/chunks/' in request.url.path else 8192)
             # Count streamed bodies too: Content-Length alone is not a size limit.
             size = 0
             original = request._receive
@@ -158,6 +168,20 @@ def create_app(settings=None, internal_key=None):
     @app.post(prefix + '/directories')
     def mkdir(body: Directory, ident=Depends(device)):
         return store.mkdir(ident, body.parent_id, body.name, body.parent_revision)
+
+    @app.get(prefix + '/entries/{entry_id}/delete-preview')
+    def preview_delete(entry_id: str, ident=Depends(device)):
+        return store.delete_preview(ident, entry_id)
+
+    @app.post(prefix + '/entries/{entry_id}/move')
+    def move_entry(entry_id: str, body: Move, if_match: str = Header(default=''),
+                   idempotency_key: str = Header(default=''), ident=Depends(device)):
+        return store.move_entry(ident, entry_id, if_match, body.parent_id, body.parent_revision, body.name, idempotency_key)
+
+    @app.delete(prefix + '/entries/{entry_id}')
+    def delete_entry(entry_id: str, body: Removal, if_match: str = Header(default=''),
+                     idempotency_key: str = Header(default=''), ident=Depends(device)):
+        return store.delete_entry(ident, entry_id, if_match, idempotency_key, body.recursive, body.tree_revision)
 
     @app.get(prefix + '/files/{file_id}/content')
     def download(file_id: str, request: Request, ident=Depends(device)):
@@ -229,7 +253,10 @@ def create_app(settings=None, internal_key=None):
     def cancel(upload_id: str, ident=Depends(device)):
         return store.cancel(ident, upload_id)
 
+    if settings.dav_write:
+        from cloud.dav_write import router as dav_write_router
+        app.include_router(dav_write_router(store))
     from cloud.dav import application
     app.mount('/cloud/dav', WSGIMiddleware(application(store)))
-    app.add_middleware(DavBodyLimit)
+    app.add_middleware(DavBodyLimit, allow_put=settings.dav_write)
     return app

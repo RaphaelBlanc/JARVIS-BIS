@@ -7,7 +7,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
-from cloud.body_limit import BodyRejected, bounded_dav_body
+from cloud.body_limit import BodyRejected, bounded_dav_body, bounded_dav_stream
 
 
 def configuration():
@@ -45,13 +45,13 @@ async def capability():
 
 
 _ALLOWED = {
-    'GET': r'(?:status|entries(?:/(?:root|[0-9a-f]{32}))?|files/[0-9a-f]{32}/content|uploads/[0-9a-f]{32})',
-    'POST': r'(?:directories|uploads|uploads/[0-9a-f]{32}/commit)',
+    'GET': r'(?:status|entries(?:/(?:root|[0-9a-f]{32})(?:/delete-preview)?)?|files/[0-9a-f]{32}/content|uploads/[0-9a-f]{32})',
+    'POST': r'(?:directories|uploads|uploads/[0-9a-f]{32}/commit|entries/(?:root|[0-9a-f]{32})/move)',
     'PUT': r'uploads/[0-9a-f]{32}/chunks/[0-9]{1,10}',
-    'DELETE': r'(?:uploads|files)/[0-9a-f]{32}',
+    'DELETE': r'(?:uploads|files|entries)/[0-9a-f]{32}',
 }
 _HEADERS = {'authorization', 'content-type', 'content-length', 'idempotency-key', 'x-content-sha256',
-            'range', 'if-range', 'if-match', 'if-none-match', 'depth', 'translate'}
+            'range', 'if-range', 'if-match', 'if-none-match', 'depth', 'translate', 'destination', 'overwrite'}
 _RESPONSE_HEADERS = {'content-type', 'content-length', 'content-range', 'accept-ranges', 'etag',
                      'last-modified', 'content-disposition', 'www-authenticate', 'dav', 'allow', 'retry-after'}
 
@@ -69,7 +69,7 @@ def router(require_secret):
     async def cloud_capabilities():
         return await capability()
 
-    async def proxy(request, path, admin=False, content=None):
+    async def proxy(request, path, admin=False, content=None, streamed=None):
         _, enabled, url, key = configuration()
         if not enabled:
             return JSONResponse({'error': 'cloud_disabled'}, status_code=403)
@@ -77,6 +77,13 @@ def router(require_secret):
             return JSONResponse({'error': 'cloud_unavailable'}, status_code=503)
         headers = {k: v for k, v in request.headers.items() if k.lower() in _HEADERS}
         headers['X-Cloud-Internal-Key'] = key
+        if 'destination' in headers:
+            destination = urlsplit(headers['destination'])
+            if (destination.query or destination.fragment or destination.username or destination.password
+                    or (destination.netloc and destination.netloc.lower() != request.url.netloc.lower())
+                    or not destination.path.startswith('/cloud/dav/')):
+                return JSONResponse({'error': 'invalid_destination'}, status_code=400)
+            headers['destination'] = destination.path
         if admin:
             headers['X-Cloud-Admin'] = '1'
         if content is not None:
@@ -88,8 +95,11 @@ def router(require_secret):
             if request.scope.get('query_string'):
                 target += '?' + request.scope['query_string'].decode('ascii')
             outgoing = client.build_request(request.method, target, headers=headers,
-                                             content=content if content is not None else request.stream())
+                                             content=content if content is not None else streamed if streamed is not None else request.stream())
             upstream = await client.send(outgoing, stream=True)
+        except BodyRejected as exc:
+            await client.aclose()
+            return JSONResponse({'error': exc.code}, status_code=exc.status)
         except httpx.HTTPError:
             await client.aclose()
             return JSONResponse({'error': 'cloud_unavailable'}, status_code=503)
@@ -130,6 +140,10 @@ def router(require_secret):
     async def dav(path: str, request: Request):
         if any(p in ('.', '..') for p in path.split('/')) or '\\' in path:
             return JSONResponse({'error': 'invalid_path'}, status_code=400)
+        if request.method == 'PUT' and os.environ.get('CLOUD_DAV_WRITE', '0') == '1':
+            return await proxy(request, '/cloud/dav/' + path,
+                streamed=bounded_dav_stream(request.scope, request.receive,
+                                            limit=int(os.environ.get('CLOUD_MAX_FILE_BYTES', 5 * 1024**3))))
         try:
             content = await bounded_dav_body(request.scope, request.receive)
         except BodyRejected as exc:
