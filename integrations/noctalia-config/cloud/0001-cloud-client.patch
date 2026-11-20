@@ -1,0 +1,868 @@
+From 3cd00cee56f5e9b4b45e000028ce2ca05f7cfb23 Mon Sep 17 00:00:00 2001
+From: RaphaelBlanc <raphael.blanc-alcaix@epita.fr>
+Date: Fri, 20 Nov 2026 12:36:18 +0100
+Subject: [PATCH 1/3] Cloud JARVIS : client de transfert et envoi depuis
+ Nautilus
+
+---
+ home/.local/bin/nc-cloud                      |  10 +
+ .../scripts/Envoyer vers Cloud JARVIS         |  10 +
+ home/.local/share/nc-cloud/client.py          | 572 ++++++++++++++++++
+ tests/test_cloud.py                           | 235 +++++++
+ 4 files changed, 827 insertions(+)
+ create mode 100755 home/.local/bin/nc-cloud
+ create mode 100755 home/.local/share/nautilus/scripts/Envoyer vers Cloud JARVIS
+ create mode 100644 home/.local/share/nc-cloud/client.py
+ create mode 100644 tests/test_cloud.py
+
+diff --git a/home/.local/bin/nc-cloud b/home/.local/bin/nc-cloud
+new file mode 100755
+index 0000000..c3f7dd9
+--- /dev/null
++++ b/home/.local/bin/nc-cloud
+@@ -0,0 +1,10 @@
++#!/usr/bin/env python3
++"""Cloud JARVIS distant — nc-cloud associer, fenetre, deposer FICHIER, ouvrir, etat."""
++from pathlib import Path
++import sys
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'share/nc-cloud'))
++from client import main
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/home/.local/share/nautilus/scripts/Envoyer vers Cloud JARVIS b/home/.local/share/nautilus/scripts/Envoyer vers Cloud JARVIS
+new file mode 100755
+index 0000000..d7dc15a
+--- /dev/null
++++ b/home/.local/share/nautilus/scripts/Envoyer vers Cloud JARVIS	
+@@ -0,0 +1,10 @@
++#!/usr/bin/env python3
++"""Nautilus supplies one local path per argv element. No shell evaluation."""
++from pathlib import Path
++import os
++import subprocess
++import sys
++
++files = sys.argv[1:] or os.environ.get('NAUTILUS_SCRIPT_SELECTED_FILE_PATHS', '').splitlines()
++if files:
++    subprocess.run([str(Path.home() / '.local/bin/nc-cloud'), 'deposer', *files], check=False)
+diff --git a/home/.local/share/nc-cloud/client.py b/home/.local/share/nc-cloud/client.py
+new file mode 100644
+index 0000000..2c5ee7a
+--- /dev/null
++++ b/home/.local/share/nc-cloud/client.py
+@@ -0,0 +1,572 @@
++"""Cloud JARVIS client: no offline queue, no mirror directory, no AI requests."""
++import argparse
++import base64
++import fcntl
++import hashlib
++import importlib.machinery
++import importlib.util
++import json
++import os
++from pathlib import Path
++import re
++import socket
++import shutil
++import stat
++import subprocess
++import sys
++import tempfile
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++import uuid
++
++MESSAGES = {
++    'cloud_unavailable': ('Cloud hors ligne. Aucun nouvel envoi. Réessaie après reconnexion.', 'Cloud offline. No new upload. Try again after reconnecting.'),
++    'cloud_disabled': ('Cloud disponible uniquement sur un serveur distant avec cette option activée.', 'Cloud is only available on a remote server with this option enabled.'),
++    'not_associated': ('Associe ce PC au cloud dans les réglages.', 'Associate this PC with the cloud in settings.'),
++    'device_revoked': ('Accès cloud révoqué : associe à nouveau ce PC.', 'Cloud access revoked: associate this PC again.'),
++    'version_conflict': ('Un fichier de ce nom existe ou a changé sur le serveur.', 'A file with this name exists or has changed on the server.'),
++    'source_changed': ('Le fichier source a changé. Dépose-le à nouveau.', 'The source file changed. Drop it again.'),
++    'keyring_unavailable': ('Le trousseau de session ne répond pas (secret-tool).', 'The session keyring is unavailable (secret-tool).'),
++    'server_changed': ('Le serveur cloud a changé. Associe à nouveau ce PC.', 'The cloud server changed. Associate this PC again.'),
++    'quota_exceeded': ('Quota cloud dépassé.', 'Cloud quota exceeded.'),
++    'storage_full': ('Disque du serveur plein.', 'Server disk is full.'),
++    'upload_expired': ('Ce transfert a expiré. Dépose le fichier à nouveau.', 'This upload expired. Drop the file again.'),
++    'invalid_source': ('Sélectionne un fichier local ordinaire ; les dossiers et liens ne sont pas envoyés.', 'Select a regular local file; folders and links are not uploaded.'),
++    'authentication_required': ('Identifiants cloud refusés. Associe à nouveau ce PC.', 'Cloud credentials rejected. Associate this PC again.'),
++    'destination_changed': ('Le dossier distant a changé. Choisis à nouveau la destination.', 'The remote folder changed. Select the destination again.'),
++    'mount_failed': ('Impossible d’ouvrir le drive dans Fichiers. Vérifie les composants Gio et GVfs.', 'Unable to open the drive in Files. Check Gio and GVfs components.'),
++    'not_configured': ('Configure d’abord la connexion à JARVIS.', 'Configure the JARVIS connection first.'),
++    'incompatible': ('Ce serveur ne propose pas cette version du cloud.', 'This server does not provide this cloud version.'),
++}
++
++
++def language():
++    return not (os.environ.get('LANG', '').lower().startswith('fr'))
++
++
++class Failure(Exception):
++    def __init__(self, code, status=0, current=None):
++        self.code, self.status, self.current = code, status, current
++        super().__init__(MESSAGES.get(code, ('Erreur cloud : ' + code, 'Cloud error: ' + code))[language()])
++
++
++def private_write(path, data):
++    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
++    if path.is_symlink():
++        raise Failure('invalid_source')
++    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as f:
++        temporary = Path(f.name)
++        json.dump(data, f, ensure_ascii=False)
++        f.flush()
++        os.fsync(f.fileno())
++    os.chmod(temporary, 0o600)
++    os.replace(temporary, path)
++
++
++def private_read(path):
++    if path.is_symlink() or path.stat().st_mode & 0o077 or path.stat().st_size > 1024**2:
++        raise Failure('invalid_private_file')
++    return json.loads(path.read_text())
++
++
++class NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        return None
++
++
++def assistant_configuration():
++    path = Path(__file__).resolve().parents[2] / 'bin/nc-assistant'
++    loader = importlib.machinery.SourceFileLoader('cloud_assistant_configuration', str(path))
++    spec = importlib.util.spec_from_loader(loader.name, loader)
++    module = importlib.util.module_from_spec(spec)
++    loader.exec_module(module)
++    try:
++        config = module.configuration()
++    except module.Erreur:
++        raise Failure('not_configured') from None
++    if not module.transport_sur(config['URL']):
++        raise Failure('unsafe_transport')
++    return config
++
++
++class Client:
++    def __init__(self, config=None, state=None):
++        self.config = config or assistant_configuration()
++        self.url = self.config['URL'].rstrip('/')
++        self.namespace = hashlib.sha256(self.url.encode()).hexdigest()
++        root = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state')
++        self.root = (Path(state) if state else root / 'nc-cloud') / self.namespace
++        self.identity_file = self.root / 'connection.json'
++        self.transfers_dir = self.root / 'transfers'
++        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
++        self._token = None
++
++    def identity(self):
++        try:
++            return private_read(self.identity_file)
++        except FileNotFoundError:
++            raise Failure('not_associated') from None
++
++    def keyring(self, operation, identity, token=None):
++        command = ['secret-tool', operation]
++        if operation == 'store':
++            command += ['--label=Cloud JARVIS']
++        command += ['service', 'nc-cloud', 'server', self.namespace, 'device', identity['device_id']]
++        try:
++            result = subprocess.run(command, input=token, text=True, capture_output=True, timeout=15)
++        except (OSError, subprocess.TimeoutExpired):
++            raise Failure('keyring_unavailable') from None
++        if result.returncode:
++            raise Failure('keyring_unavailable')
++        return result.stdout.strip()
++
++    def token(self):
++        if self._token is None:
++            self._token = self.keyring('lookup', self.identity())
++            if not self._token:
++                raise Failure('not_associated')
++        return self._token
++
++    def request(self, path, method='GET', payload=None, binary=None, headers=None, admin=False, timeout=8):
++        auth = {'X-Secret-Key': self.config['SECRET_KEY']} if admin else {'Authorization': 'Bearer ' + self.token()}
++        auth.update(headers or {})
++        data = binary
++        if payload is not None:
++            data = json.dumps(payload).encode()
++            auth['Content-Type'] = 'application/json'
++        elif data is not None:
++            auth['Content-Type'] = 'application/octet-stream'
++        request = urllib.request.Request(self.url + path, data=data, headers=auth, method=method)
++        try:
++            with self.opener.open(request, timeout=timeout) as response:
++                raw = response.read(2 * 1024**2 + 1)
++                if len(raw) > 2 * 1024**2:
++                    raise Failure('invalid_response')
++                result = json.loads(raw)
++        except urllib.error.HTTPError as exc:
++            try:
++                error = json.loads(exc.read(8192))
++            except (ValueError, OSError):
++                error = {}
++            finally:
++                exc.close()
++            raise Failure(error.get('error', 'authentication_required' if exc.code in (401, 403) else 'cloud_unavailable'),
++                          exc.code, error.get('current')) from None
++        except (urllib.error.URLError, TimeoutError, OSError):
++            raise Failure('cloud_unavailable') from None
++        except ValueError:
++            raise Failure('incompatible') from None
++        if result.get('api_version') != 1:
++            raise Failure('incompatible')
++        if not admin:
++            identity = self.identity()
++            if result.get('server_id') != identity['server_id'] or result.get('space_id') != identity['space_id']:
++                raise Failure('server_changed')
++        return result
++
++    def capability(self):
++        active = self.root.parent / 'active.json'
++        if active.exists() and private_read(active).get('namespace') != self.namespace:
++            self.bookmark(False)
++        try:
++            result = self.request('/api/cloud/v1/capabilities', admin=True, timeout=3)
++        except Failure as exc:
++            if exc.status == 404:
++                raise Failure('incompatible') from None
++            raise
++        if not result.get('enabled'):
++            # Keep identity for future reactivation, but remove the old Files bookmark.
++            self.bookmark(False)
++            raise Failure('cloud_disabled')
++        if result.get('state') != 'ready':
++            raise Failure('cloud_unavailable')
++        return result
++
++    def status(self):
++        self.capability()
++        result = self.request('/api/cloud/v1/status', timeout=3)
++        return dict(result, associated=True, enabled=True, configured=True)
++
++    def associate(self):
++        capability = self.capability()
++        associated = self.request('/api/cloud/v1/devices', 'POST', {'name': socket.gethostname()[:80] or 'PC'}, admin=True)
++        if associated['server_id'] != capability['server_id']:
++            raise Failure('server_changed')
++        identity = {k: associated[k] for k in ('server_id', 'space_id', 'device_id')}
++        try:
++            self.keyring('store', identity, associated['token'])
++        except Failure:
++            self.request('/api/cloud/v1/devices/' + identity['device_id'], 'DELETE', admin=True)
++            raise
++        previous = self.identity() if self.identity_file.exists() else None
++        private_write(self.identity_file, identity)
++        if previous and previous['device_id'] != identity['device_id']:
++            self.request('/api/cloud/v1/devices/' + previous['device_id'], 'DELETE', admin=True)
++            self.keyring('clear', previous)
++        self._token = associated['token']
++        return self.status()
++
++    def listing(self, parent='root', cursor=''):
++        return self.request('/api/cloud/v1/entries?' + urllib.parse.urlencode({'parent_id': parent, 'cursor': cursor}))
++
++    @staticmethod
++    def source(path):
++        if path.startswith('file:'):
++            uri = urllib.parse.urlsplit(path)
++            if uri.scheme != 'file' or uri.netloc not in ('', 'localhost') or uri.query or uri.fragment:
++                raise Failure('invalid_source')
++            path = urllib.parse.unquote(uri.path)
++        file = Path(path).absolute()
++        try:
++            initial = file.lstat()
++            if not stat.S_ISREG(initial.st_mode):
++                raise Failure('invalid_source')
++            fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
++            source = os.fdopen(fd, 'rb')
++            actual = os.fstat(fd)
++            if (initial.st_dev, initial.st_ino) != (actual.st_dev, actual.st_ino):
++                source.close()
++                raise Failure('source_changed')
++            return file, source
++        except OSError:
++            raise Failure('invalid_source') from None
++
++    @staticmethod
++    def fingerprint(source):
++        info = os.fstat(source.fileno())
++        return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
++
++    def manifest_path(self, ident):
++        if not re.fullmatch('[0-9a-f]{32}', ident):
++            raise Failure('invalid_transfer')
++        return self.transfers_dir / (ident + '.json')
++
++    def save(self, manifest):
++        manifest['updated'] = time.time()
++        private_write(self.manifest_path(manifest['id']), manifest)
++
++    def check_manifest(self, manifest):
++        identity = self.identity()
++        if any(manifest[k] != identity[k] for k in ('server_id', 'space_id', 'device_id')):
++            raise Failure('server_changed')
++
++    def prepare(self, path, parent, revision):
++        # A live authenticated round trip must precede preparation. Never queue an offline drop.
++        status = self.status()
++        file, source = self.source(path)
++        with source:
++            fingerprint = self.fingerprint(source)
++            if fingerprint[2] > status['max_file_bytes']:
++                raise Failure('file_too_large')
++            digest = hashlib.file_digest(source, 'sha256').hexdigest()
++            if self.fingerprint(source) != fingerprint:
++                raise Failure('source_changed')
++        manifest = dict(self.identity(), id=uuid.uuid4().hex, source=str(file), fingerprint=fingerprint,
++                        name=file.name, parent_id=parent, parent_revision=revision, size=fingerprint[2],
++                        sha256=digest, policy='create', expected_revision=None, idem=uuid.uuid4().hex,
++                        state='preparing', sent=0, created=time.time())
++        spec = {k: manifest[k] for k in ('name', 'parent_id', 'parent_revision', 'size', 'sha256', 'policy', 'expected_revision')}
++        self.save(manifest)  # Persist intent before an HTTP response can be lost.
++        try:
++            upload = self.request('/api/cloud/v1/uploads', 'POST', spec, headers={'Idempotency-Key': manifest['idem']})
++        except Failure as exc:
++            manifest.update(state='interrupted', error=exc.code, message=str(exc))
++            self.save(manifest)
++            raise
++        manifest.update(upload_id=upload['upload_id'], state='ready')
++        self.save(manifest)
++        return manifest
++
++    def launch(self, ident):
++        manifest = private_read(self.manifest_path(ident))
++        self.check_manifest(manifest)
++        launcher = Path(__file__).resolve().parents[2] / 'bin/nc-cloud'
++        # No credentials in argv or log files. A worker ends on the first connection failure.
++        subprocess.Popen([sys.executable, str(launcher), 'worker', ident], stdin=subprocess.DEVNULL,
++                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
++
++    def worker(self, ident):
++        path = self.manifest_path(ident)
++        lock = path.with_suffix('.lock')
++        lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
++        fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
++        with os.fdopen(fd, 'w') as handle:
++            fcntl.flock(handle, fcntl.LOCK_EX)
++            manifest = private_read(path)
++            try:
++                self.check_manifest(manifest)
++                if not manifest.get('upload_id'):
++                    self.capability()
++                    spec = {k: manifest[k] for k in ('name', 'parent_id', 'parent_revision', 'size', 'sha256', 'policy', 'expected_revision')}
++                    result = self.request('/api/cloud/v1/uploads', 'POST', spec, headers={'Idempotency-Key': manifest['idem']})
++                    manifest['upload_id'] = result['upload_id']
++                    self.save(manifest)
++                state = self.request('/api/cloud/v1/uploads/' + manifest['upload_id'])
++                if state['state'] == 'committed':
++                    manifest.update(state='committed', sent=manifest['size'], result=state['result'])
++                    self.save(manifest)
++                    return
++                if state['state'] != 'pending':
++                    raise Failure('upload_expired' if state['state'] == 'expired' else 'upload_not_pending')
++                self.capability()
++                _, source = self.source(manifest['source'])
++                with source:
++                    if self.fingerprint(source) != manifest['fingerprint'] or hashlib.file_digest(source, 'sha256').hexdigest() != manifest['sha256']:
++                        raise Failure('source_changed')
++                    source.seek(0)
++                    received = {r['idx']: r['sha256'] for r in state['chunks']}
++                    manifest.update(state='uploading', error=None, sent=0)
++                    self.save(manifest)
++                    index = 0
++                    while data := source.read(state['chunk_bytes']):
++                        checksum = hashlib.sha256(data).hexdigest()
++                        if self.manifest_path(ident).with_suffix('.cancel').exists():
++                            raise Failure('cancel_requested')
++                        if received.get(index) != checksum:
++                            self.request('/api/cloud/v1/uploads/' + manifest['upload_id'] + '/chunks/' + str(index),
++                                         'PUT', binary=data, headers={'X-Content-SHA256': checksum}, timeout=60)
++                        manifest['sent'] += len(data)
++                        self.save(manifest)
++                        index += 1
++                    if self.fingerprint(source) != manifest['fingerprint']:
++                        raise Failure('source_changed')
++                manifest['state'] = 'verifying'
++                self.save(manifest)
++                if self.manifest_path(ident).with_suffix('.cancel').exists():
++                    raise Failure('cancel_requested')
++                result = self.request('/api/cloud/v1/uploads/' + manifest['upload_id'] + '/commit', 'POST', timeout=60)
++                manifest.update(state='committed', result=result['result'])
++                self.save(manifest)
++                self.notify(manifest['name'] + (' envoyé.' if not language() else ' uploaded.'))
++            except Failure as exc:
++                manifest.update(state='conflict' if exc.code == 'version_conflict' else 'interrupted',
++                                error=exc.code, message=str(exc), current=exc.current)
++                if exc.code in ('cancel_requested', 'upload_not_pending'):
++                    manifest['state'] = 'cancelled'
++                self.save(manifest)
++                self.notify(str(exc))
++
++    @staticmethod
++    def notify(message):
++        try:
++            subprocess.run(['notify-send', '-a', 'Cloud JARVIS', 'Cloud JARVIS', message], timeout=3,
++                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++        except (OSError, subprocess.TimeoutExpired):
++            pass
++
++    def transfers(self):
++        rows = []
++        if self.transfers_dir.exists():
++            for path in self.transfers_dir.glob('*.json'):
++                manifest = private_read(path)
++                if manifest['state'] in ('ready', 'preparing', 'uploading', 'verifying') and time.time() - manifest['updated'] > 5:
++                    fd = os.open(path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
++                    with os.fdopen(fd, 'w') as handle:
++                        try:
++                            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                        except BlockingIOError:
++                            pass
++                        else:
++                            manifest = private_read(path)
++                            if manifest['state'] in ('ready', 'preparing', 'uploading', 'verifying'):
++                                manifest.update(state='interrupted', error='worker_stopped',
++                                                message=('Transfert interrompu. Reprends-le pour vérifier son état.' if not language() else 'Transfer interrupted. Resume to verify its state.'))
++                                self.save(manifest)
++                # Source paths and device credentials are not passed to QML.
++                rows.append({k: manifest.get(k) for k in ('id', 'name', 'state', 'size', 'sent', 'updated', 'message', 'error', 'current')})
++        return sorted(rows, key=lambda row: row['updated'], reverse=True)[:100]
++
++    def cancel(self, ident):
++        manifest = private_read(self.manifest_path(ident))
++        self.check_manifest(manifest)
++        private_write(self.manifest_path(ident).with_suffix('.cancel'), {})
++        result = self.request('/api/cloud/v1/uploads/' + manifest['upload_id'], 'DELETE')
++        # Let an active worker reconcile its own manifest; terminal server state is authoritative.
++        manifest.update(state=result['state'], result=result.get('result'))
++        self.save(manifest)
++        return result
++
++    def resolve(self, ident, policy):
++        manifest = private_read(self.manifest_path(ident))
++        self.check_manifest(manifest)
++        if manifest['state'] != 'conflict' or policy not in ('keep_both', 'replace'):
++            raise Failure('invalid_resolution')
++        current = manifest.get('current') or {}
++        if policy == 'replace' and current.get('kind') != 'file':
++            raise Failure('invalid_resolution')
++        self.cancel(ident)
++        manifest.update(policy=policy, expected_revision=current.get('revision') if policy == 'replace' else None,
++                        idem=uuid.uuid4().hex, state='ready', error=None)
++        spec = {k: manifest[k] for k in ('name', 'parent_id', 'parent_revision', 'size', 'sha256', 'policy', 'expected_revision')}
++        result = self.request('/api/cloud/v1/uploads', 'POST', spec, headers={'Idempotency-Key': manifest['idem']})
++        manifest['upload_id'] = result['upload_id']
++        self.manifest_path(ident).with_suffix('.cancel').unlink(missing_ok=True)
++        self.save(manifest)
++        self.launch(ident)
++        return {'ok': True}
++
++    def dav_uri(self):
++        parsed = urllib.parse.urlsplit(self.url)
++        identity = self.identity()
++        return urllib.parse.urlunsplit(('davs' if parsed.scheme == 'https' else 'dav',
++                                         identity['device_id'] + '@' + parsed.netloc, parsed.path + '/cloud/dav/', '', ''))
++
++    def bookmark(self, add):
++        config = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
++        path = config / 'gtk-3.0/bookmarks'
++        try:
++            lines = path.read_text().splitlines()
++        except FileNotFoundError:
++            lines = []
++        # Only own our label, preserve every other bookmark.
++        lines = [line for line in lines if not line.endswith(' Cloud JARVIS')]
++        if add:
++            lines.append(self.dav_uri() + ' Cloud JARVIS')
++        path.parent.mkdir(parents=True, exist_ok=True)
++        if path.is_symlink():
++            raise Failure('invalid_private_file')
++        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as f:
++            f.write('\n'.join(lines) + ('\n' if lines else ''))
++            temporary = f.name
++        os.replace(temporary, path)
++        active = self.root.parent / 'active.json'
++        if add:
++            private_write(active, {'namespace': self.namespace, 'uri': self.dav_uri()})
++        elif active.exists():
++            previous = private_read(active)
++            if previous.get('uri'):
++                try:
++                    subprocess.run(['gio', 'mount', '--unmount', previous['uri']], timeout=3,
++                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++                except (OSError, subprocess.TimeoutExpired):
++                    pass
++            active.unlink(missing_ok=True)
++
++    def open_files(self):
++        self.status()
++        uri = self.dav_uri()
++        # MountOperation answers the actual prompts; piping assumed prompt order to gio is unsafe.
++        identity = self.identity()
++        try:
++            from gi.repository import Gio, GLib
++            loop, cancellable = GLib.MainLoop(), Gio.Cancellable()
++            operation = Gio.MountOperation()
++            token = self.token()
++            errors = []
++
++            def password(op, message, user, domain, flags):
++                op.set_username(identity['device_id'])
++                op.set_domain('')
++                op.set_password(token)
++                op.set_password_save(Gio.PasswordSave.PERMANENTLY)
++                op.reply(Gio.MountOperationResult.HANDLED)
++
++            def finished(file, result):
++                try:
++                    file.mount_enclosing_volume_finish(result)
++                except GLib.Error as exc:
++                    if not exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.ALREADY_MOUNTED):
++                        errors.append(True)
++                loop.quit()
++
++            operation.connect('ask-password', password)
++            file = Gio.File.new_for_uri(uri)
++            file.mount_enclosing_volume(Gio.MountMountFlags.NONE, operation, cancellable, finished)
++            timer = GLib.timeout_add_seconds(15, lambda: (cancellable.cancel(), loop.quit(), False)[-1])
++            loop.run()
++            if not cancellable.is_cancelled():
++                GLib.source_remove(timer)
++            if errors or cancellable.is_cancelled():
++                raise Failure('mount_failed')
++            self.bookmark(True)
++            subprocess.Popen(['gio', 'open', uri], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++        except (ImportError, OSError):
++            raise Failure('mount_failed') from None
++        return {'ok': True, 'read_only': True}
++
++
++def dispatch(client, body):
++    op = body.get('op')
++    if op == 'etat':
++        try:
++            return client.status()
++        except Failure as exc:
++            return dict(ok=False, configured=client.identity_file.exists(), enabled=exc.code != 'cloud_disabled',
++                        state='unavailable', error=exc.code, message=str(exc))
++    if op == 'associer':
++        return client.associate()
++    if op == 'lister':
++        return client.listing(body.get('parent_id', 'root'), body.get('cursor', ''))
++    if op == 'dossier':
++        return client.request('/api/cloud/v1/directories', 'POST',
++                              {k: body[k] for k in ('name', 'parent_id', 'parent_revision')})
++    if op == 'ouvrir':
++        return client.open_files()
++    if op == 'envoyer':
++        files = body.get('files', [])
++        if not isinstance(files, list) or not 1 <= len(files) <= 8 or any(not isinstance(p, str) for p in files):
++            raise Failure('invalid_source')
++        results = []
++        for path in files:
++            try:
++                manifest = client.prepare(path, body['parent_id'], body['parent_revision'])
++                client.launch(manifest['id'])
++                results.append({'id': manifest['id'], 'ok': True})
++            except Failure as exc:
++                results.append({'ok': False, 'error': exc.code, 'message': str(exc)})
++        return {'results': results, 'ok': all(row['ok'] for row in results)}
++    if op == 'transferts':
++        return {'transfers': client.transfers()}
++    if op == 'reprise':
++        client.status()
++        client.launch(body['id'])
++        return {'ok': True}
++    if op == 'annuler':
++        return client.cancel(body['id'])
++    if op == 'resoudre':
++        return client.resolve(body['id'], body['policy'])
++    raise Failure('unknown_operation')
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('action', choices=['etat', 'associer', 'ouvrir', 'lister', 'transferts', 'requete', 'worker', 'fenetre', 'deposer', 'verifier'])
++    parser.add_argument('arguments', nargs='*')
++    args = parser.parse_args(argv)
++    if args.action == 'verifier':
++        components = {name: bool(shutil.which(name)) for name in ('secret-tool', 'gio', 'qs')}
++        components['gio_python'] = importlib.util.find_spec('gi') is not None
++        print(json.dumps({'ok': all(components.values()), 'components': components}))
++        return 0 if all(components.values()) else 1
++    if args.action in ('fenetre', 'deposer'):
++        # IPC contains only a bounded file selection. No credentials or local file contents.
++        data = json.dumps(args.arguments if args.action == 'deposer' else [], ensure_ascii=False)
++        if len(data.encode()) > 16384:
++            raise Failure('invalid_source')
++        return subprocess.run(['qs', '-c', 'nc-ile', 'ipc', 'call', 'ile', 'cloud', data], check=False).returncode
++    try:
++        client = Client()
++        if args.action == 'worker':
++            client.worker(args.arguments[0])
++            return 0
++        if args.action == 'requete':
++            raw = sys.stdin.buffer.read(32769)
++            if len(raw) > 32768:
++                raise Failure('request_too_large')
++            body = json.loads(raw)
++        else:
++            body = {'op': args.action}
++        result = dispatch(client, body)
++        print(json.dumps(result, ensure_ascii=False))
++        return 0
++    except (Failure, OSError, ValueError, KeyError, IndexError) as exc:
++        result = {'ok': False, 'error': exc.code if isinstance(exc, Failure) else 'client_error',
++                  'message': str(exc) if isinstance(exc, Failure) else ('Configuration cloud invalide.' if not language() else 'Invalid cloud configuration.')}
++        print(json.dumps(result, ensure_ascii=False))
++        return 1
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/tests/test_cloud.py b/tests/test_cloud.py
+new file mode 100644
+index 0000000..b774a8b
+--- /dev/null
++++ b/tests/test_cloud.py
+@@ -0,0 +1,235 @@
++"""Client protocol tests with an isolated HTTP server and a simulated keyring."""
++from contextlib import contextmanager
++import hashlib
++import importlib.util
++import json
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++import os
++from pathlib import Path
++import tempfile
++import threading
++import time
++import unittest
++from unittest.mock import patch
++import uuid
++
++SOURCE = Path(__file__).resolve().parents[1] / 'home/.local/share/nc-cloud/client.py'
++SPEC = importlib.util.spec_from_file_location('nc_cloud_client_test', SOURCE)
++CLOUD = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(CLOUD)
++
++
++class Protocol(BaseHTTPRequestHandler):
++    def log_message(self, *args):
++        pass
++
++    def do_GET(self):
++        self.handle_request()
++
++    def do_POST(self):
++        self.handle_request()
++
++    def do_PUT(self):
++        self.handle_request()
++
++    def do_DELETE(self):
++        self.handle_request()
++
++    def handle_request(self):
++        state = self.server.state
++        state['calls'].append((self.command, self.path))
++        base = dict(api_version=1, server_id=state['server_id'], space_id='personal')
++        code, data = 200, {}
++        size = int(self.headers.get('Content-Length', '0'))
++        payload = self.rfile.read(size)
++        if self.path.endswith('/capabilities'):
++            data = dict(enabled=state['enabled'], state='ready')
++        elif self.path.endswith('/devices'):
++            data = dict(device_id='device', token='test-device-token')
++        elif self.headers.get('Authorization') != 'Bearer test-device-token':
++            code, data = 401, {'error': 'authentication_required'}
++        elif self.path.endswith('/status'):
++            data = dict(state='ready', max_file_bytes=1000, root={'id': 'root', 'revision': 'r1'})
++        elif self.path.endswith('/uploads'):
++            spec = json.loads(payload)
++            key = self.headers['Idempotency-Key']
++            ident = state['idempotency'].get(key)
++            if not ident:
++                ident = uuid.uuid4().hex
++                state['idempotency'][key] = ident
++                state['uploads'][ident] = dict(spec=spec, chunks={}, state='pending')
++            data = dict(upload_id=ident, chunk_bytes=4, state='pending')
++        elif '/uploads/' in self.path:
++            ident = self.path.split('/uploads/')[1].split('/')[0]
++            upload = state['uploads'][ident]
++            if '/chunks/' in self.path:
++                index = int(self.path.rsplit('/', 1)[1])
++                assert hashlib.sha256(payload).hexdigest() == self.headers.get('X-Content-SHA256')
++                upload['chunks'][index] = payload
++            elif self.path.endswith('/commit'):
++                if state['conflict']:
++                    code, data = 412, dict(error='version_conflict', current={'kind': 'file', 'revision': 'r2'})
++                else:
++                    complete = b''.join(upload['chunks'][i] for i in sorted(upload['chunks']))
++                    assert hashlib.sha256(complete).hexdigest() == upload['spec']['sha256']
++                    upload.update(state='committed', result={'name': upload['spec']['name']})
++                    data = dict(state='committed', result=upload['result'])
++            elif self.command == 'DELETE':
++                if upload['state'] != 'committed':
++                    upload['state'] = 'cancelled'
++                data = dict(state=upload['state'], result=upload.get('result'))
++            else:
++                data = dict(state=upload['state'], chunk_bytes=4, result=upload.get('result'),
++                            chunks=[{'idx': i, 'sha256': hashlib.sha256(v).hexdigest()} for i, v in upload['chunks'].items()])
++        encoded = json.dumps(base | data).encode()
++        self.send_response(code)
++        self.send_header('Content-Type', 'application/json')
++        self.send_header('Content-Length', str(len(encoded)))
++        self.end_headers()
++        self.wfile.write(encoded)
++
++
++class CloudClient(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Protocol)
++        self.server.state = dict(server_id='server-A', enabled=True, uploads={}, idempotency={}, calls=[], conflict=False)
++        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
++        self.thread.start()
++        self.addCleanup(self.shutdown)
++        self.client = CLOUD.Client({'URL': 'http://127.0.0.1:' + str(self.server.server_port), 'SECRET_KEY': 'admin'}, self.root / 'state')
++        self.client.keyring = lambda *args: 'test-device-token'
++        self.client.notify = lambda *args: None
++        self.client.associate()
++        self.file = self.root / 'été 2026.txt'
++        self.file.write_bytes(b'hello world')
++
++    def shutdown(self):
++        self.server.shutdown()
++        self.server.server_close()
++        self.thread.join(2)
++
++    def test_round_trip_keeps_source_and_hides_secrets(self):
++        manifest = self.client.prepare(self.file.as_uri(), 'root', 'r1')
++        self.client.worker(manifest['id'])
++        rows = self.client.transfers()
++        self.assertEqual(rows[0]['state'], 'committed')
++        self.assertEqual(self.file.read_bytes(), b'hello world')
++        self.assertNotIn('token', self.client.identity_file.read_text())
++        self.assertNotIn('source', rows[0])
++        self.assertNotIn('test-device-token', json.dumps(rows))
++        self.assertEqual(self.client.identity_file.stat().st_mode & 0o077, 0)
++
++    def test_disabled_refuses_before_preparation(self):
++        self.server.state['enabled'] = False
++        with patch.dict(os.environ, {'XDG_CONFIG_HOME': str(self.root / 'config')}):
++            with self.assertRaisesRegex(CLOUD.Failure, 'Cloud'):
++                self.client.prepare(str(self.file), 'root', 'r1')
++        self.assertFalse(self.client.transfers_dir.exists())
++        self.assertEqual(self.server.state['uploads'], {})
++
++    def test_offline_refuses_before_manifest_or_upload(self):
++        with patch.object(self.client.opener, 'open', side_effect=TimeoutError):
++            with self.assertRaises(CLOUD.Failure) as caught:
++                self.client.prepare(str(self.file), 'root', 'r1')
++        self.assertEqual(caught.exception.code, 'cloud_unavailable')
++        self.assertFalse(self.client.transfers_dir.exists())
++
++    def test_changed_source_is_not_resumed(self):
++        manifest = self.client.prepare(str(self.file), 'root', 'r1')
++        self.file.write_bytes(b'changed')
++        self.client.worker(manifest['id'])
++        self.assertEqual(self.client.transfers()[0]['error'], 'source_changed')
++        self.assertEqual(self.server.state['uploads'][manifest['upload_id']]['chunks'], {})
++
++    def test_lost_creation_response_preserves_idempotency_intent(self):
++        normal = self.client.request
++        def lose_response(path, *args, **kwargs):
++            result = normal(path, *args, **kwargs)
++            if path == '/api/cloud/v1/uploads':
++                raise CLOUD.Failure('cloud_unavailable')
++            return result
++        with patch.object(self.client, 'request', side_effect=lose_response):
++            with self.assertRaises(CLOUD.Failure):
++                self.client.prepare(str(self.file), 'root', 'r1')
++        manifest = CLOUD.private_read(next(self.client.transfers_dir.glob('*.json')))
++        self.assertNotIn('upload_id', manifest)
++        self.client.worker(manifest['id'])
++        self.assertEqual(len(self.server.state['uploads']), 1)
++        self.assertEqual(self.client.transfers()[0]['state'], 'committed')
++
++    def test_stopped_worker_requires_explicit_resume(self):
++        manifest = self.client.prepare(str(self.file), 'root', 'r1')
++        manifest.update(state='uploading', updated=time.time() - 20)
++        CLOUD.private_write(self.client.manifest_path(manifest['id']), manifest)
++        self.assertEqual(self.client.transfers()[0]['state'], 'interrupted')
++        self.assertEqual(self.server.state['uploads'][manifest['upload_id']]['chunks'], {})
++
++    def test_committed_receipt_survives_lost_local_result(self):
++        manifest = self.client.prepare(str(self.file), 'root', 'r1')
++        self.client.worker(manifest['id'])
++        manifest.update(state='interrupted')
++        self.client.save(manifest)
++        self.file.unlink()
++        before = len(self.server.state['calls'])
++        self.client.worker(manifest['id'])
++        self.assertEqual(self.client.transfers()[0]['state'], 'committed')
++        self.assertEqual(len(self.server.state['calls']) - before, 1)
++
++    def test_interruption_and_explicit_resume(self):
++        manifest = self.client.prepare(str(self.file), 'root', 'r1')
++        normal = self.client.request
++        def cut(path, *args, **kwargs):
++            if path.endswith('/chunks/1'):
++                raise CLOUD.Failure('cloud_unavailable')
++            return normal(path, *args, **kwargs)
++        with patch.object(self.client, 'request', side_effect=cut):
++            self.client.worker(manifest['id'])
++        self.assertEqual(self.client.transfers()[0]['state'], 'interrupted')
++        self.assertEqual(list(self.server.state['uploads'][manifest['upload_id']]['chunks']), [0])
++        self.client.worker(manifest['id'])
++        self.assertEqual(self.client.transfers()[0]['state'], 'committed')
++
++    def test_conflict_resolution_uses_displayed_revision(self):
++        self.server.state['conflict'] = True
++        manifest = self.client.prepare(str(self.file), 'root', 'r1')
++        self.client.worker(manifest['id'])
++        self.assertEqual(self.client.transfers()[0]['state'], 'conflict')
++        with patch.object(self.client, 'launch') as launch:
++            self.client.resolve(manifest['id'], 'replace')
++        launch.assert_called_once()
++        updated = CLOUD.private_read(self.client.manifest_path(manifest['id']))
++        self.assertEqual(updated['expected_revision'], 'r2')
++        self.assertEqual(updated['policy'], 'replace')
++
++    def test_server_identity_change_is_refused(self):
++        self.server.state['server_id'] = 'different-server'
++        with self.assertRaises(CLOUD.Failure) as caught:
++            self.client.status()
++        self.assertEqual(caught.exception.code, 'server_changed')
++
++    def test_symlink_and_remote_url_are_refused(self):
++        link = self.root / 'link'
++        link.symlink_to(self.file)
++        for path in (str(link), 'file://other-host/etc/passwd', str(self.root)):
++            with self.assertRaises(CLOUD.Failure):
++                self.client.prepare(path, 'root', 'r1')
++
++    def test_bookmark_preserves_other_entries_and_no_password_in_uri(self):
++        with patch.dict(os.environ, {'XDG_CONFIG_HOME': str(self.root / 'config')}):
++            path = self.root / 'config/gtk-3.0/bookmarks'
++            path.parent.mkdir(parents=True)
++            path.write_text('file:///tmp Other\n')
++            self.client.bookmark(True)
++            self.assertIn('file:///tmp Other', path.read_text())
++            self.assertIn(' Cloud JARVIS', path.read_text())
++            self.assertNotIn('test-device-token', path.read_text())
++            with patch.object(subprocess := CLOUD.subprocess, 'run'):
++                self.client.bookmark(False)
++            self.assertEqual(path.read_text(), 'file:///tmp Other\n')
++
++
++if __name__ == '__main__':
++    unittest.main()

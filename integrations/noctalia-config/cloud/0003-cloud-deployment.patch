@@ -1,0 +1,47 @@
+From 71944e747d14fc38c94ff72dfa1e4dbb6998e5d3 Mon Sep 17 00:00:00 2001
+From: RaphaelBlanc <raphael.blanc-alcaix@epita.fr>
+Date: Fri, 20 Nov 2026 12:36:18 +0100
+Subject: [PATCH 3/3] =?UTF-8?q?Cloud=20JARVIS=20:=20accepter=20le=20serveu?=
+ =?UTF-8?q?r=20v1=20et=20d=C3=A9sactiver=20le=20cloud=20en=20local?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ home/.local/share/nc-jarvis/deployer.py | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/home/.local/share/nc-jarvis/deployer.py b/home/.local/share/nc-jarvis/deployer.py
+index 90f7ffe..1e38ae8 100644
+--- a/home/.local/share/nc-jarvis/deployer.py
++++ b/home/.local/share/nc-jarvis/deployer.py
+@@ -52,13 +52,16 @@ REPO='https://github.com/RaphaelBlanc/JARVIS-BIS.git'
+ # (agy_catalogue.py, nc_engines.py d'amont) n'est jamais chargé ici : l'overlay garde le sien (nc_runner.py le vérifie),
+ # et main.py n'appelle que des méthodes que notre nc_engines a déjà. La relecture forcée au démarrage ne s'applique donc pas.
+ REVISION='e1448c824b49e2e291be7c8a8cd2acbacf3f3006'
++# Cloud v1: opt-in server storage. The gateway overlay keeps these upstream routes;
++# initial deployment stays pinned above, a manually updated checkout may use this SHA.
++CLOUD_REVISION='d605b224ee992f6c7fe89eec3b8b49a7f679164e'
+ VALIDATED_REVISIONS=('8867dd093c43a5e5d3f0a13d3e14600e57edc96a','9c12e00ffc6f11732013b575f0652e920331756a',
+                      '9cd91bbb6235116e3cadd433eb68fcd9b17203bf','3d1c6b6df5d6bc1352a4b66fcdde74fd56d59175',
+                      '64523e57c958f23af459c8069d1a6985bf349640','aae5b9b3e6da13cfb78c2da33b5584c854f5139a',
+                      'f522291ca02af08903cbebd32203e14013dc80a6','4ecc57a8351fee610185b699b12c4b15092fe5ff',
+                      '94a3a930efae59dbfd7758be5af6f883ab34b9df','ffb19b94f9c98ed98723500efbaa5c2c7f832821',
+                      '17525afe78e11d4c509daac8bcf4cbb00673cd4a','9617d4b6827b6e4b0467430455ccb5b2189e7af8',
+-                     '6041caf630606d3b1b2deb3f3447f839e1637206',REVISION)
++                     '6041caf630606d3b1b2deb3f3447f839e1637206',CLOUD_REVISION,REVISION)
+ 
+ 
+ def ask(message, default=False):
+@@ -154,6 +157,11 @@ def configure(backend, mode):
+     for config in reversed(configs):current.update(config)
+     changes={'SECRET_KEY':next(iter(keys),secrets.token_hex(32)), 'DEPLOY_MODE':mode,
+              'HOME_SERVER_URL':current.get('HOME_SERVER_URL','http://127.0.0.1:8080')}
++    if mode == 'local':
++        changes['CLOUD_ENABLED'] = '0'
++    else:
++        print('Cloud distant optionnel : après déploiement et validation de la révision, utilise sur le serveur '
++              '« ./deploy.sh cloud configure » puis « ./deploy.sh cloud up ». Aucun conteneur lancé ici.')
+     print('\nÉtape 2 sur 4 : les réglages.\n'
+           'D’abord le moteur : c’est l’IA qui répondra à tes messages (agy, codex, claude ou opencode).\n'
+           'Tu peux appuyer sur Entrée pour garder le choix proposé entre crochets ; tu pourras le changer plus tard.')

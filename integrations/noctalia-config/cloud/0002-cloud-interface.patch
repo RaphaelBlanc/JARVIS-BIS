@@ -1,0 +1,520 @@
+From 1a73c36b60d5612b0ba4a17f4d20f46afb670d45 Mon Sep 17 00:00:00 2001
+From: RaphaelBlanc <raphael.blanc-alcaix@epita.fr>
+Date: Fri, 20 Nov 2026 12:36:18 +0100
+Subject: [PATCH 2/3] =?UTF-8?q?Cloud=20JARVIS=20:=20fen=C3=AAtre=20de=20de?=
+ =?UTF-8?q?stination=20et=20d=C3=A9p=C3=B4t=20dans=20la=20barre?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ docs/cloud-jarvis.md                          |  44 ++++++
+ home/.config/quickshell/nc-ile/Cloud.qml      | 105 +++++++++++++
+ home/.config/quickshell/nc-ile/CloudDepot.qml |  38 +++++
+ home/.config/quickshell/nc-ile/CloudEtat.qml  | 145 ++++++++++++++++++
+ home/.config/quickshell/nc-ile/shell.qml      |  23 +++
+ home/.local/bin/nc-reglages                   |  12 ++
+ tests/test_cloud_qml.py                       |  63 ++++++++
+ 7 files changed, 430 insertions(+)
+ create mode 100644 docs/cloud-jarvis.md
+ create mode 100644 home/.config/quickshell/nc-ile/Cloud.qml
+ create mode 100644 home/.config/quickshell/nc-ile/CloudDepot.qml
+ create mode 100644 home/.config/quickshell/nc-ile/CloudEtat.qml
+ create mode 100644 tests/test_cloud_qml.py
+
+diff --git a/docs/cloud-jarvis.md b/docs/cloud-jarvis.md
+new file mode 100644
+index 0000000..7f72f05
+--- /dev/null
++++ b/docs/cloud-jarvis.md
+@@ -0,0 +1,44 @@
++# Cloud JARVIS distant
++
++Le cloud est une option du serveur distant JARVIS BIS. Il reste désactivé lorsque JARVIS tourne en mode local sur ce PC. Le serveur doit fournir le contrat cloud v1 ; un ancien serveur reste utilisable pour le chat.
++
++## Activer
++
++Dans les réglages « Agents IA (coucou) », ouvrir « Cloud JARVIS distant », associer le PC puis activer « Cloud JARVIS dans la barre ». Le jeton de cet appareil est enregistré dans le trousseau de session, séparément de la clé générale JARVIS.
++
++Commandes :
++
++```bash
++nc-cloud associer
++nc-reglages set CLOUD_JARVIS oui
++nc-cloud fenetre
++nc-cloud ouvrir
++```
++
++Le client Python de transferts utilise la bibliothèque standard. L’association nécessite `secret-tool` et un trousseau Secret Service déverrouillé. L’accès dans Fichiers nécessite Gio Python et le backend WebDAV de GVfs. Aucun moteur de conteneurs n’est nécessaire sur le poste client.
++
++## Utiliser
++
++Déposer jusqu’à 8 fichiers locaux sur l’icône cloud de la barre. Dans la fenêtre, parcourir les dossiers, éventuellement créer un dossier, puis cliquer « Envoyer ici ». Les sources sont copiées et restent sur le PC. La progression et le résultat sont affichés par fichier ; fermer la fenêtre ne stoppe pas le processus d’envoi.
++
++Le bouton « Ouvrir dans Fichiers » monte le drive à la demande et ajoute le favori « Cloud JARVIS » au gestionnaire GTK. `Super + E` continue d’ouvrir le gestionnaire choisi. Le drive natif est **en lecture seule** dans cette version ; les écritures passent par la fenêtre pour préserver la gestion des conflits. Nautilus dispose aussi de « Scripts → Envoyer vers Cloud JARVIS ». Pour un autre gestionnaire, `nc-cloud deposer FICHIER…` ouvre le même choix de destination.
++
++`CLOUD_BARRE_DECALAGE` règle le décalage de l’icône par rapport au centre de la barre supérieure. La surface est créée uniquement si le cloud est activé et configuré. Le déplacement dans la barre officielle pourra être adapté par son mainteneur.
++
++## Hors ligne et conflits
++
++Hors ligne, le dépôt est refusé avec un message. Aucun fichier n’est mis dans une file d’envoi différé. Un transfert commencé puis interrompu reste dans l’historique privé ; « Reprendre / vérifier » consulte son état sur le serveur avant de renvoyer quoi que ce soit.
++
++Si la source a changé, déposer de nouveau le fichier. Si la destination existe ou si un autre PC l’a modifiée, choisir « Conserver les deux », « Remplacer » ou « Annuler ». Le remplacement vérifie la révision distante ; une seconde modification peut donc provoquer un nouveau conflit. La résolution renvoie actuellement les morceaux depuis la source locale.
++
++Un changement de serveur ou d’appareil interdit la réutilisation d’un ancien transfert. Le favori et le montage de l’ancienne connexion sont retirés lors de la prochaine vérification cloud. Aucune suppression ou modification de fichiers du serveur n’est déclenchée par une désactivation de l’icône.
++
++Les manifestes sont privés, sous `$XDG_STATE_HOME/nc-cloud/` (ou `~/.local/state/nc-cloud/`), séparés par adresse de serveur. Ils contiennent les chemins des sources nécessaires à une reprise, sans leur contenu ni leurs jetons. Les 100 transferts les plus récents sont affichés ; l’archivage/purge de cet historique local reste manuel dans cette version.
++
++## Vérifier
++
++```bash
++python3 -B -m unittest tests.test_cloud -v
++```
++
++Le test utilise un serveur HTTP simulé et un faux trousseau. La compilation QML, le montage GVfs et les gestes de dépôt sur Hyprland nécessitent aussi une validation en session graphique. Le serveur et ses instructions d’installation sont livrés dans le dépôt JARVIS BIS, avec le SHA exact indiqué dans la fiche d’intégration.
+diff --git a/home/.config/quickshell/nc-ile/Cloud.qml b/home/.config/quickshell/nc-ile/Cloud.qml
+new file mode 100644
+index 0000000..23b6142
+--- /dev/null
++++ b/home/.config/quickshell/nc-ile/Cloud.qml
+@@ -0,0 +1,105 @@
++import QtQuick
++import QtQuick.Controls
++import Quickshell
++
++FloatingWindow {
++    id: fen
++    signal fermer()
++    title: "Cloud JARVIS"
++    implicitWidth: 680; implicitHeight: 720
++    minimumSize: Qt.size(480, 440)
++    color: Couleurs.fond
++    onClosed: fermer()
++    Shortcut { sequence: "Escape"; onActivated: fen.fermer() }
++    Component.onCompleted: { CloudEtat.panneauOuvert = true; CloudEtat.relire(); CloudEtat.demander({ op: "transferts" }) }
++    Component.onDestruction: CloudEtat.panneauOuvert = false
++    Flickable {
++        anchors.fill: parent; anchors.margins: 24
++        contentWidth: width; contentHeight: contenu.height
++        clip: true
++        Column {
++            id: contenu
++            width: parent.width; spacing: 14
++            Texte { text: "Cloud JARVIS"; font.pixelSize: 24; font.bold: true }
++            Texte {
++                width: parent.width; wrapMode: Text.Wrap
++                text: Reglages.t("Stockage distant • accès fichiers en lecture seule • envois depuis cette fenêtre", "Remote storage • read-only Files access • uploads from this window")
++            }
++            Flow {
++                width: parent.width
++                spacing: 8
++                JarvisBouton { texte: Reglages.t("Actualiser", "Refresh"); enabled: !CloudEtat.occupe; onClic: { CloudEtat.relire(); if (CloudEtat.enLigne) CloudEtat.lister(CloudEtat.dossier.id) } }
++                JarvisBouton { texte: Reglages.t("Associer ce PC", "Associate this PC"); enabled: !CloudEtat.occupe; onClic: CloudEtat.demander({ op: "associer" }) }
++                JarvisBouton { texte: Reglages.t("Ouvrir dans Fichiers", "Open in Files"); enabled: CloudEtat.enLigne && !CloudEtat.occupe; onClic: CloudEtat.demander({ op: "ouvrir" }) }
++            }
++            Texte { width: parent.width; wrapMode: Text.Wrap; visible: text !== ""; text: CloudEtat.message; color: Couleurs.accent }
++            JarvisBouton { visible: !CloudEtat.active; texte: Reglages.t("Afficher le cloud dans la barre", "Show cloud in the bar"); onClic: CloudEtat.afficherDansBarre() }
++            Texte { visible: CloudEtat.occupe; text: Reglages.t("Vérification / préparation…", "Checking / preparing…") }
++            Row {
++                spacing: 8
++                JarvisBouton { texte: "↑"; enabled: CloudEtat.chemin.length > 0 && !CloudEtat.occupe; onClic: CloudEtat.remonter() }
++                Texte { text: "/" + CloudEtat.chemin.map(p => p.name || "").filter(p => p).concat([CloudEtat.dossier.name || ""]).filter(p => p).join("/"); width: Math.max(0, contenu.width - 58); elide: Text.ElideMiddle }
++            }
++            Repeater {
++                model: CloudEtat.dossiers
++                delegate: Rectangle {
++                    required property var modelData
++                    width: contenu.width; height: 36; radius: 8; color: Couleurs.gris2
++                    Texte { anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 24; elide: Text.ElideMiddle; text: (modelData.kind === "directory" ? "▸  " : "    ") + modelData.name }
++                    MouseArea { anchors.fill: parent; enabled: modelData.kind === "directory" && !CloudEtat.occupe; onClicked: CloudEtat.entrer(modelData) }
++                }
++            }
++            JarvisBouton { visible: CloudEtat.suite !== ""; texte: Reglages.t("Afficher la suite", "Load more"); onClic: CloudEtat.lister(CloudEtat.dossier.id, CloudEtat.suite) }
++            Row {
++                spacing: 8
++                TextField { id: nouveau; width: 260; placeholderText: Reglages.t("Nom du nouveau dossier", "New folder name") }
++                JarvisBouton {
++                    texte: Reglages.t("Créer", "Create"); enabled: CloudEtat.enLigne && !CloudEtat.occupe && nouveau.text.trim() !== ""
++                    onClic: { CloudEtat.demander({ op: "dossier", parent_id: CloudEtat.dossier.id, parent_revision: CloudEtat.dossier.revision, name: nouveau.text }); nouveau.text = "" }
++                }
++            }
++            Rectangle {
++                width: parent.width; height: 92; radius: 12
++                color: depot.containsDrag ? Couleurs.accent : Couleurs.gris2
++                Texte {
++                    anchors.fill: parent; anchors.margins: 12; wrapMode: Text.Wrap; verticalAlignment: Text.AlignVCenter
++                    text: CloudEtat.fichiers.length ? CloudEtat.fichiers.length + Reglages.t(" fichier(s) prêt(s). Choisis un dossier puis « Envoyer ici ».", " file(s) ready. Choose a folder, then “Upload here”.")
++                                                   : Reglages.t("Dépose ici jusqu’à 8 fichiers locaux. Ils seront copiés après ton choix de destination.", "Drop up to 8 local files here. They will be copied after you choose the destination.")
++                }
++                DropArea {
++                    id: depot; anchors.fill: parent
++                    onEntered: drag => { if (!drag.hasUrls) drag.accepted = false }
++                    onDropped: drop => {
++                        if (!drop.hasUrls) return
++                        var urls = []; for (let i = 0; i < drop.urls.length; ++i) urls.push(String(drop.urls[i]))
++                        CloudEtat.deposer(urls); drop.accept(Qt.CopyAction)
++                    }
++                }
++            }
++            JarvisBouton { texte: Reglages.t("Envoyer ici", "Upload here"); primaire: true; enabled: CloudEtat.enLigne && CloudEtat.fichiers.length > 0 && !CloudEtat.occupe; onClic: CloudEtat.envoyer() }
++            Texte { text: Reglages.t("Transferts", "Transfers"); font.pixelSize: 18 }
++            JarvisBouton { texte: Reglages.t("Actualiser les transferts", "Refresh transfers"); onClic: CloudEtat.demander({ op: "transferts" }) }
++            Repeater {
++                model: CloudEtat.transferts
++                delegate: Column {
++                    required property var modelData
++                    width: contenu.width; spacing: 5
++                    Texte { width: parent.width; elide: Text.ElideMiddle; text: modelData.name + " — " + CloudEtat.etatTexte(modelData.state) + " (" + (modelData.state === "committed" ? 100 : Math.round(100 * (modelData.sent || 0) / Math.max(1, modelData.size || 0))) + " %)" }
++                    Texte { width: parent.width; wrapMode: Text.Wrap; visible: text !== ""; text: modelData.message || "" }
++                    Texte {
++                        width: parent.width; wrapMode: Text.Wrap
++                        visible: modelData.state === "conflict" && modelData.current !== null
++                        text: modelData.current ? Reglages.t("Version distante : ", "Remote version: ") + new Date(modelData.current.modified * 1000).toLocaleString(Qt.locale()) + " · " + modelData.current.size + Reglages.t(" octets", " bytes") : ""
++                    }
++                    Row {
++                        spacing: 8
++                        JarvisBouton { visible: modelData.state === "interrupted"; texte: Reglages.t("Reprendre / vérifier", "Resume / verify"); enabled: CloudEtat.enLigne; onClic: CloudEtat.demander({ op: "reprise", id: modelData.id }) }
++                        JarvisBouton { visible: modelData.state === "conflict"; texte: Reglages.t("Conserver les deux", "Keep both"); enabled: CloudEtat.enLigne; onClic: CloudEtat.demander({ op: "resoudre", id: modelData.id, policy: "keep_both" }) }
++                        JarvisBouton { visible: modelData.state === "conflict" && modelData.current && modelData.current.kind === "file"; texte: Reglages.t("Remplacer", "Replace"); enabled: CloudEtat.enLigne; onClic: CloudEtat.demander({ op: "resoudre", id: modelData.id, policy: "replace" }) }
++                        JarvisBouton { visible: ["committed", "cancelled", "expired"].indexOf(modelData.state) < 0; texte: Reglages.t("Annuler", "Cancel"); enabled: CloudEtat.enLigne; onClic: CloudEtat.demander({ op: "annuler", id: modelData.id }) }
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/home/.config/quickshell/nc-ile/CloudDepot.qml b/home/.config/quickshell/nc-ile/CloudDepot.qml
+new file mode 100644
+index 0000000..c004a26
+--- /dev/null
++++ b/home/.config/quickshell/nc-ile/CloudDepot.qml
+@@ -0,0 +1,38 @@
++// Dedicated Wayland surface: hidden means no surface and no input region.
++import QtQuick
++import Quickshell
++import Quickshell.Wayland
++
++PanelWindow {
++    id: depot
++    required property var modelData
++    screen: modelData
++    anchors.top: true
++    anchors.left: true
++    margins.left: Math.max(0, Math.round((modelData.width - 36) / 2 + Number(Reglages.val("CLOUD_BARRE_DECALAGE", "100"))))
++    implicitWidth: 36; implicitHeight: Gabarit.barre
++    exclusionMode: ExclusionMode.Ignore
++    color: "transparent"
++    WlrLayershell.layer: WlrLayer.Overlay
++    WlrLayershell.namespace: "nc-cloud"
++    Rectangle {
++        anchors.centerIn: parent
++        width: 32; height: 28; radius: 14
++        color: zone.containsDrag ? Couleurs.accent : Couleurs.gris2
++        opacity: CloudEtat.enLigne ? 1 : 0.5
++        Ico { anchors.centerIn: parent; nom: "cloud"; taille: 20; color: Couleurs.texte }
++        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { CloudEtat.relire(); CloudEtat.ouvrirPanneau() } }
++    }
++    DropArea {
++        id: zone
++        anchors.fill: parent
++        onEntered: drag => { if (!drag.hasUrls) drag.accepted = false }
++        onDropped: drop => {
++            if (!drop.hasUrls) return
++            var urls = []
++            for (let i = 0; i < drop.urls.length; ++i) urls.push(String(drop.urls[i]))
++            CloudEtat.deposer(urls)
++            drop.accept(Qt.CopyAction)
++        }
++    }
++}
+diff --git a/home/.config/quickshell/nc-ile/CloudEtat.qml b/home/.config/quickshell/nc-ile/CloudEtat.qml
+new file mode 100644
+index 0000000..45cfd8e
+--- /dev/null
++++ b/home/.config/quickshell/nc-ile/CloudEtat.qml
+@@ -0,0 +1,145 @@
++pragma Singleton
++import QtQuick
++import Quickshell
++import Quickshell.Io
++
++Singleton {
++    id: cloud
++    signal ouvrirPanneau()
++    readonly property string bin: Quickshell.env("HOME") + "/.local/bin/nc-cloud"
++    readonly property bool active: Reglages.val("CLOUD_JARVIS", "non") === "oui"
++    property bool visible: false
++    property bool enLigne: false
++    property bool attenteReponse: false
++    readonly property bool occupe: attenteReponse || commande.running
++    property bool panneauOuvert: false
++    property string message: ""
++    property var statut: ({})
++    property var dossier: ({ id: "root", revision: "", name: "Cloud JARVIS" })
++    property var dossiers: []
++    property var chemin: []
++    property var fichiers: []
++    property var transferts: []
++    property string suite: ""
++    property var attente: []
++    property var courant: ({})
++
++    function demander(body) {
++        attente = attente.concat([body])
++        executer()
++    }
++    function executer() {
++        if (attenteReponse || commande.running || attente.length === 0) return
++        courant = attente[0]; attente = attente.slice(1)
++        attenteReponse = true
++        commande.stdinEnabled = true
++        commande.running = true
++    }
++    function relire() { demander({ op: "etat" }) }
++    function etatTexte(state) {
++        var noms = { preparing: ["Préparation", "Preparing"], ready: ["Prêt", "Ready"], uploading: ["Envoi", "Uploading"],
++                     verifying: ["Vérification", "Verifying"], committed: ["Enregistré", "Saved"], interrupted: ["Interrompu", "Interrupted"],
++                     conflict: ["Conflit", "Conflict"], cancelled: ["Annulé", "Cancelled"], expired: ["Expiré", "Expired"] }
++        var nom = noms[state] || [state, state]
++        return Reglages.t(nom[0], nom[1])
++    }
++    function afficherDansBarre() { reglage.running = true }
++    function lister(id, cursor) { demander({ op: "lister", parent_id: id || "root", cursor: cursor || "" }) }
++    function entrer(entry) {
++        chemin = chemin.concat([dossier]); lister(entry.id)
++    }
++    function remonter() {
++        if (chemin.length === 0) return
++        var parent = chemin[chemin.length - 1]
++        chemin = chemin.slice(0, -1); lister(parent.id)
++    }
++    function deposer(urls) {
++        message = ""
++        if (!enLigne) {
++            message = Reglages.t("Cloud hors ligne. Aucun fichier envoyé. Réessaie après reconnexion.", "Cloud offline. No file uploaded. Try again after reconnecting.")
++        } else if (urls.length > 8) {
++            message = Reglages.t("Dépose au plus 8 fichiers à la fois.", "Drop at most 8 files at once.")
++        } else {
++            fichiers = urls
++        }
++        ouvrirPanneau()
++    }
++    function envoyer() {
++        if (!enLigne || !fichiers.length) return
++        demander({ op: "envoyer", files: fichiers, parent_id: dossier.id, parent_revision: dossier.revision })
++        fichiers = []
++    }
++    function reponse(result) {
++        if (courant.op === "etat" || courant.op === "associer") {
++            if (result.server_id && statut.server_id !== result.server_id) {
++                chemin = []; dossiers = []; fichiers = []
++                dossier = { id: "root", revision: "", name: "Cloud JARVIS" }
++            }
++            statut = result
++            enLigne = result.state === "ready"
++            visible = active && result.enabled !== false && (result.configured === true || enLigne)
++            if (enLigne) {
++                message = ""
++                if (!dossier.revision) lister("root")
++            } else {
++                fichiers = []; dossiers = []; chemin = []
++                dossier = { id: "root", revision: "", name: "Cloud JARVIS" }
++                message = result.message || Reglages.t("Cloud indisponible", "Cloud unavailable")
++            }
++        } else if (courant.op === "lister" && result.entries) {
++            dossier = result.parent
++            dossiers = courant.cursor ? dossiers.concat(result.entries) : result.entries
++            suite = result.next_cursor || ""
++        } else if (courant.op === "transferts") {
++            transferts = result.transfers || []
++        } else if (courant.op === "dossier") {
++            if (result.entry) lister(dossier.id)
++        } else if (courant.op === "envoyer") {
++            var errors = (result.results || []).filter(r => !r.ok)
++            message = errors.map(r => r.message).join("\n")
++            demander({ op: "transferts" })
++        }
++        if (result.ok === false || result.error) {
++            message = result.message || result.error || Reglages.t("Erreur cloud", "Cloud error")
++            if (["cloud_unavailable", "cloud_disabled", "device_revoked", "server_changed"].indexOf(result.error) >= 0) enLigne = false
++        }
++    }
++    Process {
++        id: commande
++        command: [cloud.bin, "requete"]
++        stdinEnabled: true
++        onStarted: { write(JSON.stringify(cloud.courant)); stdinEnabled = false }
++        stdout: StdioCollector {
++            onStreamFinished: {
++                try { cloud.reponse(JSON.parse(text)) }
++                catch (e) { cloud.message = Reglages.t("Réponse cloud illisible", "Invalid cloud response") }
++            }
++        }
++        onExited: Qt.callLater(() => { cloud.attenteReponse = false; cloud.executer() })
++    }
++    Process {
++        id: reglage
++        command: [Quickshell.env("HOME") + "/.local/bin/nc-reglages", "set", "CLOUD_JARVIS", "oui"]
++    }
++    Process {
++        command: ["nmcli", "monitor"]
++        running: cloud.active && cloud.visible && Etat.ecranVu
++        stdout: SplitParser { onRead: reseau.restart() }
++    }
++    Timer { id: reseau; interval: 600; onTriggered: cloud.relire() }
++    // No network loop: configured users refresh on wake, connection changes, or an explicit action.
++    FileView {
++        path: Quickshell.env("HOME") + "/.config/nc/assistant.conf"
++        watchChanges: cloud.active
++        onFileChanged: { reload(); if (cloud.active) cloud.relire() }
++    }
++    Connections { target: Etat; function onEcranVuChanged() { if (cloud.active && Etat.ecranVu) cloud.relire() } }
++    onActiveChanged: { if (active) relire(); else { visible = false; enLigne = false; fichiers = [] } }
++    Component.onCompleted: if (active) relire()
++    Timer {
++        interval: 1000; repeat: true
++        running: cloud.panneauOuvert && Etat.ecranVu && !cloud.occupe
++                 && cloud.transferts.some(t => ["ready", "preparing", "uploading", "verifying"].indexOf(t.state) >= 0)
++        onTriggered: cloud.demander({ op: "transferts" })
++    }
++}
+diff --git a/home/.config/quickshell/nc-ile/shell.qml b/home/.config/quickshell/nc-ile/shell.qml
+index 4f928f3..becd1eb 100644
+--- a/home/.config/quickshell/nc-ile/shell.qml
++++ b/home/.config/quickshell/nc-ile/shell.qml
+@@ -155,6 +155,22 @@ ShellRoot {
+     }
+     // Panneau VPN (Super + Alt + V, nc-vpn) : les tunnels VPN et WireGuard de NetworkManager ; créé à l'ouverture seulement
+     property bool vpnOuvert: false
++    property bool cloudOuvert: false
++    LazyLoader {
++        active: racine.cloudOuvert
++        Cloud {
++            screen: Quickshell.screens.find(s => Hyprland.focusedMonitor && s.name === Hyprland.focusedMonitor.name) || Quickshell.screens[0]
++            onFermer: racine.cloudOuvert = false
++        }
++    }
++    Connections {
++        target: CloudEtat
++        function onOuvrirPanneau() { racine.cloudOuvert = true }
++    }
++    Variants {
++        model: CloudEtat.visible ? Quickshell.screens : []
++        CloudDepot {}
++    }
+     LazyLoader {
+         id: chargeurVpn
+         active: racine.vpnOuvert
+@@ -222,6 +238,13 @@ ShellRoot {
+             if (!racine.vpnOuvert) Hyprland.refreshMonitors()
+             racine.vpnOuvert = !racine.vpnOuvert
+         }
++        function cloud(selection: string): void {
++            racine.cloudOuvert = true
++            if (selection && selection !== "[]") {
++                try { CloudEtat.deposer(JSON.parse(selection)) }
++                catch (e) { CloudEtat.message = "Sélection cloud invalide" }
++            }
++        }
+         // Panneau Santé Garmin (Super + Alt + S) : ouvre ; déjà ouvert, le referme
+         function garmin(): void {
+             Etat.fermer()
+diff --git a/home/.local/bin/nc-reglages b/home/.local/bin/nc-reglages
+index ae557d0..cc036a4 100755
+--- a/home/.local/bin/nc-reglages
++++ b/home/.local/bin/nc-reglages
+@@ -519,6 +519,12 @@ REGLAGES = [
+         "pendant 3 s ; la page Son l'affiche à côté du casque. Rien si le casque ne donne pas son niveau.",
+         "When headphones or earbuds that report their battery connect (AirPods…), the pill shows the name and level for 3 s; "
+         "the Sound page shows it next to the device. Nothing if the device does not report its level.")),
++    R("CLOUD_JARVIS", "Agents IA (coucou)", L("Cloud JARVIS dans la barre", "JARVIS Cloud in the bar"), "ouinon", "non",
++      L("Serveur distant uniquement. Associe ce PC dans la fenêtre Cloud JARVIS. Les dépôts hors ligne sont refusés.",
++        "Remote server only. Associate this PC in the Cloud JARVIS window. Offline drops are refused.")),
++    R("CLOUD_BARRE_DECALAGE", "Agents IA (coucou)", L("Position du cloud depuis le centre", "Cloud offset from centre"), "entier", "100",
++      L("Décalage horizontal en pixels logiques de l’icône cloud, pour éviter les autres éléments de la barre.",
++        "Horizontal cloud icon offset in logical pixels, to avoid other bar items."), mini=-1200, maxi=1200, pas=10),
+     R("ILE_PRESSE_ACTIONS", "Île", L("Actions rapides du presse-papiers", "Clipboard quick actions"), "ouinon", "oui",
+       L("Un texte copié qui est une couleur (pastille et conversions), un lien (Ouvrir), un chemin (Ouvrir le dossier) ou un "
+         "calcul (résultat avec qalc, sans réseau) reçoit sa ligne d'action dans la page Presse-papiers. Rien n'est lancé sans ton clic, "
+@@ -4092,6 +4098,12 @@ def catalogue(vals):
+                     choix=[], mini=0, maxi=0, pas=1, unite="", zero="", valeur="", affiche=T("Configurer…", "Configure…"),
+                     modifie=False, groupe="", commande=["nc-assistant", "configurer"])]
+     sec_ia = "Intelligence artificielle"
++    actions.append(dict(cle="action:jarvis-cloud", section="Agents IA (coucou)", sectionNom=nom_section("Agents IA (coucou)"),
++                        nom=T("Cloud JARVIS distant", "Remote JARVIS Cloud"), genre="action", defaut="",
++                        aide=T("Association du PC, dossiers distants, dépôt de fichiers et transferts.",
++                               "Associate this PC, browse remote folders, drop files and manage transfers."),
++                        choix=[], mini=0, maxi=0, pas=1, unite="", zero="", valeur="", affiche=T("Ouvrir…", "Open…"),
++                        modifie=False, groupe="", commande=["nc-cloud", "fenetre"]))
+     for cle_a, nom_a, aide_a, cmd in reversed((
+             ("action:ia-cles", T("Clés d'API des IA", "AI API keys"),
+              T("Anthropic, OpenAI, Gemini, Mistral, Groq, DeepSeek, OpenRouter et l'adresse d'Ollama : saisie masquée, "
+diff --git a/tests/test_cloud_qml.py b/tests/test_cloud_qml.py
+new file mode 100644
+index 0000000..39d6c94
+--- /dev/null
++++ b/tests/test_cloud_qml.py
+@@ -0,0 +1,63 @@
++"""Opt-in Wayland smoke: actual cloud QML and serialized JSON process requests.
++
++NC_CLOUD_QML=1 python3 -B -m unittest tests.test_cloud_qml -v
++Uses an isolated HOME and a fake client; briefly opens a separate test window.
++"""
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++SOURCE = Path(__file__).resolve().parents[1] / 'home/.config/quickshell/nc-ile'
++
++
++@unittest.skipUnless(os.environ.get('NC_CLOUD_QML') == '1' and os.environ.get('WAYLAND_DISPLAY') and shutil.which('qs'),
++                     'Opt-in Wayland session and Quickshell required')
++class CloudQml(unittest.TestCase):
++    def test_window_depot_and_process_queue(self):
++        display = os.environ['WAYLAND_DISPLAY']
++        socket = Path(os.environ.get('NC_CLOUD_WAYLAND_SOCKET') or
++                      (display if display.startswith('/') else f'/run/user/{os.getuid()}/{display}'))
++        if not socket.exists():
++            self.skipTest('Wayland socket unavailable; set NC_CLOUD_WAYLAND_SOCKET')
++        with tempfile.TemporaryDirectory(prefix='nc-cloud-qml-') as temporary:
++            root = Path(temporary)
++            for name in ('Cloud.qml', 'CloudDepot.qml', 'CloudEtat.qml', 'JarvisBouton.qml', 'Texte.qml', 'Ico.qml', 'Gabarit.qml'):
++                shutil.copyfile(SOURCE / name, root / name)
++            (root / 'Couleurs.qml').write_text('pragma Singleton\nimport QtQuick\nQtObject {'
++                'readonly property color fond: "#171a24"; readonly property color gris2: "#292e40";'
++                'readonly property color gris3: "#3c435c"; readonly property color texte: "#f0f1f5";'
++                'readonly property color texteSec: "#a9b0c2"; readonly property color accent: "#73d4e8";'
++                'readonly property color accentClair: "#9defff"; readonly property color surAccent: "#12151d" }')
++            (root / 'Reglages.qml').write_text('pragma Singleton\nimport QtQuick\nQtObject { function val(k,d) { return d } function t(a,b) { return a } }')
++            (root / 'Etat.qml').write_text('pragma Singleton\nimport QtQuick\nQtObject { property bool ecranVu: true }')
++            (root / 'shell.qml').write_text('import QtQuick\nimport Quickshell\nShellRoot { Cloud { } '
++                'CloudDepot { modelData: Quickshell.screens[0] } '
++                'Timer { interval: 1500; running: true; onTriggered: Qt.quit() } }')
++            fake = root / 'fake-home'
++            command = fake / '.local/bin/nc-cloud'
++            command.parent.mkdir(parents=True)
++            command.write_text('''#!/usr/bin/env python3
++import json,sys
++from pathlib import Path
++body=json.load(sys.stdin)
++with Path(__file__).with_name("calls").open("a") as f: f.write(body["op"]+"\\n")
++responses={"etat":{"api_version":1,"server_id":"test","space_id":"personal","enabled":True,"configured":True,"state":"ready"},"transferts":{"transfers":[]},"lister":{"parent":{"id":"root","revision":"r1","name":"Cloud JARVIS"},"entries":[],"next_cursor":None}}
++print(json.dumps(responses.get(body["op"],{"ok":True})))
++''')
++            command.chmod(0o755)
++            config = fake / '.config/nc'
++            config.mkdir(parents=True)
++            (config / 'assistant.conf').touch()
++            result = subprocess.run(['qs', '-p', str(root), '--no-color'], text=True, capture_output=True, timeout=10,
++                                    env=dict(os.environ, HOME=str(fake), QT_QPA_PLATFORM='wayland',
++                                             XDG_RUNTIME_DIR=str(socket.parent), WAYLAND_DISPLAY=socket.name))
++            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++            self.assertNotIn('ERROR:', result.stdout + result.stderr)
++            self.assertEqual(command.with_name('calls').read_text().splitlines(), ['etat', 'transferts', 'lister'])
++
++
++if __name__ == '__main__':
++    unittest.main()
