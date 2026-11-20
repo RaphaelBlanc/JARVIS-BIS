@@ -34,9 +34,13 @@ def configure(root, rotate_key=False, confirm_history_prune=False):
     storage_changes = {'CLOUD_INTERNAL_KEY': key}
     if confirm_history_prune:
         limit = os.environ.get('CLOUD_MAX_VERSIONS', storage.values.get('CLOUD_MAX_VERSIONS', '10'))
-        if not 0 <= int(limit) <= 10:
-            raise ValueError('History limit must be between 0 and 10')
-        storage_changes['CLOUD_CONFIRMED_HISTORY_LIMIT'] = str(int(limit))
+        try:
+            limit = int(limit)
+        except ValueError:
+            raise ValueError('CLOUD_MAX_VERSIONS must be an integer between 0 and 10; history pruning was not confirmed') from None
+        if not 0 <= limit <= 10:
+            raise ValueError('CLOUD_MAX_VERSIONS must be an integer between 0 and 10; history pruning was not confirmed')
+        storage_changes['CLOUD_CONFIRMED_HISTORY_LIMIT'] = str(limit)
     plan = [(storage, storage.updated(storage_changes)),
             (gateway, gateway.updated(changes)),
             (primary, primary.updated({'DEPLOY_MODE': 'server'} if primary.path.exists() else {}, remove={'CLOUD_INTERNAL_KEY'})),
@@ -63,7 +67,10 @@ def main():
         parser.error('Cloud is available only with DEPLOY_MODE=server (gateway/.env).')
     env_file = ROOT / 'deploy/cloud.env'
     if args.action == 'configure':
-        rotated = configure(ROOT, args.rotate_key, args.confirm_history_prune)
+        try:
+            rotated = configure(ROOT, args.rotate_key, args.confirm_history_prune)
+        except ValueError as exc:
+            parser.error(str(exc))
         if rotated:
             print('Internal key rotated; recreate storage and restart the gateway together.')
         print('Cloud configured. Run ./deploy.sh cloud up, then restart the gateway. Data is preserved by down.')

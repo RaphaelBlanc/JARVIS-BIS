@@ -47,11 +47,13 @@ Avec le déploiement autonome `deploy.sh`, le **`.env` racine fait foi pour tous
 
 Au démarrage, une liaison dotenv non cloud invalide ou contenant des octets non UTF-8 est ignorée avec un avertissement indiquant fichier et ligne, sans afficher sa valeur. Les autres paramètres restent chargés. Un lien symbolique ordinaire peut être lu ; la synchronisation ne remplace pas ce lien. Les réglages cloud ou de mode mal formés restent refusés, ainsi qu’une ancienne clé cloud à retirer d’un fichier lié. Les commandes qui éditent explicitement la configuration cloud restent strictes et refusent les liens symboliques. Les valeurs modifiées conservent leurs vraies lignes multiples plutôt que des échappements JSON, conformément à [EnvironmentFile de systemd](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#EnvironmentFile=).
 
+Un manifeste de synchronisation illisible, non UTF-8 ou de structure invalide est ignoré avec un avertissement, sans afficher son contenu et sans retirer de clé suivie. Cela permet au gateway et au runner de démarrer en conservant leurs réglages. Une synchronisation suivante reconstruit le suivi pour les valeurs qu’elle écrit ; les anciennes clés dont le suivi est perdu restent conservées. Un manifeste lié symboliquement reste refusé.
+
 Avec Noctalia, utiliser son déployeur et ses services habituels ; seules les commandes `./deploy.sh cloud configure|up|status|down` concernent le conteneur. Ne pas lancer `deploy.sh start` ou `setup` pour piloter l’installation du rice.
 
 ## Depuis Noctalia
 
-Conserver la connexion JARVIS distante habituelle. Théo écrit le client officiel depuis le contrat API ; sa disponibilité et ses commandes sont à vérifier dans le rice. Dans le prototype local déjà installé pour les essais, l’association et l’affichage utilisent :
+Conserver la connexion JARVIS distante habituelle. Le client terminal officiel est disponible dans Noctalia depuis `2cd7b0d` ; voir son [guide cloud](https://github.com/abcdef123456-wq/noctalia-config/blob/2cd7b0d04ff9ae0763670eb6e57d5bcba7486805/docs/cloud.md). Pour ce client : `nc-cloud verifier`, `nc-cloud associer`, `nc-cloud etat`, puis `nc-cloud lister`. L’interface officielle reste à intégrer. Dans le prototype local déjà installé pour les essais, l’association et l’affichage utilisent :
 
 ```bash
 nc-cloud associer
@@ -80,6 +82,8 @@ Associer chaque PC séparément, puis vérifier :
 Le client ne supprime jamais les sources après dépôt. La v1 accepte jusqu’à 8 fichiers ordinaires par sélection ; dossiers récursifs et liens symboliques ne sont pas envoyés. Aucun envoi n’est relancé automatiquement au retour du réseau.
 
 ## Entretien et sauvegarde
+
+La confirmation refuse une valeur `CLOUD_MAX_VERSIONS` non entière ou hors de 0 à 10 avec une erreur explicite, sans trace Python et sans modifier les fichiers de configuration.
 
 Chaque fichier conserve au plus dix anciennes versions, selon `CLOUD_MAX_VERSIONS`. Les plus anciennes sont retirées lors d’un remplacement. Si un historique existant dépasse la limite au démarrage, le service refuse de le réduire sans confirmation explicite. **Cette réduction est définitive : sauvegarder avant mise à jour.** Après sauvegarde, confirmer la limite actuellement configurée dans `deploy/cloud.env` puis relancer :
 
@@ -122,6 +126,17 @@ python3 -m venv /tmp/jarvis-cloud-tests
 ```
 
 Les tests utilisent des dossiers temporaires et un serveur HTTP loopback. Aucun bot, moteur IA ou serveur de production n’est démarré. Le conteneur peut se construire séparément avec `podman build -f cloud/Dockerfile -t localhost/jarvis-cloud:test .`.
+
+Pour vérifier le client officiel sans le modifier, avec le vrai conteneur, l’adaptateur `nc_gateway` et un vrai trousseau jetable : installer les dépendances Python du gateway dans un environnement de test, ainsi que Podman, `dbus-run-session`, `gnome-keyring-daemon` et `secret-tool`. Fournir une copie de la révision Noctalia à tester :
+
+```bash
+podman build -f cloud/Dockerfile -t localhost/jarvis-cloud:review .
+PYTHONPATH=.:gateway python scripts/check-cloud-noctalia.py \
+  --noctalia-root /chemin/vers/noctalia-config \
+  --image localhost/jarvis-cloud:review
+```
+
+Le script lance sa propre session D-Bus et son trousseau, isole HOME et XDG, crée un volume nommé et un conteneur temporaires puis les retire. Il conserve le magasin Podman de l’utilisateur pour trouver l’image construite. Les appels client et le gateway utilisent uniquement des configurations jetables et des ports loopback ; le lifespan du gateway reste désactivé pour ne lancer aucun bot. Les coupures sont injectées à la frontière HTTP publique : les morceaux acceptés, publications, fichiers, versions et suppressions sont traités par le vrai stockage.
 
 
 Un appareil associé possède des droits de suppression définitive sur l’espace personnel. Révoquer immédiatement un appareil perdu ou un jeton compromis ; conserver des sauvegardes indépendantes. L’historique plafonné peut être évincé par des remplacements répétés et ne protège pas contre le vol d’un jeton.

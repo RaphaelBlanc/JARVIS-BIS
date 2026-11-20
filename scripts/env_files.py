@@ -128,7 +128,19 @@ def _managed(doc):
     path = doc.path.with_name('.env.jarvis-managed.json')
     if path.is_symlink():
         raise ValueError('Refusing a linked sync manifest')
-    return json.loads(path.read_text()) if path.exists() else {}
+    try:
+        owned = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+        if not isinstance(owned, dict) or any(
+            not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{64}', value)
+            for value in owned.values()
+        ):
+            raise ValueError('Invalid sync manifest')
+        return owned
+    except (OSError, ValueError):
+        # A damaged tracking file is never evidence that a setting was removed.
+        # Do not include its contents (potentially secrets) in the warning.
+        warnings.warn(f'Ignoring unreadable sync manifest at {path}; no tracked settings will be removed')
+        return {}
 
 
 def _removed(source, doc, owned):

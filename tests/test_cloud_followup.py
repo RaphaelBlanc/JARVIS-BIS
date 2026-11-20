@@ -524,3 +524,47 @@ def test_history_confirmation_records_exact_limit(configuration, monkeypatch):
     monkeypatch.setenv('CLOUD_MAX_VERSIONS', '3')
     H.CONTROL.configure(root, confirm_history_prune=True)
     assert EnvFile(root / 'deploy/cloud.env').values['CLOUD_CONFIRMED_HISTORY_LIMIT'] == '3'
+
+
+@pytest.mark.parametrize('broken', [b'{', b'[]', b'null', b'{"TRACKED": 42}',
+                                    b'{"TRACKED": "not-a-digest"}', b'\xff'])
+def test_damaged_sync_manifest_preserves_settings_and_runtime_loading(configuration, monkeypatch, broken):
+    root = configuration
+    (root / '.env').write_text('DEPLOY_MODE=local\nTRACKED=keep-me\n')
+    sync_components(root)
+    (root / '.env').write_text('DEPLOY_MODE=local\n')
+    for component in ('gateway', 'home-runner'):
+        (root / component / '.env.jarvis-managed.json').write_bytes(broken)
+    # Both runtime loaders used by main.py must tolerate the damaged file.
+    for loader in (lambda: load_gateway(root), lambda: load_shared(root, 'home-runner')):
+        monkeypatch.delenv('TRACKED', raising=False)
+        with pytest.warns(UserWarning, match='Ignoring unreadable sync manifest'):
+            loader()
+        assert os.environ['TRACKED'] == 'keep-me'
+    with pytest.warns(UserWarning, match='Ignoring unreadable sync manifest'):
+        sync_components(root)
+    sync_components(root)
+    for component in ('gateway', 'home-runner'):
+        assert EnvFile(root / component / '.env').values['TRACKED'] == 'keep-me'
+
+
+@pytest.mark.parametrize('limit', ['not-a-number', '', '-1', '11'])
+@pytest.mark.parametrize('source', ['file', 'environment'])
+def test_invalid_history_limit_cli_is_clear_and_writes_nothing(configuration, monkeypatch, capsys, limit, source):
+    root = configuration
+    monkeypatch.delenv('CLOUD_MAX_VERSIONS', raising=False)
+    (root / '.env').write_text('DEPLOY_MODE=server\n')
+    if source == 'file':
+        (root / 'deploy/cloud.env').write_text('CLOUD_MAX_VERSIONS=' + limit + '\n')
+    else:
+        monkeypatch.setenv('CLOUD_MAX_VERSIONS', limit)
+    before = {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+    monkeypatch.setattr(H.CONTROL, 'ROOT', root)
+    monkeypatch.setattr(sys, 'argv', ['cloud-control.py', 'configure', '--confirm-history-prune'])
+    with pytest.raises(SystemExit) as exc:
+        H.CONTROL.main()
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert 'CLOUD_MAX_VERSIONS must be an integer between 0 and 10' in error
+    assert 'Traceback' not in error
+    assert {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()} == before

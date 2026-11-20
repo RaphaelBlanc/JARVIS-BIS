@@ -280,7 +280,7 @@ def test_deploy_start_cannot_pass_cloud_key_to_runner(configuration):
 
 @pytest.mark.skipif(importlib.util.find_spec('discord') is None or importlib.util.find_spec('telegram') is None,
                     reason='Gateway bot dependencies required for the full import regression')
-@pytest.mark.parametrize('kind', ['valid', 'syntax', 'encoding', 'symlink'])
+@pytest.mark.parametrize('kind', ['valid', 'syntax', 'encoding', 'symlink', 'manifest'])
 def test_gateway_reads_root_shared_and_gateway_cloud_configuration(configuration, kind):
     root = configuration
     for directory in ('core', 'gateway', 'cloud', 'scripts'):
@@ -297,6 +297,8 @@ def test_gateway_reads_root_shared_and_gateway_cloud_configuration(configuration
         (root / '.env').rename(root / 'linked.env')
         (root / '.env').symlink_to('linked.env')
     (root / 'gateway/.env').write_text('DEPLOY_MODE=server\nCLOUD_ENABLED=1\nCLOUD_INTERNAL_KEY=' + 'x' * 32 + '\nSECRET_KEY=test-only\n')
+    if kind == 'manifest':
+        (root / 'gateway/.env.jarvis-managed.json').write_text('{broken-json')
     env = {k: v for k, v in os.environ.items() if not k.startswith('CLOUD_') and k not in ('DEPLOY_MODE', 'SECRET_KEY')}
     env['PYTHONPATH'] = str(root) + os.pathsep + str(root / 'gateway')
     result = subprocess.run([sys.executable, '-c',
