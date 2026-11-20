@@ -12,6 +12,30 @@ from env_files import EnvFile, private_write
 
 ROOT = Path(__file__).resolve().parents[1]
 
+COMPOSE_DEFAULTS = {
+    'CLOUD_QUOTA_BYTES': '21474836480',
+    'CLOUD_MAX_FILE_BYTES': '5368709120',
+    'CLOUD_CHUNK_BYTES': '4194304',
+    'CLOUD_UPLOAD_TTL': '86400',
+    'CLOUD_MAX_UPLOADS': '8',
+    'CLOUD_CONFIRMED_HISTORY_LIMIT': '-1',
+    'CLOUD_MAX_VERSIONS': '10',
+}
+
+
+def compose_environment(env_file):
+    # podman-compose 1.3 normalizes environment into a mapping before expanding
+    # it and otherwise treats unset self-referencing defaults as literal values.
+    values = EnvFile(env_file).values
+    environment = dict(os.environ)
+    key = environment.get('CLOUD_INTERNAL_KEY', values.get('CLOUD_INTERNAL_KEY', ''))
+    if len(key) < 32 or not key.isascii():
+        raise ValueError('CLOUD_INTERNAL_KEY must contain at least 32 ASCII characters')
+    environment['CLOUD_INTERNAL_KEY'] = key
+    for name, default in COMPOSE_DEFAULTS.items():
+        environment.setdefault(name, values.get(name, default))
+    return environment
+
 
 def configure(root, rotate_key=False, confirm_history_prune=False):
     primary = EnvFile(root / '.env')
@@ -84,8 +108,8 @@ def main():
     else:
         parser.error('Install Docker Compose or podman-compose on the server.')
     command = base + ['--env-file', str(env_file), '-f', str(ROOT / 'deploy/cloud.compose.yaml')]
-    command += {'up': ['up', '-d', '--build'], 'down': ['down'], 'status': ['ps']}[args.action]
-    return subprocess.run(command, cwd=ROOT, check=False).returncode
+    command += {'up': ['up', '-d', '--build', '--force-recreate'], 'down': ['down'], 'status': ['ps']}[args.action]
+    return subprocess.run(command, cwd=ROOT, env=compose_environment(env_file), check=False).returncode
 
 
 if __name__ == '__main__':

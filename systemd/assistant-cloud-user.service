@@ -1,0 +1,17 @@
+[Unit]
+Description=Assistant Personnel — stockage cloud Podman sans root
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Nom créé par deploy/cloud.compose.yaml ; adapter si le projet Compose change.
+Environment=CLOUD_CONTAINER=deploy_jarvis-cloud_1
+ExecStart=/usr/bin/podman start ${CLOUD_CONTAINER}
+ExecStop=/usr/bin/podman stop --time 30 ${CLOUD_CONTAINER}
+TimeoutStartSec=120
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

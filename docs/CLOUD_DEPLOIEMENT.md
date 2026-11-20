@@ -31,6 +31,20 @@ Redémarrer le gateway après cette rotation pour qu’il utilise la nouvelle cl
 
 Redémarrer ensuite le gateway avec son mécanisme habituel (service utilisateur Noctalia, service système ou déploiement propre au serveur). Il n’est pas nécessaire de redémarrer le runner IA pour le cloud. Le gateway doit charger les valeurs `CLOUD_ENABLED`, `CLOUD_INTERNAL_KEY` et `CLOUD_INTERNAL_URL` configurées.
 
+`cloud up` recrée explicitement le conteneur pour appliquer l’image et les réglages, avec une brève interruption du stockage. Le volume est conservé. Pour Podman Compose 1.3, le contrôleur fournit les valeurs numériques par défaut dans l’environnement du processus Compose : les réglages de `deploy/cloud.env` et les variables explicites restent prioritaires. Cela évite que cette version transmette littéralement les expressions `${CLOUD_…:-…}` au conteneur. Utiliser les commandes `deploy.sh cloud` pour bénéficier de cette compatibilité.
+
+Avec Podman sans root, après le premier `cloud up`, installer aussi le service utilisateur pour retrouver le conteneur après redémarrage du serveur :
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/assistant-cloud-user.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now assistant-cloud-user.service
+sudo loginctl enable-linger "$USER"
+```
+
+Le service démarre le conteneur existant sans reconstruction et l’arrête proprement avec la session système. Adapter `CLOUD_CONTAINER` dans l’unité si le nom du projet Compose a changé. Vérifier avec `systemctl --user status assistant-cloud-user.service` et `./deploy.sh cloud status`. Avant une désactivation durable avec `cloud down`, désactiver d’abord cette unité avec `systemctl --user disable --now assistant-cloud-user.service`.
+
 Le port du stockage `8091` est publié sur **127.0.0.1 uniquement**, pour un gateway installé sur l’hôte. Le point d’entrée distant reste le gateway existant, avec HTTPS ou votre réseau privé sécurisé. Ne pas exposer `8091` sur Internet. Si le gateway est lui aussi conteneurisé, placer les deux services sur un réseau privé commun et régler `CLOUD_INTERNAL_URL` sur l’adresse du service ; la publication loopback peut alors être retirée.
 
 Le volume Compose `jarvis-cloud-data` contient fichiers, versions, morceaux et base SQLite. Le conteneur tourne sans root, avec son système de fichiers en lecture seule, un répertoire temporaire borné et aucune capacité Linux. Le poste Noctalia n’a pas besoin de Docker ou Podman pour accéder au drive.

@@ -55,8 +55,12 @@ from memory import (
 # Chargement de la configuration
 # ---------------------------------------------------------------------------
 
+# The standalone systemd service starts in home-runner without PYTHONPATH.
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 from scripts.env_files import load_shared
-load_shared(Path(__file__).resolve().parent.parent, 'home-runner')
+load_shared(ROOT_DIR, 'home-runner')
 
 SECRET_KEY: str = os.environ.get("SECRET_KEY", "")
 PORT: int = int(os.environ.get("PORT", "8080"))
