@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+from urllib.parse import quote
 import uuid
 
 
@@ -30,11 +31,12 @@ def run(*command, **kwargs):
 
 
 @contextmanager
-def serve(app):
+def serve(app, tls=None):
     import uvicorn
     listener = socket.socket()
     listener.bind(('127.0.0.1', 0))
-    server = uvicorn.Server(uvicorn.Config(app, log_level='critical', lifespan='off'))
+    options = {'ssl_certfile': str(tls[0]), 'ssl_keyfile': str(tls[1])} if tls else {}
+    server = uvicorn.Server(uvicorn.Config(app, log_level='critical', lifespan='off', **options))
     thread = threading.Thread(target=server.run, kwargs={'sockets': [listener]}, daemon=True)
     thread.start()
     try:
@@ -43,7 +45,7 @@ def serve(app):
             time.sleep(.01)
         if not server.started:
             raise RuntimeError('Gateway did not start')
-        yield 'http://127.0.0.1:' + str(listener.getsockname()[1])
+        yield ('https://localhost:' if tls else 'http://127.0.0.1:') + str(listener.getsockname()[1])
     finally:
         server.should_exit = True
         thread.join(5)
@@ -82,6 +84,101 @@ class Interruptions:
         await self.app(scope, receive, response)
 
 
+def check_gvfs(public, device, token, filename, content, environment):
+    # Use system Python for the distribution's Gio bindings. Credentials travel
+    # only on stdin, never in an argv or URI; all daemons use the disposable bus.
+    helper = r'''
+import hashlib, json, sys, time
+from gi.repository import Gio, GLib
+request = json.load(sys.stdin)
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+deadline = time.monotonic() + 5
+while not bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
+        'org.freedesktop.DBus', 'NameHasOwner', GLib.Variant('(s)', ('org.gtk.vfs.Daemon',)),
+        GLib.VariantType.new('(b)'), Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]:
+    assert time.monotonic() < deadline, 'Isolated GVfs daemon did not start'
+    time.sleep(.05)
+root = Gio.File.new_for_uri(request['url'].replace('http://', 'dav://') + '/cloud/dav/')
+operation = Gio.MountOperation()
+operation.set_password_save(Gio.PasswordSave.NEVER)
+attempts = 0
+def authenticate(op, message, user, domain, flags):
+    global attempts
+    attempts += 1
+    if attempts > 2:
+        op.reply(Gio.MountOperationResult.ABORT)
+        return
+    op.set_username(request['device'])
+    op.set_password(request['token'])
+    op.reply(Gio.MountOperationResult.HANDLED)
+operation.connect('ask-password', authenticate)
+loop = GLib.MainLoop()
+failure = []
+cancel = Gio.Cancellable()
+def mounted(source, result):
+    try:
+        source.mount_enclosing_volume_finish(result)
+    except Exception as exc:
+        failure.append(exc)
+    finally:
+        loop.quit()
+GLib.timeout_add_seconds(15, lambda: (cancel.cancel(), False)[1])
+root.mount_enclosing_volume(Gio.MountMountFlags.NONE, operation, cancel, mounted)
+loop.run()
+assert not failure, 'GVfs mount failed'
+try:
+    listing = root.enumerate_children('standard::name,standard::type', Gio.FileQueryInfoFlags.NONE, None)
+    names = []
+    while (info := listing.next_file(None)) is not None:
+        names.append(info.get_name())
+    listing.close(None)
+    assert request['filename'] in names
+    ok, data, etag = root.get_child(request['filename']).load_contents(None)
+    assert ok and hashlib.sha256(data).hexdigest() == request['sha256']
+    try:
+        root.get_child('must-not-be-created.txt').replace_contents(b'forbidden', None, False, Gio.FileCreateFlags.NONE, None)
+    except GLib.Error:
+        pass
+    else:
+        raise AssertionError('WebDAV unexpectedly accepted a write')
+finally:
+    mount = root.find_enclosing_mount(None)
+    def unmounted(source, result):
+        try:
+            source.unmount_with_operation_finish(result)
+        except Exception as exc:
+            failure.append(exc)
+        finally:
+            loop.quit()
+    mount.unmount_with_operation(Gio.MountUnmountFlags.NONE, None, None, unmounted)
+    loop.run()
+assert not failure, 'GVfs unmount failed'
+print('PASS: real Gio/GVfs mount, Unicode listing, SHA-256 read, refused write, unmount')
+'''
+    payload = dict(url=public, device=device, token=token, filename=filename,
+                   sha256=hashlib.sha256(content).hexdigest())
+    binary = next((p for p in ('/usr/libexec/gvfsd', '/usr/lib/gvfs/gvfsd') if Path(p).is_file()), None)
+    if binary is None:
+        raise RuntimeError('Install the distribution Gio/GVfs daemon and WebDAV backend')
+    # Do not mount over the desktop's FUSE path. GTK file managers use Gio
+    # directly; testing that path needs no FUSE projection or desktop changes.
+    daemon = subprocess.Popen([binary, '--no-fuse'], env=environment,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        result = subprocess.run(['/usr/bin/python3', '-c', helper], input=json.dumps(payload),
+                                env=environment, capture_output=True, text=True, timeout=45)
+    finally:
+        daemon.terminate()
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
+    if result.returncode:
+        raise RuntimeError('Isolated Gio/GVfs check failed: ' + result.stderr.replace(token, '[redacted]'))
+    print(result.stdout.strip())
+
+
 def exercise(args, temporary):
     import httpx
     key, admin = secrets.token_hex(32), secrets.token_hex(32)
@@ -103,8 +200,24 @@ def exercise(args, temporary):
                        TMPDIR=str(temporary / 'tmp'), GIO_USE_PORTALS='0')
     for directory in ('runtime', 'tmp'):
         (temporary / directory).mkdir(mode=0o700)
+    (temporary / 'runtime/keyring').mkdir(mode=0o700)
+    environment.update(GNOME_KEYRING_CONTROL=str(temporary / 'runtime/keyring'), GNOME_KEYRING_PID='')
     os.environ.clear()
     os.environ.update(environment)
+    # dbus-run-session started before HOME was isolated. Update only this
+    # disposable bus (never --systemd), including services activated on demand.
+    run('dbus-update-activation-environment', 'HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME',
+        'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR', 'TMPDIR', 'GIO_USE_PORTALS',
+        'GNOME_KEYRING_CONTROL', 'GNOME_KEYRING_PID')
+    tls = None
+    if args.https:
+        cert, private_key = temporary / 'tls.pem', temporary / 'tls.key'
+        run('openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+            '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost',
+            '-keyout', str(private_key), '-out', str(cert))
+        private_key.chmod(0o600)
+        tls = cert, private_key
+        environment['SSL_CERT_FILE'] = str(cert)
     with (temporary / 'keyring.log').open('w') as log:
         keyring = subprocess.Popen(['gnome-keyring-daemon', '--foreground', '--unlock', '--components=secrets',
                                     '--control-directory', str(temporary / 'runtime/keyring')],
@@ -150,7 +263,7 @@ def exercise(args, temporary):
                             str(ROOT / 'gateway'), str(ROOT)]
             import nc_gateway
             faults = Interruptions(nc_gateway.app)
-            with serve(faults) as public:
+            with serve(faults, tls) as public:
                 command = [sys.executable, str(args.noctalia_root / 'home/.local/bin/nc-cloud'), '--json']
                 homes = {}
                 for pc in ('pc-a', 'pc-b'):
@@ -162,8 +275,8 @@ def exercise(args, temporary):
                     homes[pc] = dict(environment, HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'),
                                      XDG_STATE_HOME=str(home / '.local/state'))
 
-                def cli(pc, *arguments, code=0):
-                    result = subprocess.run(command + list(map(str, arguments)), env=homes[pc],
+                def cli(pc, *arguments, code=0, environment_override=None):
+                    result = subprocess.run(command + list(map(str, arguments)), env=environment_override or homes[pc],
                                             capture_output=True, text=True, timeout=45)
                     assert result.returncode == code, (arguments, result.returncode, result.stdout, result.stderr)
                     assert admin not in result.stdout + result.stderr and key not in result.stdout + result.stderr
@@ -176,6 +289,19 @@ def exercise(args, temporary):
                 cli('pc-b', 'associer', 'integration-pc-b')
                 cli('pc-a', 'verifier')
                 cli('pc-a', 'etat')
+                if tls:
+                    before = len(faults.journal)
+                    untrusted = dict(homes['pc-a'])
+                    untrusted.pop('SSL_CERT_FILE', None)
+                    cli('pc-a', 'etat', code=3, environment_override=untrusted)
+                    conf = Path(homes['pc-a']['HOME']) / '.config/nc/assistant.conf'
+                    original_conf = conf.read_text()
+                    conf.write_text(original_conf.replace('https://localhost:', 'https://127.0.0.1:'))
+                    try:
+                        cli('pc-a', 'etat', code=3)
+                    finally:
+                        conf.write_text(original_conf)
+                    assert len(faults.journal) == before
                 tokens = []
                 for pc in homes:
                     state = Path(homes[pc]['XDG_STATE_HOME']) / 'nc-cloud'
@@ -207,6 +333,13 @@ def exercise(args, temporary):
                 assert not manifests[0].exists()
                 assert sum(p.endswith('/' + upload + '/chunks/0') for _, p, _ in faults.journal) == 1
                 entry = next(e for e in entries() if e['name'] == source.name)
+                metadata = json.loads((Path(homes['pc-b']['XDG_STATE_HOME']) / 'nc-cloud/appareil.json').read_text())
+                dav = httpx.get(public + '/cloud/dav/' + quote(source.name, safe=''),
+                                auth=(metadata['device_id'], tokens[1]), trust_env=False,
+                                verify=str(tls[0]) if tls else True)
+                assert dav.status_code == 200 and dav.content == original
+                if args.gvfs:
+                    check_gvfs(public, metadata['device_id'], tokens[1], source.name, original, homes['pc-b'])
                 destination = temporary / 'download.bin'
                 faults.download = True
                 cli('pc-b', 'telecharger', entry['id'], destination, code=3)
@@ -255,6 +388,8 @@ def exercise(args, temporary):
             print('      concurrent PCs, conflict, keep both, CAS replacement/deletion, disabled local mode,')
             print('      offline without queue, restart, private state without secrets, unpair')
             print('Container image: ' + container('image', 'inspect', args.image, '--format', '{{.Id}}'))
+            if tls:
+                print('PASS: verified HTTPS API/WebDAV; untrusted certificate and wrong hostname refused before HTTP')
         finally:
             container('rm', '-f', name, check=False)
             container('volume', 'rm', '-f', volume, check=False)
@@ -270,9 +405,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--noctalia-root', type=Path, required=True)
     parser.add_argument('--image', default='localhost/jarvis-cloud:review')
+    parser.add_argument('--https', action='store_true', help='Exercise real TLS with a disposable localhost trust anchor')
+    parser.add_argument('--gvfs', action='store_true', help='Exercise a real isolated Gio/GVfs WebDAV mount (HTTP only)')
     parser.add_argument('--isolated-session', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.noctalia_root = args.noctalia_root.resolve()
+    if args.https and args.gvfs:
+        parser.error('Run --https and --gvfs separately: GVfs uses its own certificate trust store')
     if not (args.noctalia_root / 'home/.local/bin/nc-cloud').is_file():
         parser.error('--noctalia-root must contain the official nc-cloud client')
     if not args.isolated_session:

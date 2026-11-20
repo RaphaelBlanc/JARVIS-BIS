@@ -481,6 +481,30 @@ def test_download_open_does_not_need_sqlite_write_lock(service):
                 assert source.read() == b'hello'
 
 
+def test_gc_does_not_hold_up_downloads_while_sqlite_writer_is_busy(service, monkeypatch):
+    store, _, device = service
+    ident = device['device_id']
+    deleted = published(store, ident, name='to-delete')['result']
+    retained = published(store, ident, name='to-read')['result']
+    with monkeypatch.context() as patch:
+        patch.setattr(store, 'collect_garbage', lambda: None)
+        store.delete_file(ident, deleted['id'], '"' + deleted['revision'] + '"', uuid.uuid4().hex)
+    with ThreadPoolExecutor(2) as pool:
+        with store.transaction():
+            pool.submit(store.collect_garbage).result(timeout=2)
+            _, source = pool.submit(store.open_content, retained['id']).result(timeout=2)
+            with source:
+                assert source.read() == b'hello'
+            with store.connection() as db:
+                assert db.execute('SELECT SUM(size) FROM garbage').fetchone()[0] == 5
+    # Deferred objects remain reserved until the writer releases and GC succeeds.
+    assert store.status(ident)['garbage_bytes'] == 5
+    store.collect_garbage()
+    assert store.status(ident)['garbage_bytes'] == 0
+    with store.open_content(retained['id'])[1] as source:
+        assert source.read() == b'hello'
+
+
 def test_one_failed_gc_object_does_not_block_others(service, monkeypatch):
     store, _, device = service
     a = published(store, device['device_id'], name='a')['result']

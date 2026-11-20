@@ -141,8 +141,8 @@ class Store:
         self.collect_garbage()
 
     @contextmanager
-    def connection(self):
-        db = sqlite3.connect(self.database, timeout=30, isolation_level=None)
+    def connection(self, timeout=30):
+        db = sqlite3.connect(self.database, timeout=timeout, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA synchronous=FULL')
         try:
@@ -151,8 +151,8 @@ class Store:
             db.close()
 
     @contextmanager
-    def transaction(self):
-        with self.connection() as db:
+    def transaction(self, blocking=True):
+        with self.connection(timeout=30 if blocking else 0) as db:
             db.execute('BEGIN IMMEDIATE')
             try:
                 yield db
@@ -258,7 +258,10 @@ class Store:
             for row in rows:
                 self._gc_cursor = row['blob']
                 try:
-                    with self._object_lock(exclusive=True), self.transaction() as db:
+                    # Keep the lock order, but never wait for a SQLite writer
+                    # while excluding readers. Busy objects stay queued/charged
+                    # and the next cleanup cycle retries them.
+                    with self._object_lock(exclusive=True), self.transaction(blocking=False) as db:
                         referenced = db.execute('SELECT 1 FROM entries WHERE blob=? UNION SELECT 1 FROM versions WHERE blob=?',
                                                 (row['blob'], row['blob'])).fetchone()
                         if referenced:

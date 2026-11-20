@@ -98,6 +98,8 @@ Les reçus de publication et de suppression restent conservés. Les morceaux tem
 
 Les objets retirés après suppression ou réduction d’historique passent par une file persistante. `used_bytes` est le quota logique des versions référencées ; `garbage_bytes` est l’espace des objets retirés restant à récupérer, encore inclus dans `reserved_bytes`. Si un effacement disque échoue, cet espace n’est pas annoncé comme récupéré et reste chargé jusqu’au succès. Un téléchargement déjà ouvert peut se terminer même si l’objet est ensuite retiré du répertoire.
 
+Si SQLite est occupé par un écrivain, le nettoyage ne patiente pas en gardant le verrou exclusif des objets : sa transaction utilise un délai d’attente nul et reporte l’effacement au cycle suivant. L’ordre des verrous reste objets puis SQLite, comme pour les ouvertures de lecture. Les objets reportés restent dans la file et comptés dans les réservations ; les téléchargements peuvent s’ouvrir pendant cette attente d’écriture.
+
 Un ensemble borné de 64 verrous protège les transferts : deux identifiants peuvent partager un verrou et être sérialisés, sans compromettre l’intégrité. Le nettoyage ne supprime pas un morceau encore utilisé par un assemblage. En cas d’échec du nettoyage, sa réservation reste comptée pour empêcher de remplir le disque par des annulations répétées ; le service réessaie. Les reçus d’idempotence restent disponibles après suppression des morceaux, avec `chunks=[]` pour un état terminal.
 
 Le schéma SQLite passe automatiquement de la version 1 ou 2 à la version 3. Les identités, jetons, versions courantes et reçus sont préservés ; la réduction d’un historique excédentaire exige la confirmation décrite ci-dessus. Les anciens reçus sans morceaux présents ne réservent plus inutilement leur taille complète. Sauvegarder le volume avant mise à jour : les anciens binaires refusent le schéma 3 et ne constituent pas un retour arrière compatible.
@@ -137,6 +139,21 @@ PYTHONPATH=.:gateway python scripts/check-cloud-noctalia.py \
 ```
 
 Le script lance sa propre session D-Bus et son trousseau, isole HOME et XDG, crée un volume nommé et un conteneur temporaires puis les retire. Il conserve le magasin Podman de l’utilisateur pour trouver l’image construite. Les appels client et le gateway utilisent uniquement des configurations jetables et des ports loopback ; le lifespan du gateway reste désactivé pour ne lancer aucun bot. Les coupures sont injectées à la frontière HTTP publique : les morceaux acceptés, publications, fichiers, versions et suppressions sont traités par le vrai stockage.
+
+Deux parcours supplémentaires sont disponibles, à lancer séparément :
+
+```bash
+PYTHONPATH=.:gateway python scripts/check-cloud-noctalia.py \
+  --noctalia-root /chemin/vers/noctalia-config --https
+PYTHONPATH=.:gateway python scripts/check-cloud-noctalia.py \
+  --noctalia-root /chemin/vers/noctalia-config --gvfs
+```
+
+`--https` requiert OpenSSL. Il génère un certificat temporaire pour `localhost`, ajoute cette confiance uniquement aux processus clients de l’essai et rejoue le parcours complet en TLS, y compris WebDAV. Deux contrôles négatifs vérifient qu’un certificat inconnu et un mauvais nom d’hôte échouent avant toute requête HTTP applicative. Cela ne valide pas le certificat ou le reverse proxy du serveur personnel.
+
+`--gvfs` requiert `/usr/bin/python3` avec les bindings Gio, le démon GVfs et son backend WebDAV. Il monte le drive réel via une opération Gio avec authentification, liste un nom Unicode, relit le contenu et vérifie son SHA-256, constate le refus d’écriture puis démonte. Le démon isolé utilise `--no-fuse` pour ne pas projeter ce montage sur le répertoire FUSE du bureau. Le script met aussi à jour l’environnement d’activation de sa seule session D-Bus jetable, sans `--systemd`, pour isoler les services activés à la demande. L’essai valide le backend natif utilisé par Fichiers, pas son interface graphique ni le favori officiel Noctalia.
+
+Après mise à jour du serveur personnel et du client officiel, vérifier `nc-cloud verifier` puis `nc-cloud etat` avec l’adresse HTTPS ou Tailscale réelle. Associer chaque PC s’il ne l’est pas déjà, déposer un fichier de test depuis le premier, le télécharger depuis le second et comparer les SHA-256. Un ping Tailscale réussi ne valide que la connectivité ; si `/api/cloud/v1/capabilities` répond 404, l’API cloud n’est pas disponible à cette adresse et le parcours distant ne peut pas encore être validé. Les réglages, le panneau et le dépôt sur l’île sont fournis par l’intégration officielle Noctalia.
 
 
 Un appareil associé possède des droits de suppression définitive sur l’espace personnel. Révoquer immédiatement un appareil perdu ou un jeton compromis ; conserver des sauvegardes indépendantes. L’historique plafonné peut être évincé par des remplacements répétés et ne protège pas contre le vol d’un jeton.
