@@ -459,7 +459,7 @@ index 0000000..d7dc15a
 +    subprocess.run([str(Path.home() / '.local/bin/nc-cloud'), 'deposer', *files], check=False)
 diff --git a/home/.local/share/nc-cloud/client.py b/home/.local/share/nc-cloud/client.py
 new file mode 100644
-index 0000000..2c5ee7a
+index 0000000..45b9b64
 --- /dev/null
 +++ b/home/.local/share/nc-cloud/client.py
 @@ -0,0 +1,572 @@
@@ -770,7 +770,7 @@ index 0000000..2c5ee7a
 +                    self.save(manifest)
 +                state = self.request('/api/cloud/v1/uploads/' + manifest['upload_id'])
 +                if state['state'] == 'committed':
-+                    manifest.update(state='committed', sent=manifest['size'], result=state['result'])
++                    manifest.update(state='committed', sent=manifest['size'], result=state['result'], error=None, message='', current=None)
 +                    self.save(manifest)
 +                    return
 +                if state['state'] != 'pending':
@@ -782,7 +782,7 @@ index 0000000..2c5ee7a
 +                        raise Failure('source_changed')
 +                    source.seek(0)
 +                    received = {r['idx']: r['sha256'] for r in state['chunks']}
-+                    manifest.update(state='uploading', error=None, sent=0)
++                    manifest.update(state='uploading', error=None, message='', current=None, sent=0)
 +                    self.save(manifest)
 +                    index = 0
 +                    while data := source.read(state['chunk_bytes']):
@@ -802,7 +802,7 @@ index 0000000..2c5ee7a
 +                if self.manifest_path(ident).with_suffix('.cancel').exists():
 +                    raise Failure('cancel_requested')
 +                result = self.request('/api/cloud/v1/uploads/' + manifest['upload_id'] + '/commit', 'POST', timeout=60)
-+                manifest.update(state='committed', result=result['result'])
++                manifest.update(state='committed', result=result['result'], error=None, message='', current=None)
 +                self.save(manifest)
 +                self.notify(manifest['name'] + (' envoyé.' if not language() else ' uploaded.'))
 +            except Failure as exc:
@@ -849,7 +849,7 @@ index 0000000..2c5ee7a
 +        private_write(self.manifest_path(ident).with_suffix('.cancel'), {})
 +        result = self.request('/api/cloud/v1/uploads/' + manifest['upload_id'], 'DELETE')
 +        # Let an active worker reconcile its own manifest; terminal server state is authoritative.
-+        manifest.update(state=result['state'], result=result.get('result'))
++        manifest.update(state=result['state'], result=result.get('result'), error=None, message='', current=None)
 +        self.save(manifest)
 +        return result
 +
@@ -863,7 +863,7 @@ index 0000000..2c5ee7a
 +            raise Failure('invalid_resolution')
 +        self.cancel(ident)
 +        manifest.update(policy=policy, expected_revision=current.get('revision') if policy == 'replace' else None,
-+                        idem=uuid.uuid4().hex, state='ready', error=None)
++                        idem=uuid.uuid4().hex, state='ready', error=None, message='', current=None)
 +        spec = {k: manifest[k] for k in ('name', 'parent_id', 'parent_revision', 'size', 'sha256', 'policy', 'expected_revision')}
 +        result = self.request('/api/cloud/v1/uploads', 'POST', spec, headers={'Idempotency-Key': manifest['idem']})
 +        manifest['upload_id'] = result['upload_id']
@@ -1071,10 +1071,10 @@ index 90f7ffe..1e38ae8 100644
            'Tu peux appuyer sur Entrée pour garder le choix proposé entre crochets ; tu pourras le changer plus tard.')
 diff --git a/tests/test_cloud.py b/tests/test_cloud.py
 new file mode 100644
-index 0000000..b774a8b
+index 0000000..14b4dc9
 --- /dev/null
 +++ b/tests/test_cloud.py
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,236 @@
 +"""Client protocol tests with an isolated HTTP server and a simulated keyring."""
 +from contextlib import contextmanager
 +import hashlib
@@ -1253,6 +1253,7 @@ index 0000000..b774a8b
 +        before = len(self.server.state['calls'])
 +        self.client.worker(manifest['id'])
 +        self.assertEqual(self.client.transfers()[0]['state'], 'committed')
++        self.assertFalse(self.client.transfers()[0].get('message'))
 +        self.assertEqual(len(self.server.state['calls']) - before, 1)
 +
 +    def test_interruption_and_explicit_resume(self):

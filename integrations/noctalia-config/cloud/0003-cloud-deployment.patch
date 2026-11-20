@@ -1,8 +1,8 @@
-From 71944e747d14fc38c94ff72dfa1e4dbb6998e5d3 Mon Sep 17 00:00:00 2001
+From 6e37f2112a15b5f21a05d126c8f60311e3dd720e Mon Sep 17 00:00:00 2001
 From: RaphaelBlanc <raphael.blanc-alcaix@epita.fr>
 Date: Fri, 20 Nov 2026 12:36:18 +0100
-Subject: [PATCH 3/3] =?UTF-8?q?Cloud=20JARVIS=20:=20accepter=20le=20serveu?=
- =?UTF-8?q?r=20v1=20et=20d=C3=A9sactiver=20le=20cloud=20en=20local?=
+Subject: [PATCH] =?UTF-8?q?Cloud=20JARVIS=20:=20accepter=20le=20serveur=20?=
+ =?UTF-8?q?v1=20et=20d=C3=A9sactiver=20le=20cloud=20en=20local?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
