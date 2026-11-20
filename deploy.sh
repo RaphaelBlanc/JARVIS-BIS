@@ -16,6 +16,10 @@ GATEWAY_DIR="$ROOT_DIR/gateway"
 ACTION="${1:-install}"
 
 case "$ACTION" in
+    cloud)
+        shift
+        exec python3 "$ROOT_DIR/scripts/cloud-control.py" "$@"
+        ;;
     setup|wizard|config)
         python3 "$ROOT_DIR/setup_wizard.py"
         if [ -f "$ROOT_DIR/.env" ]; then

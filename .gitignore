@@ -57,3 +57,6 @@ credentials.json
 token.json
 client_secret*.json
 *.token
+# Cloud secrets and local test volumes
+deploy/cloud.env
+.cloud-data/

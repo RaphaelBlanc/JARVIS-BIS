@@ -417,6 +417,10 @@ app = FastAPI(
 # Monte le router Telegram
 app.include_router(telegram_router)
 
+# Optional storage remains independent from the runner and its chat payload limits.
+from cloud_proxy import capability as cloud_capability, router as cloud_router
+app.include_router(cloud_router(require_secret))
+
 
 @app.middleware("http")
 async def limit_desktop_api(request: Request, call_next):
@@ -428,6 +432,7 @@ async def limit_desktop_api(request: Request, call_next):
         DESKTOP_RATE_LIMIT > 0
         and request.url.path.startswith("/api/")
         and request.url.path not in {"/api/health"}
+        and not request.url.path.startswith("/api/cloud/")
     ):
         ip = _client_ip(request)
         now = time.monotonic()
@@ -656,6 +661,7 @@ async def api_status() -> dict:
         "online": runner_alive,
         "version": VERSION,
         "deploy_mode": os.getenv("DEPLOY_MODE", "local"),
+        "cloud": await cloud_capability(),
         "runner": runner_health,
         "session": session_info if not session_info.get("error") else None,
         "tools": tools_list,

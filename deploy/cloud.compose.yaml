@@ -1,0 +1,29 @@
+services:
+  jarvis-cloud:
+    build:
+      context: ..
+      dockerfile: cloud/Dockerfile
+    image: jarvis-cloud:local
+    restart: unless-stopped
+    environment:
+      DEPLOY_MODE: server
+      CLOUD_ENABLED: '1'
+      CLOUD_INTERNAL_KEY: ${CLOUD_INTERNAL_KEY:?Set CLOUD_INTERNAL_KEY in deploy/cloud.env}
+      CLOUD_DATA_DIR: /data
+      CLOUD_QUOTA_BYTES: ${CLOUD_QUOTA_BYTES:-21474836480}
+      CLOUD_MAX_FILE_BYTES: ${CLOUD_MAX_FILE_BYTES:-5368709120}
+      CLOUD_CHUNK_BYTES: ${CLOUD_CHUNK_BYTES:-4194304}
+      CLOUD_UPLOAD_TTL: ${CLOUD_UPLOAD_TTL:-86400}
+    ports:
+      - '127.0.0.1:8091:8091'
+    volumes:
+      - jarvis-cloud-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+volumes:
+  jarvis-cloud-data:

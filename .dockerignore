@@ -1,0 +1,5 @@
+**
+!cloud/
+!cloud/*.py
+!cloud/requirements.txt
+!cloud/Dockerfile

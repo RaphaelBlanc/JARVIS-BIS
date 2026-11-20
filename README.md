@@ -76,6 +76,12 @@ flowchart LR
 
 ## 🌟 Fonctionnalités & Modules (Style MCP)
 
+### Cloud distant optionnel
+
+En déploiement `server`, un conteneur de stockage persistant fournit un drive commun aux PC Noctalia associés : navigation WebDAV en lecture seule et fenêtre d’envoi avec gestion des conflits, transferts par morceaux et reprise explicite. Les nouveaux dépôts hors ligne sont refusés. Le cloud reste désactivé en mode local.
+
+Voir [le déploiement cloud](docs/CLOUD_DEPLOIEMENT.md) et [le contrat API v1](docs/CLOUD_API.md).
+
 Chaque outil est un module autonome activable ou désactivable à l'installation :
 
 - 🎓 **Moodle EPITA** (`/devoirs`) : Récupération automatique des devoirs, TPs et dates d'échéances.

@@ -97,6 +97,14 @@ def main():
     )
     env_config["HOME_SERVER_URL"] = home_server_url
 
+    mode = ask_string("Mode de déploiement (local/server)", default=env_config.get("DEPLOY_MODE", "local"))
+    if mode not in ("local", "server"):
+        raise ValueError("Mode attendu : local ou server")
+    env_config["DEPLOY_MODE"] = mode
+    env_config["CLOUD_ENABLED"] = env_config.get("CLOUD_ENABLED", "0") if mode == "server" else "0"
+    if mode == "server":
+        print("Cloud distant optionnel : après l’installation, utilise ./deploy.sh cloud configure puis cloud up.")
+
     # ── ÉTAPE 2 : Messagerie & Plateformes ─────────────────────────────────────
     print(f"\n{CYAN}{BOLD}--- ÉTAPE 2 : Plateformes de Messagerie ---{RESET}")
 

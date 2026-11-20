@@ -19,6 +19,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # - "server" : Tourne sur un serveur distant 24/7 (les commandes matérielles nécessitent pc-agent)
 # - "pc-agent" : Tourne sur le PC local en client du serveur distant
 DEPLOY_MODE = os.getenv("DEPLOY_MODE", "local").strip().lower()
+CLOUD_ENABLED = DEPLOY_MODE == "server" and os.getenv("CLOUD_ENABLED", "0") == "1"
 
 # Clé secrète partagée
 SECRET_KEY = os.getenv("SECRET_KEY", "")
