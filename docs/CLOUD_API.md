@@ -71,11 +71,15 @@ Le client vérifie une connexion authentifiée avant de préparer un nouveau dé
 
 Après une coupure, le manifeste local permet une reprise explicite. Le client commence par retrouver le statut distant : si le commit avait réussi avec une réponse perdue, il affiche le succès initial. Sinon il vérifie l’identité du serveur, de l’appareil, de l’espace et du fichier source, puis renvoie les morceaux manquants. Une source modifiée exige un nouveau dépôt. Le commit revérifie la version distante.
 
+Les morceaux sont effacés automatiquement après publication, annulation, révocation ou expiration. Les reçus de résultat restent conservés ; un état terminal expose `chunks=[]`. Si le nettoyage échoue, les octets réservés restent comptés jusqu’à son succès. Les opérations de nettoyage respectent les assemblages en cours et sont réessayées côté service, sans relevé du client.
+
 ## WebDAV
 
 `/cloud/dav/` expose le même espace en **lecture seule**, avec Basic Auth : utilisateur `device_id`, mot de passe `token`. Sur Internet, utiliser HTTPS ; un réseau privé sécurisé est également possible. Les identifiants ne figurent jamais ensemble dans l’URL.
 
 `OPTIONS`, `PROPFIND`, `GET` et `HEAD` sont permis. Toutes les mutations, dont `PUT`, `MKCOL`, `MOVE`, `COPY`, `DELETE`, `LOCK` et `PROPPATCH`, sont refusées. Le contournement du dialogue de conflit par un éditeur ou un gestionnaire de fichiers est ainsi impossible dans cette version. Les écritures s’effectuent par `nc-cloud`, la fenêtre ou le script Nautilus.
+
+Pour toutes les méthodes WebDAV, le gateway et le service refusent un corps dépassant 8 Kio (`413`), même sans Basic Auth et sans `Content-Length`. La lecture du corps est limitée à 5 secondes (`408`). Le contrôle précède le pont WSGI et sa collecte en mémoire. Ces limites ne s’appliquent pas au contenu des réponses de téléchargement ni aux morceaux binaires de l’API de transfert.
 
 ## Erreurs et confidentialité
 

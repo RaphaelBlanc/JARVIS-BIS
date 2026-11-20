@@ -29,13 +29,14 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket,
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+# Load this component before core/config.py adds root defaults to os.environ.
+# Cloud credentials and flags belong to the gateway, not the runner's root config.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from core.hardware_relay import HARDWARE_RELAY
 from core.node_hub import NODE_HUB
 from core.tools.base import ToolRegistry
 from core.tools.dispatcher import execute_tool_action
-
-# Charge les variables d'environnement depuis .env (si présent)
-load_dotenv()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 

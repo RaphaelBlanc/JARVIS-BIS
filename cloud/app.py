@@ -1,5 +1,7 @@
 """Internal service. Reach through the gateway, never expose this port publicly."""
 import hmac
+import asyncio
+from contextlib import asynccontextmanager
 import os
 import re
 from pathlib import Path
@@ -11,6 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.wsgi import WSGIMiddleware
 
 from cloud.storage import CloudError, Settings, Store
+from cloud.body_limit import DavBodyLimit
+
+PART_CLEANUP_INTERVAL = 30
 
 
 class Model(BaseModel):
@@ -44,7 +49,27 @@ def create_app(settings=None, internal_key=None):
     if len(key) < 32:
         raise RuntimeError('CLOUD_INTERNAL_KEY must contain at least 32 characters')
     store = Store(settings)
-    app = FastAPI(title='JARVIS Cloud internal', docs_url=None, redoc_url=None, openapi_url=None)
+    @asynccontextmanager
+    async def lifespan(app):
+        stop = asyncio.Event()
+
+        async def expire_parts():
+            while not stop.is_set():
+                await asyncio.to_thread(store.collect_expired)
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=PART_CLEANUP_INTERVAL)
+                except TimeoutError:
+                    pass
+
+        task = asyncio.create_task(expire_parts())
+        try:
+            yield
+        finally:
+            stop.set()
+            await task
+
+    app = FastAPI(title='JARVIS Cloud internal', docs_url=None, redoc_url=None, openapi_url=None,
+                  lifespan=lifespan)
     app.state.store = store
 
     @app.exception_handler(CloudError)
@@ -189,4 +214,5 @@ def create_app(settings=None, internal_key=None):
 
     from cloud.dav import application
     app.mount('/cloud/dav', WSGIMiddleware(application(store)))
+    app.add_middleware(DavBodyLimit)
     return app

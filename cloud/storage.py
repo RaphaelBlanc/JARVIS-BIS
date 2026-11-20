@@ -2,7 +2,9 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import fcntl
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -12,6 +14,8 @@ import sqlite3
 import time
 import unicodedata
 import uuid
+
+logger = logging.getLogger(__name__)
 
 
 class CloudError(Exception):
@@ -79,11 +83,13 @@ class Store:
         self.blobs, self.parts = self.root / 'objects', self.root / 'uploads'
         self.blobs.mkdir(mode=0o700, exist_ok=True)
         self.parts.mkdir(mode=0o700, exist_ok=True)
+        self.locks = self.root / 'locks'
+        self.locks.mkdir(mode=0o700, exist_ok=True)
         self.database = self.root / 'cloud.sqlite3'
         with self.connection() as db:
             db.execute('PRAGMA journal_mode=WAL')
             version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise RuntimeError('Unsupported cloud database version')
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -96,13 +102,15 @@ class Store:
                     blob TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,created REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS uploads(id TEXT PRIMARY KEY,device TEXT NOT NULL,
                     idem TEXT NOT NULL,spec TEXT NOT NULL,state TEXT NOT NULL,expires REAL NOT NULL,
-                    result TEXT,UNIQUE(device,idem));
+                    result TEXT,cleanup_pending INTEGER NOT NULL DEFAULT 1,UNIQUE(device,idem));
                 CREATE TABLE IF NOT EXISTS chunks(upload TEXT NOT NULL,idx INTEGER NOT NULL,
                     sha256 TEXT NOT NULL,size INTEGER NOT NULL,PRIMARY KEY(upload,idx));
-                PRAGMA user_version=1;
             ''')
         os.chmod(self.database, 0o600)
         with self.transaction() as db:
+            if 'cleanup_pending' not in {row[1] for row in db.execute('PRAGMA table_info(uploads)')}:
+                db.execute('ALTER TABLE uploads ADD COLUMN cleanup_pending INTEGER NOT NULL DEFAULT 1')
+            db.execute('PRAGMA user_version=2')
             db.execute('INSERT OR IGNORE INTO meta VALUES (?,?)', ('server_id', new_id()))
             db.execute('INSERT OR IGNORE INTO entries VALUES (?,?,?,?,?,?,?,?,?)',
                        ('root', None, '', 'directory', new_id(), None, 0, None, time.time()))
@@ -131,6 +139,62 @@ class Store:
 
     def envelope(self, **data):
         return dict(api_version=1, server_id=self.server_id, space_id='personal', **data)
+
+    @contextmanager
+    def _upload_lock(self, ident, blocking=True):
+        if not isinstance(ident, str) or not re.fullmatch('[0-9a-f]{32}', ident):
+            raise CloudError('not_found', 404)
+        # A bounded set of locks prevents one persistent lock file per receipt.
+        path = self.locks / str(int(ident[:2], 16) % 64)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'a') as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    def _cleanup_terminal(self, ident):
+        """Caller owns the upload lock; pending/assembling transfers keep their parts."""
+        try:
+            with self.transaction() as db:
+                row = db.execute('SELECT state,expires,cleanup_pending FROM uploads WHERE id=?', (ident,)).fetchone()
+                if row is None or not row['cleanup_pending']:
+                    return
+                if row['state'] == 'pending':
+                    if row['expires'] >= time.time():
+                        return
+                    db.execute("UPDATE uploads SET state='expired' WHERE id=?", (ident,))
+                # Includes a part written before a crash/rollback of its DB registration.
+                for path in self.parts.glob(ident + '-*'):
+                    path.unlink(missing_ok=True)
+                sync_dir(self.parts)
+                db.execute('DELETE FROM chunks WHERE upload=?', (ident,))
+                db.execute('UPDATE uploads SET cleanup_pending=0 WHERE id=?', (ident,))
+        except (OSError, sqlite3.Error):
+            # Retain the cleanup marker and its reservation until disk cleanup succeeds.
+            logger.warning('Cloud part cleanup deferred for upload %s', ident)
+
+    def collect_expired(self, ident=None):
+        """Online reaper. Never hold a DB transaction while acquiring an upload lock."""
+        try:
+            with self.connection() as db:
+                if ident is None:
+                    ids = [row[0] for row in db.execute(
+                        "SELECT id FROM uploads WHERE cleanup_pending=1 AND (state!='pending' OR expires<?) LIMIT 256",
+                        (time.time(),))]
+                else:
+                    ids = [ident]
+            for upload in ids:
+                with self._upload_lock(upload, blocking=False) as acquired:
+                    if acquired:
+                        self._cleanup_terminal(upload)
+        except (OSError, sqlite3.Error):
+            logger.warning('Cloud part cleanup will be retried')
 
     @staticmethod
     def _active(db, device):
@@ -162,6 +226,7 @@ class Store:
         with self.transaction() as db:
             db.execute('UPDATE devices SET revoked=1 WHERE id=?', (device,))
             db.execute("UPDATE uploads SET state='cancelled' WHERE device=? AND state='pending'", (device,))
+        self.collect_expired()
         return self.envelope(revoked=True)
 
     @staticmethod
@@ -227,7 +292,8 @@ class Store:
 
     @staticmethod
     def _reserved(db):
-        rows = db.execute("SELECT spec FROM uploads WHERE state='pending' AND expires>?", (time.time(),)).fetchall()
+        # Failed cleanup remains charged, including expired/cancelled/committed parts.
+        rows = db.execute("SELECT spec FROM uploads WHERE state='pending' OR cleanup_pending=1").fetchall()
         return sum(json.loads(r['spec'])['size'] for r in rows)
 
     def status(self, device):
@@ -240,6 +306,7 @@ class Store:
 
     def create_upload(self, device, spec, idem):
         # The caller supplies a complete immutable intent, not a filename used as a disk path.
+        self.collect_expired()
         spec = dict(spec)
         spec['name'] = name_checked(spec.get('name'))
         digest_checked(spec.get('sha256'))
@@ -270,7 +337,7 @@ class Store:
             if shutil.disk_usage(self.root).free < 2 * (size + reserved) + 1024**2:
                 raise CloudError('storage_full', 507)
             ident = new_id()
-            db.execute('INSERT INTO uploads VALUES (?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO uploads(id,device,idem,spec,state,expires,result) VALUES (?,?,?,?,?,?,?)',
                        (ident, device, idem, encoded, 'pending', time.time() + self.settings.ttl, None))
             return self._upload_response(db, self._get_upload(db, device, ident))
 
@@ -282,23 +349,32 @@ class Store:
         return row
 
     def _pending(self, row):
+        if row['state'] == 'expired' or (row['state'] == 'pending' and row['expires'] < time.time()):
+            raise CloudError('upload_expired', 410)
         if row['state'] != 'pending':
             raise CloudError('upload_not_pending', 409)
-        if row['expires'] < time.time():
-            raise CloudError('upload_expired', 410)
 
     def _upload_response(self, db, row):
-        chunks = [dict(r) for r in db.execute('SELECT idx,sha256,size FROM chunks WHERE upload=? ORDER BY idx', (row['id'],))]
         state = 'expired' if row['state'] == 'pending' and row['expires'] < time.time() else row['state']
+        chunks = ([dict(r) for r in db.execute('SELECT idx,sha256,size FROM chunks WHERE upload=? ORDER BY idx', (row['id'],))]
+                  if state == 'pending' else [])
         return self.envelope(upload_id=row['id'], state=state, expires=row['expires'],
                              chunk_bytes=self.settings.chunk_size, chunks=chunks,
                              result=json.loads(row['result']) if row['result'] else None)
 
     def upload_status(self, device, ident):
+        self.collect_expired(ident)
         with self.connection() as db:
             return self._upload_response(db, self._get_upload(db, device, ident))
 
     def chunk(self, device, ident, index, data, checksum):
+        with self._upload_lock(ident):
+            try:
+                return self._chunk(device, ident, index, data, checksum)
+            finally:
+                self._cleanup_terminal(ident)
+
+    def _chunk(self, device, ident, index, data, checksum):
         digest_checked(checksum)
         if hashlib.sha256(data).hexdigest() != checksum:
             raise CloudError('integrity_error', 422)
@@ -324,6 +400,13 @@ class Store:
         return self.envelope(received=index)
 
     def commit(self, device, ident):
+        with self._upload_lock(ident):
+            try:
+                return self._commit(device, ident)
+            finally:
+                self._cleanup_terminal(ident)
+
+    def _commit(self, device, ident):
         with self.connection() as db:
             row = self._get_upload(db, device, ident)
             if row['state'] == 'committed':
@@ -412,7 +495,9 @@ class Store:
             row = self._get_upload(db, device, ident)
             if row['state'] != 'committed':
                 db.execute("UPDATE uploads SET state='cancelled' WHERE id=?", (ident,))
-            return self._upload_response(db, self._get_upload(db, device, ident))
+            response = self._upload_response(db, self._get_upload(db, device, ident))
+        self.collect_expired(ident)
+        return response
 
     def maintenance(self):
         """Run with service stopped: clean orphan blobs/parts, keep all committed receipts and versions."""

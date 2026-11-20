@@ -107,3 +107,12 @@ def test_proxy_disabled_and_unavailable(gateway, monkeypatch):
     assert cap['enabled'] and cap['state'] == 'unavailable'
     monkeypatch.setenv('DEPLOY_MODE', 'local')
     assert client.get('/api/cloud/v1/status').status_code == 403
+
+
+@pytest.mark.parametrize('method', ['GET', 'HEAD', 'OPTIONS', 'PROPFIND', 'DELETE', 'COPY', 'MOVE', 'LOCK', 'UNLOCK', 'MKCOL', 'PROPPATCH'])
+def test_gateway_bounds_dav_body_before_forwarding(gateway, monkeypatch, method):
+    client, _ = gateway
+    # An unreachable upstream proves rejection occurs in the gateway itself, without Basic Auth.
+    monkeypatch.setenv('CLOUD_INTERNAL_URL', 'http://127.0.0.1:1')
+    assert client.request(method, '/cloud/dav/', content=b'x' * 8193).status_code == 413
+    assert client.request(method, '/cloud/dav/', content=iter([b'x' * 4096, b'x' * 4096, b'x'])).status_code == 413

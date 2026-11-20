@@ -15,16 +15,24 @@ HOME_RUNNER_DIR="$ROOT_DIR/home-runner"
 GATEWAY_DIR="$ROOT_DIR/gateway"
 ACTION="${1:-install}"
 
+env_python() {
+    if [ -x "$GATEWAY_DIR/.venv/bin/python" ]; then
+        "$GATEWAY_DIR/.venv/bin/python" "$@"
+    else
+        python3 "$@"
+    fi
+}
+
 case "$ACTION" in
     cloud)
         shift
-        exec python3 "$ROOT_DIR/scripts/cloud-control.py" "$@"
+        env_python "$ROOT_DIR/scripts/cloud-control.py" "$@"
+        exit $?
         ;;
     setup|wizard|config)
         python3 "$ROOT_DIR/setup_wizard.py"
         if [ -f "$ROOT_DIR/.env" ]; then
-            cp "$ROOT_DIR/.env" "$HOME_RUNNER_DIR/.env" 2>/dev/null || true
-            cp "$ROOT_DIR/.env" "$GATEWAY_DIR/.env" 2>/dev/null || true
+            env_python "$ROOT_DIR/scripts/env_files.py" "$ROOT_DIR"
         fi
         exit 0
         ;;
@@ -46,7 +54,8 @@ case "$ACTION" in
 
     start)
         echo -e "${BLUE}Démarrage de l'Assistant Personnel...${NC}"
-        "$HOME_RUNNER_DIR/.venv/bin/uvicorn" main:app --app-dir "$HOME_RUNNER_DIR" --port 8080 &
+        env_python "$ROOT_DIR/scripts/env_files.py" "$ROOT_DIR" --isolate-runner
+        env -u CLOUD_INTERNAL_KEY "$HOME_RUNNER_DIR/.venv/bin/uvicorn" main:app --app-dir "$HOME_RUNNER_DIR" --port 8080 &
         RUNNER_PID=$!
         "$GATEWAY_DIR/.venv/bin/uvicorn" main:app --app-dir "$GATEWAY_DIR" --port 8000 &
         GATEWAY_PID=$!
@@ -107,8 +116,7 @@ else
 fi
 
 if [ -f "$ROOT_DIR/.env" ]; then
-    cp "$ROOT_DIR/.env" "$HOME_RUNNER_DIR/.env" 2>/dev/null || true
-    cp "$ROOT_DIR/.env" "$GATEWAY_DIR/.env" 2>/dev/null || true
+    env_python "$ROOT_DIR/scripts/env_files.py" "$ROOT_DIR"
 fi
 
 echo -e "\n${GREEN}======================================================${NC}"

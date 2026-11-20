@@ -7,6 +7,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
+from cloud.body_limit import BodyRejected, bounded_dav_body
 
 
 def configuration():
@@ -61,7 +62,7 @@ def router(require_secret):
     async def cloud_capabilities():
         return await capability()
 
-    async def proxy(request, admin=False):
+    async def proxy(request, admin=False, content=None):
         _, enabled, url, key = configuration()
         if not enabled:
             return JSONResponse({'error': 'cloud_disabled'}, status_code=403)
@@ -71,13 +72,16 @@ def router(require_secret):
         headers['X-Cloud-Internal-Key'] = key
         if admin:
             headers['X-Cloud-Admin'] = '1'
+        if content is not None:
+            headers['content-length'] = str(len(content))
         client = httpx.AsyncClient(timeout=httpx.Timeout(60, connect=3, pool=3), trust_env=False,
                                    follow_redirects=False)
         try:
             target = url + request.url.path
             if request.url.query:
                 target += '?' + request.url.query
-            outgoing = client.build_request(request.method, target, headers=headers, content=request.stream())
+            outgoing = client.build_request(request.method, target, headers=headers,
+                                             content=content if content is not None else request.stream())
             upstream = await client.send(outgoing, stream=True)
         except httpx.HTTPError:
             await client.aclose()
@@ -119,6 +123,11 @@ def router(require_secret):
     async def dav(path: str, request: Request):
         if any(p in ('.', '..') for p in path.split('/')) or '\\' in path:
             return JSONResponse({'error': 'invalid_path'}, status_code=400)
-        return await proxy(request)
+        try:
+            content = await bounded_dav_body(request.scope, request.receive)
+        except BodyRejected as exc:
+            return JSONResponse({'error': exc.code}, status_code=exc.status,
+                                headers={'Cache-Control': 'no-store'})
+        return await proxy(request, content=content)
 
     return routes

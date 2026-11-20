@@ -14,7 +14,18 @@ Depuis le checkout JARVIS :
 ./deploy.sh cloud status
 ```
 
-`configure` crée un secret interne dans `deploy/cloud.env` et configure le gateway dans `.env` et `gateway/.env`, en conservant leurs autres valeurs. Les fichiers sont privés (`0600`) et le secret n’est pas affiché. L’opération ne lance aucun service. `up` construit et lance uniquement le stockage.
+`configure` crée un secret interne uniquement dans `deploy/cloud.env` et `gateway/.env`. Il configure le gateway sans changer les autres valeurs, les commentaires, les accents ou une adresse interne personnalisée. Les deux fichiers de clé sont privés (`0600`) et le secret n’est pas affiché. L’opération ne lance aucun service. `up` construit et lance uniquement le stockage. Le script utilise `python-dotenv`, déjà fourni dans le venv du gateway ; `deploy.sh` sélectionne cet interpréteur lorsqu’il est installé.
+
+La clé ne doit pas figurer dans le `.env` racine, chargé également par le runner, ni dans `home-runner/.env`. Les synchronisations de configuration filtrent les paramètres cloud et préservent ceux du gateway. `deploy.sh start` retire aussi la clé de l’environnement transmis au processus runner.
+
+Si une ancienne installation a copié la clé dans le `.env` racine ou du runner, `cloud configure` retire ces copies et génère automatiquement une nouvelle clé. Pour imposer une rotation même sans copie détectée :
+
+```bash
+./deploy.sh cloud configure --rotate-key
+./deploy.sh cloud up
+```
+
+Redémarrer le gateway après cette rotation pour qu’il utilise la nouvelle clé, et également le runner si l’ancienne clé était déjà chargée dans son processus. Les jetons des appareils et les données du volume ne changent pas. Les commentaires ou valeurs déjà altérés par l’ancien script ne peuvent pas être reconstruits automatiquement : vérifier les sauvegardes si nécessaire.
 
 Redémarrer ensuite le gateway avec son mécanisme habituel (service utilisateur Noctalia, service système ou déploiement propre au serveur). Il n’est pas nécessaire de redémarrer le runner IA pour le cloud. Le gateway doit charger les valeurs `CLOUD_ENABLED`, `CLOUD_INTERNAL_KEY` et `CLOUD_INTERNAL_URL` configurées.
 
@@ -56,7 +67,13 @@ Le client ne supprime jamais les sources après dépôt. La v1 accepte jusqu’�
 
 ## Entretien et sauvegarde
 
-Les anciennes versions sont conservées sans purge automatique et comptent dans le quota. Les reçus de publication sont conservés. Les morceaux terminés/expirés et objets orphelins peuvent être nettoyés **stockage arrêté**, par exemple avec Docker Compose :
+Les anciennes versions sont conservées sans purge automatique et comptent dans le quota. Les reçus de publication sont conservés. Les morceaux temporaires sont maintenant retirés automatiquement après publication, annulation ou révocation. Une tâche interne au stockage vérifie les expirations et reprend les nettoyages différés toutes les 30 secondes. Ce mécanisme est indépendant du client et de l’icône Noctalia.
+
+Un verrou par transfert empêche de supprimer un morceau encore utilisé par un assemblage. En cas d’échec du nettoyage, sa réservation reste comptée pour empêcher de remplir le disque par des annulations répétées ; le service réessaie. Les reçus d’idempotence restent disponibles après suppression des morceaux, avec `chunks=[]` pour un état terminal.
+
+Le schéma SQLite passe automatiquement de la version 1 à la version 2, sans modifier les identités, jetons ou fichiers publiés. Sauvegarder le volume avant mise à jour : l’ancien binaire refuse le schéma 2 et ne constitue pas un retour arrière compatible.
+
+Les objets complets orphelins d’un arrêt brutal restent récupérables par la maintenance **stockage arrêté**, par exemple avec Docker Compose :
 
 ```bash
 docker compose --env-file deploy/cloud.env -f deploy/cloud.compose.yaml stop jarvis-cloud
@@ -65,7 +82,7 @@ docker compose --env-file deploy/cloud.env -f deploy/cloud.compose.yaml run --rm
 docker compose --env-file deploy/cloud.env -f deploy/cloud.compose.yaml up -d jarvis-cloud
 ```
 
-Ne pas exécuter `maintenance()` pendant des transferts : le nettoyage des objets orphelins suppose l’absence de commits en cours. Le nettoyage préserve les versions publiées et les reçus d’idempotence.
+Ne pas exécuter `maintenance()` pendant des transferts : son nettoyage des objets complets orphelins suppose l’absence de commits en cours. Le nettoyage préserve les versions publiées et les reçus d’idempotence. Il n’est plus nécessaire d’arrêter le service pour récupérer les morceaux des transferts terminés ou expirés.
 
 Pour une sauvegarde cohérente, arrêter le stockage, puis exporter **tout le volume** (base SQLite, fichiers WAL éventuels, objets et états), avant de relancer le stockage. Utiliser le mécanisme de sauvegarde de volumes de votre moteur de conteneurs. Conserver séparément les configurations privées du gateway et du service. Restaurer vers un volume distinct à l’arrêt et tester des téléchargements avant de l’utiliser comme stockage principal. Le test de persistance automatisé recrée le moteur sur le même volume ; il ne remplace pas un essai de votre outil de sauvegarde.
 
@@ -75,8 +92,8 @@ Pour une sauvegarde cohérente, arrêter le stockage, puis exporter **tout le vo
 
 ```bash
 python3 -m venv /tmp/jarvis-cloud-tests
-/tmp/jarvis-cloud-tests/bin/pip install -r cloud/requirements.txt httpx==0.27.2 pytest
-/tmp/jarvis-cloud-tests/bin/python -m pytest -q tests/test_cloud.py tests/test_cloud_proxy.py
+/tmp/jarvis-cloud-tests/bin/pip install -r cloud/requirements.txt httpx==0.27.2 python-dotenv==1.0.1 pytest
+/tmp/jarvis-cloud-tests/bin/python -m pytest -q tests/test_cloud.py tests/test_cloud_proxy.py tests/test_cloud_security.py
 ```
 
 Les tests utilisent des dossiers temporaires et un serveur HTTP loopback. Aucun bot, moteur IA ou serveur de production n’est démarré. Le conteneur peut se construire séparément avec `podman build -f cloud/Dockerfile -t localhost/jarvis-cloud:test .`.
