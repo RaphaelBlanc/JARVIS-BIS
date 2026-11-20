@@ -33,6 +33,7 @@ class Settings:
     ttl: int = 86400
     max_uploads: int = 8
     max_versions: int = 10
+    confirmed_history_limit: int | None = None
 
     @classmethod
     def environment(cls):
@@ -42,7 +43,8 @@ class Settings:
                    int(os.environ.get('CLOUD_CHUNK_BYTES', 4 * 1024**2)),
                    int(os.environ.get('CLOUD_UPLOAD_TTL', 86400)),
                    int(os.environ.get('CLOUD_MAX_UPLOADS', 8)),
-                   int(os.environ.get('CLOUD_MAX_VERSIONS', 10)))
+                   int(os.environ.get('CLOUD_MAX_VERSIONS', 10)),
+                   int(os.environ['CLOUD_CONFIRMED_HISTORY_LIMIT']) if 'CLOUD_CONFIRMED_HISTORY_LIMIT' in os.environ else None)
 
 
 def new_id():
@@ -130,7 +132,12 @@ class Store:
             db.execute('INSERT OR IGNORE INTO entries VALUES (?,?,?,?,?,?,?,?,?)',
                        ('root', None, '', 'directory', new_id(), None, 0, None, time.time()))
             self.server_id = db.execute("SELECT value FROM meta WHERE key='server_id'").fetchone()[0]
+            excess = db.execute('SELECT 1 FROM versions GROUP BY file_id HAVING COUNT(*)>? LIMIT 1',
+                                (settings.max_versions,)).fetchone()
+            if excess and settings.confirmed_history_limit != settings.max_versions:
+                raise RuntimeError('Existing history exceeds limit: back up the volume, then run cloud configure --confirm-history-prune')
             self._trim_versions(db)
+        self._gc_cursor = ''
         self.collect_garbage()
 
     @contextmanager
@@ -231,28 +238,41 @@ class Store:
                 db.execute('INSERT OR IGNORE INTO garbage VALUES (?,?)', (row['blob'], row['size']))
                 db.execute('DELETE FROM versions WHERE id=?', (row['id'],))
 
+    @contextmanager
+    def _object_lock(self, exclusive=False):
+        # Shared readers never take a SQLite write lock. GC opens exclusively;
+        # all paths acquire the object lock before any database transaction.
+        fd = os.open(self.locks / 'objects', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'a') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
     def collect_garbage(self):
-        # Only explicitly retired objects: never scan live assembly targets.
-        # File opens use the same DB write lock; opened descriptors survive unlink.
         try:
-            with self.transaction() as db:
-                rows = db.execute('SELECT * FROM garbage LIMIT 256').fetchall()
-                for row in rows:
-                    referenced = db.execute('SELECT 1 FROM entries WHERE blob=? UNION SELECT 1 FROM versions WHERE blob=?',
-                                            (row['blob'], row['blob'])).fetchone()
-                    if referenced:
-                        continue
-                    (self.blobs / row['blob']).unlink(missing_ok=True)
-                sync_dir(self.blobs)
-                for row in rows:
-                    # Referenced objects retain their marker for a safe retry.
-                    db.execute('DELETE FROM garbage WHERE blob=? AND NOT EXISTS (SELECT 1 FROM entries WHERE blob=?) AND NOT EXISTS (SELECT 1 FROM versions WHERE blob=?)',
-                               (row['blob'], row['blob'], row['blob']))
+            with self.connection() as db:
+                rows = db.execute('SELECT * FROM garbage ORDER BY (blob<=?),blob LIMIT 256',
+                                  (self._gc_cursor,)).fetchall()
+            for row in rows:
+                self._gc_cursor = row['blob']
+                try:
+                    with self._object_lock(exclusive=True), self.transaction() as db:
+                        referenced = db.execute('SELECT 1 FROM entries WHERE blob=? UNION SELECT 1 FROM versions WHERE blob=?',
+                                                (row['blob'], row['blob'])).fetchone()
+                        if referenced:
+                            continue
+                        (self.blobs / row['blob']).unlink(missing_ok=True)
+                        sync_dir(self.blobs)
+                        db.execute('DELETE FROM garbage WHERE blob=?', (row['blob'],))
+                except (OSError, sqlite3.Error):
+                    logger.warning('Cloud object cleanup deferred for %s', row['blob'])
         except (OSError, sqlite3.Error):
             logger.warning('Cloud object cleanup deferred')
 
     def open_content(self, ident):
-        with self.transaction() as db:
+        with self._object_lock(), self.connection() as db:
             entry = self._entry(db, ident)
             if entry['kind'] != 'file':
                 raise CloudError('not_found', 404)
@@ -260,7 +280,7 @@ class Store:
         return entry, source
 
     def open_version(self, entry):
-        with self.transaction() as db:
+        with self._object_lock(), self.connection() as db:
             referenced = db.execute('SELECT 1 FROM entries WHERE blob=? UNION SELECT 1 FROM versions WHERE blob=?',
                                     (entry['blob'], entry['blob'])).fetchone()
             if not referenced:
@@ -573,7 +593,9 @@ class Store:
                         name = name_checked(stem[:80] + ' (' + str(number) + ')' + suffix[:30])
                         number += 1
                     existing = None
-                self._parent(db, spec['parent_id'], spec['parent_revision'])
+                parent = self._entry(db, spec['parent_id'])
+                if parent['kind'] != 'directory':
+                    raise CloudError('destination_changed', 409)
                 now, revision = time.time(), new_id()
                 if existing:
                     db.execute('INSERT INTO versions VALUES (?,?,?,?,?,?)',

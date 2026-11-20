@@ -13,12 +13,12 @@ from env_files import EnvFile, private_write
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def configure(root, rotate_key=False):
+def configure(root, rotate_key=False, confirm_history_prune=False):
     primary = EnvFile(root / '.env')
     gateway = EnvFile(root / 'gateway/.env')
     runner = EnvFile(root / 'home-runner/.env')
     storage = EnvFile(root / 'deploy/cloud.env')
-    config = primary.values | gateway.values | dict(os.environ)
+    config = gateway.values | {k: v for k, v in primary.values.items() if not k.startswith('CLOUD_')} | dict(os.environ)
     if config.get('DEPLOY_MODE', 'local').strip().lower() != 'server':
         raise ValueError('Cloud is available only with DEPLOY_MODE=server (gateway/.env).')
     leaked = 'CLOUD_INTERNAL_KEY' in primary.values or 'CLOUD_INTERNAL_KEY' in runner.values
@@ -31,7 +31,13 @@ def configure(root, rotate_key=False):
     if not gateway.values.get('CLOUD_INTERNAL_URL'):
         changes['CLOUD_INTERNAL_URL'] = config.get('CLOUD_INTERNAL_URL') or 'http://127.0.0.1:8091'
     # Parse/render every document before touching any of them. Never rewrite other bindings.
-    plan = [(storage, storage.updated({'CLOUD_INTERNAL_KEY': key})),
+    storage_changes = {'CLOUD_INTERNAL_KEY': key}
+    if confirm_history_prune:
+        limit = os.environ.get('CLOUD_MAX_VERSIONS', storage.values.get('CLOUD_MAX_VERSIONS', '10'))
+        if not 0 <= int(limit) <= 10:
+            raise ValueError('History limit must be between 0 and 10')
+        storage_changes['CLOUD_CONFIRMED_HISTORY_LIMIT'] = str(int(limit))
+    plan = [(storage, storage.updated(storage_changes)),
             (gateway, gateway.updated(changes)),
             (primary, primary.updated({'DEPLOY_MODE': 'server'} if primary.path.exists() else {}, remove={'CLOUD_INTERNAL_KEY'})),
             (runner, runner.updated(remove={'CLOUD_INTERNAL_KEY'}))]
@@ -47,14 +53,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['configure', 'up', 'down', 'status'])
     parser.add_argument('--rotate-key', action='store_true', help='Rotate the internal key (configure only)')
+    parser.add_argument('--confirm-history-prune', action='store_true', help='Approve startup pruning to the configured history limit after backup')
     args = parser.parse_args()
+    if args.confirm_history_prune and args.action != 'configure':
+        parser.error('--confirm-history-prune applies to configure only')
     gateway = ROOT / 'gateway/.env'
-    config = EnvFile(ROOT / '.env').values | EnvFile(gateway).values | dict(os.environ)
+    config = EnvFile(gateway).values | {k: v for k, v in EnvFile(ROOT / '.env').values.items() if not k.startswith('CLOUD_')} | dict(os.environ)
     if config.get('DEPLOY_MODE', 'local').strip().lower() != 'server':
         parser.error('Cloud is available only with DEPLOY_MODE=server (gateway/.env).')
     env_file = ROOT / 'deploy/cloud.env'
     if args.action == 'configure':
-        rotated = configure(ROOT, args.rotate_key)
+        rotated = configure(ROOT, args.rotate_key, args.confirm_history_prune)
         if rotated:
             print('Internal key rotated; recreate storage and restart the gateway together.')
         print('Cloud configured. Run ./deploy.sh cloud up, then restart the gateway. Data is preserved by down.')

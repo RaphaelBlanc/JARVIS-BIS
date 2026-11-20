@@ -64,7 +64,7 @@ Champs de `GET /api/cloud/v1/status` après authentification cloud :
 | `features` | objet | Capacités de cette révision |
 | `max_old_versions`, `garbage_bytes` | entiers | Limite d’historique et objets retirés restant à récupérer |
 
-La révision du parent change à chaque création de sous-dossier, publication, remplacement ou suppression d’un enfant direct. Une mutation dans un sous-dossier ne modifie pas tous ses ancêtres. La création d’un dossier ou d’un transfert, puis son commit, vérifient `parent_revision`. Une destination périmée produit `409 destination_changed` ; actualiser l’arborescence, faire confirmer la destination et créer une nouvelle intention. Pour plusieurs fichiers, relire le parent après chaque publication ; des intentions ouvertes sur une même ancienne révision peuvent se gêner, sans écrasement silencieux.
+La révision du parent change à chaque mutation d’un enfant direct. Elle est vérifiée à la création d’un dossier ou d’une intention de transfert : une valeur périmée produit `409 destination_changed`. Au commit, le serveur vérifie seulement que le parent existe encore comme dossier et applique la précondition du nom/fichier selon `policy`. Une publication ou création de dossier sans rapport ne fait donc plus échouer un transfert déjà ouvert. La suppression du fichier ciblé continue d’invalider les anciennes intentions, sur tous les appareils. Plusieurs PC peuvent publier des fichiers différents dans le même dossier ; deux écritures concurrentes sur le même fichier restent arbitrées transactionnellement.
 
 Les déplacements, renommages et suppressions de dossiers ne sont pas proposés. Chaque remplacement conserve au plus dix anciennes versions, configurables à la baisse côté serveur ; elles comptent dans le quota. La version courante n’expire pas automatiquement. Il n’existe pas encore d’écran de restauration des versions.
 
@@ -162,3 +162,8 @@ Les refus précoces du gateway ou du middleware peuvent n’avoir que `{"error":
 Un en-tête `Range` mal formé, démesuré ou hors fichier retourne `416`, sans erreur interne.
 
 Le gateway reconstruit ses en-têtes internes et refuse les routes non prévues. Les clés et jetons sont envoyés dans les en-têtes, jamais dans la query string. Les réponses ne sont pas mises en cache. Les URL internes et les traces d’erreur du serveur ne doivent pas être affichées par le client.
+
+
+## Portée des jetons et conservation
+
+Un jeton cloud autorise les opérations sur tout l’espace personnel, y compris la suppression définitive des fichiers et de toutes leurs versions. Un jeton volé peut donc effacer les données ; des remplacements répétés peuvent aussi évincer les anciennes versions de l’historique plafonné. Révoquer immédiatement un appareil perdu ou compromis via `DELETE /devices/{device_id}` avec la clé JARVIS, et conserver des sauvegardes indépendantes du service. L’historique de versions ne remplace pas ces sauvegardes.

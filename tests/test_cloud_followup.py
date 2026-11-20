@@ -46,7 +46,7 @@ def test_directory_revisions_change_for_create_replace_and_delete(service):
     assert len(set(revisions)) == 5
 
 
-def test_changed_directory_rejects_stale_mkdir_and_upload_commit(service):
+def test_changed_directory_rejects_stale_mkdir_but_allows_unrelated_upload_commit(service):
     store, _, device = service
     ident = device['device_id']
     transfer = prepared(store, ident)
@@ -54,8 +54,7 @@ def test_changed_directory_rejects_stale_mkdir_and_upload_commit(service):
     store.mkdir(ident, 'root', 'autre', revision)
     with pytest.raises(CloudError, match='destination_changed'):
         store.mkdir(ident, 'root', 'encore', revision)
-    with pytest.raises(CloudError, match='destination_changed'):
-        store.commit(ident, transfer)
+    assert store.commit(ident, transfer)['state'] == 'committed'
 
 
 def test_transfer_limit_is_per_device(service):
@@ -247,6 +246,9 @@ def test_root_shared_settings_win_and_removed_keys_disappear(configuration, monk
     (root / '.env').write_text('DEPLOY_MODE=server\nEXAMPLE_TEST=new\nCLOUD_ENABLED=0\n')
     (root / 'gateway/.env').write_text('DEPLOY_MODE=local\nEXAMPLE_TEST=old\nREMOVED_TEST=stale\nCLOUD_ENABLED=1\n')
     (root / 'home-runner/.env').write_text('REMOVED_TEST=stale\n')
+    (root / '.env').write_text('DEPLOY_MODE=server\nEXAMPLE_TEST=new\nCLOUD_ENABLED=0\nREMOVED_TEST=initial\n')
+    sync_components(root)
+    (root / '.env').write_text('DEPLOY_MODE=server\nEXAMPLE_TEST=new\nCLOUD_ENABLED=0\n')
     load_gateway(root)
     assert os.environ['EXAMPLE_TEST'] == 'new'
     assert 'REMOVED_TEST' not in os.environ
@@ -296,6 +298,9 @@ def test_cloud_configure_then_setup_sync_preserves_enabled_server(configuration)
     root = configuration
     (root / '.env').write_text('DEPLOY_MODE=local\nCLOUD_ENABLED=0\n')
     (root / 'gateway/.env').write_text('DEPLOY_MODE=server\n')
+    with pytest.raises(ValueError):
+        H.CONTROL.configure(root)
+    (root / '.env').write_text('DEPLOY_MODE=server\nCLOUD_ENABLED=0\n')
     H.CONTROL.configure(root)
     sync_components(root)
     assert EnvFile(root / '.env').values['DEPLOY_MODE'] == 'server'
@@ -433,3 +438,89 @@ def test_status_and_name_contract(service):
     response = client.post('/api/cloud/v1/directories',
                            json={'parent_id': 'root', 'parent_revision': store.entry('root')['revision'], 'name': decomposed})
     assert response.status_code == 200 and response.json()['entry']['name'] == 'ᾄ' * 80
+
+
+def test_two_devices_publish_unrelated_files_in_same_folder(service):
+    store, _, first = service
+    second = store.associate('second')['device_id']
+    a = prepared(store, first['device_id'], spec=intent(store, name='a'))
+    b = prepared(store, second, spec=intent(store, name='b'))
+    with ThreadPoolExecutor(2) as pool:
+        results = list(pool.map(lambda pair: store.commit(*pair), [(first['device_id'], a), (second, b)]))
+    assert all(r['state'] == 'committed' for r in results)
+    assert len(store.entries()['entries']) == 2
+
+
+def test_component_only_settings_and_unreadable_root_are_preserved(configuration, monkeypatch):
+    root = configuration
+    monkeypatch.delenv('COMPONENT_ONLY', raising=False)
+    (root / '.env').write_text('DEPLOY_MODE=local\nTRACKED=first\n')
+    (root / 'gateway/.env').write_text('COMPONENT_ONLY=private-setting\n')
+    sync_components(root)
+    (root / '.env').write_text('DEPLOY_MODE=local\nTRACKED="unterminated\n')
+    sync_components(root, strict=False)
+    values = EnvFile(root / 'gateway/.env').values
+    assert values['TRACKED'] == 'first' and values['COMPONENT_ONLY'] == 'private-setting'
+    load_gateway(root)
+    assert os.environ['COMPONENT_ONLY'] == 'private-setting'
+    # A manual override is preserved even when a previously shared key is removed.
+    (root / 'gateway/.env').write_text(EnvFile(root / 'gateway/.env').updated({'TRACKED': 'manual'}))
+    (root / '.env').write_text('DEPLOY_MODE=local\n')
+    sync_components(root)
+    assert EnvFile(root / 'gateway/.env').values['TRACKED'] == 'manual'
+    assert (root / 'gateway/.env.jarvis-backup').stat().st_mode & 0o077 == 0
+
+
+def test_download_open_does_not_need_sqlite_write_lock(service):
+    store, _, device = service
+    entry = published(store, device['device_id'])['result']
+    with store.transaction():
+        with ThreadPoolExecutor(1) as pool:
+            metadata, source = pool.submit(store.open_content, entry['id']).result(timeout=2)
+            with source:
+                assert source.read() == b'hello'
+
+
+def test_one_failed_gc_object_does_not_block_others(service, monkeypatch):
+    store, _, device = service
+    a = published(store, device['device_id'], name='a')['result']
+    b = published(store, device['device_id'], name='b')['result']
+    blocked = store.entry(a['id'])['blob']
+    unlink = Path.unlink
+    def selective(path, *args, **kwargs):
+        if path.name == blocked:
+            raise PermissionError('injected single-object failure')
+        return unlink(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'unlink', selective)
+    for entry in (a,b):
+        store.delete_file(device['device_id'], entry['id'], '"' + entry['revision'] + '"', uuid.uuid4().hex)
+    store.collect_garbage()
+    assert [p.name for p in store.blobs.iterdir()] == [blocked]
+    assert store.status(device['device_id'])['garbage_bytes'] == 5
+
+
+def test_existing_history_prune_requires_matching_confirmation(service):
+    from dataclasses import replace
+    store, _, device = service
+    old = published(store, device['device_id'])['result']
+    published(store, device['device_id'], old=old)
+    restrictive = replace(store.settings, max_versions=0)
+    with pytest.raises(RuntimeError, match='confirm-history-prune'):
+        Store(restrictive)
+    with store.connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM versions').fetchone()[0] == 1
+    accepted = Store(replace(restrictive, confirmed_history_limit=0))
+    with accepted.connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM versions').fetchone()[0] == 0
+
+
+def test_history_confirmation_records_exact_limit(configuration, monkeypatch):
+    root = configuration
+    monkeypatch.delenv('CLOUD_MAX_VERSIONS', raising=False)
+    (root / '.env').write_text('DEPLOY_MODE=server\n')
+    (root / 'deploy/cloud.env').write_text('CLOUD_MAX_VERSIONS=0\n')
+    H.CONTROL.configure(root, confirm_history_prune=True)
+    assert EnvFile(root / 'deploy/cloud.env').values['CLOUD_CONFIRMED_HISTORY_LIMIT'] == '0'
+    monkeypatch.setenv('CLOUD_MAX_VERSIONS', '3')
+    H.CONTROL.configure(root, confirm_history_prune=True)
+    assert EnvFile(root / 'deploy/cloud.env').values['CLOUD_CONFIRMED_HISTORY_LIMIT'] == '3'

@@ -1,6 +1,8 @@
 """Targeted dotenv edits and layered runtime configuration."""
 import argparse
 import io
+import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -118,6 +120,25 @@ def isolate_runner(root):
             private_write(doc.path, doc.updated(remove={'CLOUD_INTERNAL_KEY'}))
 
 
+def _digest(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _managed(doc):
+    path = doc.path.with_name('.env.jarvis-managed.json')
+    if path.is_symlink():
+        raise ValueError('Refusing a linked sync manifest')
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def _removed(source, doc, owned):
+    # An unreadable root binding is not proof that a setting was removed.
+    if any(b.error or any(0xdc80 <= ord(c) <= 0xdcff for c in b.original.string) for b in source.bindings):
+        return set()
+    return {k for k, digest in owned.items() if k not in source.values
+            and k in doc.values and _digest(doc.values[k]) == digest}
+
+
 def sync_components(root, strict=True):
     source = EnvFile(root / '.env', strict=strict)
     runner = EnvFile(root / 'home-runner/.env', strict=strict)
@@ -125,45 +146,58 @@ def sync_components(root, strict=True):
     if not source.path.exists():
         isolate_runner(root)
         return
-    # Cloud configuration belongs exclusively to the gateway and storage.
     shared = {k: v for k, v in source.values.items() if not k.startswith('CLOUD_')}
-    plan = [(source, source.updated(remove={'CLOUD_INTERNAL_KEY'})),
-            (runner, runner.updated(shared, remove={b.key for b in runner.bindings if b.key and b.key not in shared})),
-            (gateway, gateway.updated(shared, remove={b.key for b in gateway.bindings if b.key and not b.key.startswith('CLOUD_') and b.key not in shared}))]
-    # A cloud secret in a linked root/runner must be fixed explicitly. Other
-    # links remain readable for legacy local installs; never replace the link.
-    for doc, text in plan:
+    plan = [(source, source.updated(remove={'CLOUD_INTERNAL_KEY'}), None)]
+    for doc in (runner, gateway):
+        owned = _managed(doc)
+        remove = _removed(source, doc, owned)
+        if doc is runner:
+            remove |= {k for k in doc.values if k.startswith('CLOUD_')}
+        updated = {k: _digest(v) for k, v in shared.items()
+                   if k in owned or doc.values.get(k) != v}
+        # Keep tracking temporarily unreadable source settings for a later sync.
+        updated.update({k: v for k, v in owned.items() if k not in shared and k not in remove})
+        plan.append((doc, doc.updated(shared, remove=remove), updated))
+    for doc, text, owned in plan:
         if doc.path.is_symlink() and text != doc.text and 'CLOUD_INTERNAL_KEY' in doc.values and doc is not gateway:
             raise ValueError('Cloud key in linked configuration; remove it explicitly')
-    for doc, text in plan:
+    for doc, text, owned in plan:
+        if doc.path.is_symlink():
+            if text != doc.text:
+                warnings.warn(f'Leaving linked configuration unchanged: {doc.path}')
+            continue
         if text != doc.text or not doc.path.exists():
-            if doc.path.is_symlink() and not strict:
-                warnings.warn(f'Leaving linked component configuration unchanged: {doc.path}')
-            else:
-                private_write(doc.path, text)
+            if owned is not None and doc.path.exists():
+                # Never retain a legacy cloud key in a runner backup.
+                backup = doc.updated(remove={'CLOUD_INTERNAL_KEY'}) if doc is runner else doc.text
+                private_write(doc.path.with_name('.env.jarvis-backup'), backup)
+            private_write(doc.path, text)
+        if owned is not None:
+            private_write(doc.path.with_name('.env.jarvis-managed.json'), json.dumps(owned, sort_keys=True))
+
+
+def _component_values(source, component):
+    values = dict(component.values)
+    if source.path.exists():
+        for key in _removed(source, component, _managed(component)):
+            values.pop(key, None)
+        values.update({k: v for k, v in source.values.items() if not k.startswith('CLOUD_')})
+    return values
 
 
 def load_gateway(root):
-    """Process environment wins; root owns shared settings, gateway owns CLOUD_*.
-
-    Component-only installs without a root .env keep their existing semantics.
-    Values absent at the root cannot leak back from a stale component copy.
-    """
+    """Environment > root shared settings > component-only settings; CLOUD_* is dedicated."""
     root = Path(root)
     source = EnvFile(root / '.env', strict=False)
     component = EnvFile(root / 'gateway/.env', strict=False)
-    values = ({k: v for k, v in source.values.items() if not k.startswith('CLOUD_')}
-              if source.path.exists() else dict(component.values))
-    values.update({k: v for k, v in component.values.items() if k.startswith('CLOUD_')})
+    values = _component_values(source, component)
     load_dotenv(stream=io.StringIO(''.join(k + '=' + EnvFile._quote(v) + '\n' for k, v in values.items())), override=False)
 
 
 def load_shared(root, component=None):
     root = Path(root)
-    path = root / '.env'
-    if not path.exists() and component:
-        path = root / component / '.env'
-    values = EnvFile(path, strict=False).values
+    source = EnvFile(root / '.env', strict=False)
+    values = _component_values(source, EnvFile(root / component / '.env', strict=False)) if component else source.values
     load_dotenv(stream=io.StringIO(''.join(k + '=' + EnvFile._quote(v) + '\n' for k, v in values.items()
                                         if not k.startswith('CLOUD_'))), override=False)
 

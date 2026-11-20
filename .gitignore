@@ -60,3 +60,7 @@ client_secret*.json
 # Cloud secrets and local test volumes
 deploy/cloud.env
 .cloud-data/
+
+# Private component sync metadata and backups
+.env.jarvis-managed.json
+.env.jarvis-backup
