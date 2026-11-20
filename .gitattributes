@@ -1,0 +1,3 @@
+# Preserve raw unified diff context and Git's tab separator for filenames with spaces.
+integrations/noctalia-config/cloud/*.patch -whitespace
+integrations/noctalia-config/cloud/*.diff -whitespace
