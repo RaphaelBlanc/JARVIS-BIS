@@ -179,7 +179,7 @@ def test_v1_migration_preserves_identity_and_reclaims_old_parts(service):
     assert restored.authenticate(device['token']) == device['device_id']
     assert list(restored.parts.iterdir()) == []
     with restored.connection() as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 3
         assert db.execute('SELECT state FROM uploads WHERE id=?', (transfer,)).fetchone()[0] == 'committed'
 
 
@@ -280,12 +280,22 @@ def test_deploy_start_cannot_pass_cloud_key_to_runner(configuration):
 
 @pytest.mark.skipif(importlib.util.find_spec('discord') is None or importlib.util.find_spec('telegram') is None,
                     reason='Gateway bot dependencies required for the full import regression')
-def test_gateway_reads_its_cloud_configuration_before_root_defaults(configuration):
+@pytest.mark.parametrize('kind', ['valid', 'syntax', 'encoding', 'symlink'])
+def test_gateway_reads_root_shared_and_gateway_cloud_configuration(configuration, kind):
     root = configuration
-    for directory in ('core', 'gateway', 'cloud'):
+    for directory in ('core', 'gateway', 'cloud', 'scripts'):
         shutil.copytree(ROOT / directory, root / directory, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns('.env', '__pycache__', '.venv', '*.sqlite3', '*.db'))
-    (root / '.env').write_text('DEPLOY_MODE=local\nCLOUD_ENABLED=0\n')
+    (root / '.env').write_text('DEPLOY_MODE=server\nCLOUD_ENABLED=0\nSECRET_KEY=test-only\n')
+    if kind == 'syntax':
+        with (root / '.env').open('ab') as f:
+            f.write(b'UNRELATED="unterminated\n')
+    elif kind == 'encoding':
+        with (root / '.env').open('ab') as f:
+            f.write(b'UNRELATED=\xff\n')
+    elif kind == 'symlink':
+        (root / '.env').rename(root / 'linked.env')
+        (root / '.env').symlink_to('linked.env')
     (root / 'gateway/.env').write_text('DEPLOY_MODE=server\nCLOUD_ENABLED=1\nCLOUD_INTERNAL_KEY=' + 'x' * 32 + '\nSECRET_KEY=test-only\n')
     env = {k: v for k, v in os.environ.items() if not k.startswith('CLOUD_') and k not in ('DEPLOY_MODE', 'SECRET_KEY')}
     env['PYTHONPATH'] = str(root) + os.pathsep + str(root / 'gateway')

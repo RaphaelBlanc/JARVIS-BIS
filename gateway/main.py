@@ -24,14 +24,14 @@ import uuid
 import json
 import re
 
-from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-# Load this component before core/config.py adds root defaults to os.environ.
-# Cloud credentials and flags belong to the gateway, not the runner's root config.
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# Shared settings come from the root, CLOUD_* from this component; the service
+# environment overrides both. Do this before importing modules with settings.
+from scripts.env_files import load_gateway
+load_gateway(Path(__file__).resolve().parent.parent)
 
 from core.hardware_relay import HARDWARE_RELAY
 from core.node_hub import NODE_HUB
@@ -419,7 +419,7 @@ app = FastAPI(
 app.include_router(telegram_router)
 
 # Optional storage remains independent from the runner and its chat payload limits.
-from cloud_proxy import capability as cloud_capability, router as cloud_router
+from cloud_proxy import capability as cloud_capability, router as cloud_router, rate_limited_cloud_route
 app.include_router(cloud_router(require_secret))
 
 
@@ -431,9 +431,9 @@ async def limit_desktop_api(request: Request, call_next):
     """
     if (
         DESKTOP_RATE_LIMIT > 0
-        and request.url.path.startswith("/api/")
-        and request.url.path not in {"/api/health"}
-        and not request.url.path.startswith("/api/cloud/")
+        and request.scope['path'].startswith("/api/")
+        and request.scope['path'] not in {"/api/health"}
+        and (not request.scope['path'].startswith("/api/cloud/") or rate_limited_cloud_route(request.method, request.scope['path']))
     ):
         ip = _client_ip(request)
         now = time.monotonic()

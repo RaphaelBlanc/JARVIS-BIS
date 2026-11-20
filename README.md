@@ -80,6 +80,8 @@ flowchart LR
 
 En déploiement `server`, un conteneur de stockage persistant fournit un drive commun aux PC Noctalia associés : navigation WebDAV en lecture seule et fenêtre d’envoi avec gestion des conflits, transferts par morceaux et reprise explicite. Les nouveaux dépôts hors ligne sont refusés. Le cloud reste désactivé en mode local.
 
+Le backend annonce aussi la suppression de fichiers sous `If-Match` et conserve au plus dix anciennes versions par fichier. Le client officiel Noctalia et son interface sont suivis dans [l’issue #46](https://github.com/abcdef123456-wq/noctalia-config/issues/46).
+
 Voir [le déploiement cloud](docs/CLOUD_DEPLOIEMENT.md) et [le contrat API v1](docs/CLOUD_API.md).
 
 Chaque outil est un module autonome activable ou désactivable à l'installation :

@@ -20,6 +20,26 @@ class TestDesktopAPI(unittest.TestCase):
         self.client = TestClient(main.app)
         self.auth_headers = {"X-Secret-Key": "test-secret-key-123"}
 
+    def test_cloud_admin_routes_are_rate_limited_without_limiting_chunks(self):
+        with patch.object(main, 'DESKTOP_RATE_LIMIT', 1):
+            try:
+                for method, path in [('GET', '/api/cloud/v1/capabilities'),
+                                     ('POST', '/api/cloud/v1/devices'),
+                                     ('DELETE', '/api/cloud/v1/devices/' + 'a' * 32)]:
+                    main.reset_rate_limit()
+                    assert self.client.request(method, path).status_code == 401
+                    assert self.client.request(method, path).status_code == 429
+                main.reset_rate_limit()
+                for _ in range(3):
+                    response = self.client.put('/api/cloud/v1/uploads/' + 'b' * 32 + '/chunks/0', content=b'test')
+                    assert response.status_code != 429
+                main.reset_rate_limit()
+                headers = {'Host': 'evil.invalid/unrelated'}
+                assert self.client.get('/api/cloud/v1/capabilities', headers=headers).status_code == 401
+                assert self.client.get('/api/cloud/v1/capabilities', headers=headers).status_code == 429
+            finally:
+                main.reset_rate_limit()
+
     def test_ask_without_secret_fails(self):
         resp = self.client.post("/api/ask", json={"prompt": "Bonjour"})
         self.assertEqual(resp.status_code, 401)

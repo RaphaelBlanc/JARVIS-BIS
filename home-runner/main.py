@@ -19,7 +19,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -56,7 +55,8 @@ from memory import (
 # Chargement de la configuration
 # ---------------------------------------------------------------------------
 
-load_dotenv()  # Charge .env si présent
+from scripts.env_files import load_shared
+load_shared(Path(__file__).resolve().parent.parent, 'home-runner')
 
 SECRET_KEY: str = os.environ.get("SECRET_KEY", "")
 PORT: int = int(os.environ.get("PORT", "8080"))

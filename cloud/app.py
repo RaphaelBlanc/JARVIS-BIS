@@ -1,6 +1,7 @@
 """Internal service. Reach through the gateway, never expose this port publicly."""
 import hmac
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 import os
 import re
@@ -11,11 +12,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.wsgi import WSGIMiddleware
+from starlette.background import BackgroundTask
 
 from cloud.storage import CloudError, Settings, Store
 from cloud.body_limit import DavBodyLimit
 
 PART_CLEANUP_INTERVAL = 30
+logger = logging.getLogger(__name__)
 
 
 class Model(BaseModel):
@@ -55,7 +58,11 @@ def create_app(settings=None, internal_key=None):
 
         async def expire_parts():
             while not stop.is_set():
-                await asyncio.to_thread(store.collect_expired)
+                try:
+                    await asyncio.to_thread(store.collect_expired)
+                    await asyncio.to_thread(store.collect_garbage)
+                except Exception:
+                    logger.exception('Cloud cleanup failed unexpectedly; retrying next cycle')
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=PART_CLEANUP_INTERVAL)
                 except TimeoutError:
@@ -124,7 +131,7 @@ def create_app(settings=None, internal_key=None):
 
     @app.get('/health')
     def health():
-        return store.envelope(state='ready')
+        return store.envelope(state='ready', features=store.features())
 
     prefix = '/api/cloud/v1'
 
@@ -150,16 +157,15 @@ def create_app(settings=None, internal_key=None):
 
     @app.get(prefix + '/files/{file_id}/content')
     def download(file_id: str, request: Request, ident=Depends(device)):
-        entry = store.entry(file_id)
-        if entry['kind'] != 'file':
-            raise CloudError('not_found', 404)
+        entry, source = store.open_content(file_id)
         etag = '"' + entry['revision'] + '"'
         start, end, code = 0, entry['size'] - 1, 200
         headers = {'ETag': etag, 'Accept-Ranges': 'bytes'}
         value = request.headers.get('range', '')
         if value and request.headers.get('if-range', etag) == etag:
-            match = re.fullmatch(r'bytes=(\d*)-(\d*)', value)
+            match = re.fullmatch(r'bytes=([0-9]{0,20})-([0-9]{0,20})', value)
             if not match or not any(match.groups()) or not entry['size']:
+                source.close()
                 return JSONResponse({'error': 'invalid_range'}, status_code=416,
                                     headers={'Content-Range': f"bytes */{entry['size']}"})
             left, right = match.groups()
@@ -169,6 +175,7 @@ def create_app(settings=None, internal_key=None):
             else:
                 start = max(0, entry['size'] - int(right))
             if start > end:
+                source.close()
                 return JSONResponse({'error': 'invalid_range'}, status_code=416,
                                     headers={'Content-Range': f"bytes */{entry['size']}"})
             code = 206
@@ -176,7 +183,7 @@ def create_app(settings=None, internal_key=None):
         headers['Content-Length'] = str(max(0, end - start + 1))
 
         def content():
-            with (store.blobs / entry['blob']).open('rb') as source:
+            with source:
                 source.seek(start)
                 remaining = end - start + 1
                 while remaining > 0:
@@ -186,7 +193,13 @@ def create_app(settings=None, internal_key=None):
                     remaining -= len(data)
                     yield data
 
-        return StreamingResponse(content(), status_code=code, headers=headers, media_type='application/octet-stream')
+        return StreamingResponse(content(), status_code=code, headers=headers, media_type='application/octet-stream',
+                                 background=BackgroundTask(source.close))
+
+    @app.delete(prefix + '/files/{file_id}')
+    def delete_file(file_id: str, if_match: str = Header(default=''),
+                    idempotency_key: str = Header(default=''), ident=Depends(device)):
+        return store.delete_file(ident, file_id, if_match, idempotency_key)
 
     @app.post(prefix + '/uploads')
     def create_upload(body: Upload, idempotency_key: str = Header(default=''), ident=Depends(device)):

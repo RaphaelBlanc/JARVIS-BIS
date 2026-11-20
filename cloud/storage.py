@@ -32,6 +32,7 @@ class Settings:
     chunk_size: int = 4 * 1024**2
     ttl: int = 86400
     max_uploads: int = 8
+    max_versions: int = 10
 
     @classmethod
     def environment(cls):
@@ -40,7 +41,8 @@ class Settings:
                    int(os.environ.get('CLOUD_MAX_FILE_BYTES', 5 * 1024**3)),
                    int(os.environ.get('CLOUD_CHUNK_BYTES', 4 * 1024**2)),
                    int(os.environ.get('CLOUD_UPLOAD_TTL', 86400)),
-                   int(os.environ.get('CLOUD_MAX_UPLOADS', 8)))
+                   int(os.environ.get('CLOUD_MAX_UPLOADS', 8)),
+                   int(os.environ.get('CLOUD_MAX_VERSIONS', 10)))
 
 
 def new_id():
@@ -78,6 +80,8 @@ class Store:
             raise ValueError('Cloud limits must be positive')
         if settings.chunk_size > 16 * 1024**2:
             raise ValueError('CLOUD_CHUNK_BYTES must be at most 16 MiB')
+        if not 0 <= settings.max_versions <= 10:
+            raise ValueError('CLOUD_MAX_VERSIONS must be between 0 and 10')
         self.root = settings.data_dir.resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.blobs, self.parts = self.root / 'objects', self.root / 'uploads'
@@ -89,7 +93,7 @@ class Store:
         with self.connection() as db:
             db.execute('PRAGMA journal_mode=WAL')
             version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise RuntimeError('Unsupported cloud database version')
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -108,13 +112,25 @@ class Store:
             ''')
         os.chmod(self.database, 0o600)
         with self.transaction() as db:
+            db.execute('CREATE TABLE IF NOT EXISTS garbage(blob TEXT PRIMARY KEY,size INTEGER NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS tombstones(id TEXT PRIMARY KEY,parent TEXT NOT NULL,name TEXT NOT NULL,revision TEXT NOT NULL,deleted REAL NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS deletions(device TEXT NOT NULL,idem TEXT NOT NULL,file_id TEXT NOT NULL,revision TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(device,idem))')
             if 'cleanup_pending' not in {row[1] for row in db.execute('PRAGMA table_info(uploads)')}:
                 db.execute('ALTER TABLE uploads ADD COLUMN cleanup_pending INTEGER NOT NULL DEFAULT 1')
-            db.execute('PRAGMA user_version=2')
+            if version < 3:
+                # Historical committed receipts usually have no parts left.
+                # Do not charge their complete source size merely for migrating.
+                for row in db.execute("SELECT id FROM uploads WHERE state!='pending'").fetchall():
+                    if not any(self.parts.glob(row['id'] + '-*')):
+                        db.execute('UPDATE uploads SET cleanup_pending=0 WHERE id=?', (row['id'],))
+                        db.execute('DELETE FROM chunks WHERE upload=?', (row['id'],))
+            db.execute('PRAGMA user_version=3')
             db.execute('INSERT OR IGNORE INTO meta VALUES (?,?)', ('server_id', new_id()))
             db.execute('INSERT OR IGNORE INTO entries VALUES (?,?,?,?,?,?,?,?,?)',
                        ('root', None, '', 'directory', new_id(), None, 0, None, time.time()))
             self.server_id = db.execute("SELECT value FROM meta WHERE key='server_id'").fetchone()[0]
+            self._trim_versions(db)
+        self.collect_garbage()
 
     @contextmanager
     def connection(self):
@@ -195,6 +211,93 @@ class Store:
                         self._cleanup_terminal(upload)
         except (OSError, sqlite3.Error):
             logger.warning('Cloud part cleanup will be retried')
+
+    def features(self):
+        return {'file_delete': True, 'delete_if_match': True, 'delete_idempotency': True,
+                'max_old_versions': self.settings.max_versions}
+
+    @staticmethod
+    def _touch(db, parent):
+        db.execute('UPDATE entries SET revision=?,modified=? WHERE id=?', (new_id(), time.time(), parent))
+
+    def _trim_versions(self, db, file_id=None):
+        files = [file_id] if file_id else [r[0] for r in db.execute('SELECT DISTINCT file_id FROM versions')]
+        for ident in files:
+            old = db.execute('SELECT id,blob,size FROM versions WHERE file_id=? ORDER BY created DESC,rowid DESC LIMIT -1 OFFSET ?',
+                             (ident, self.settings.max_versions)).fetchall()
+            for row in old:
+                db.execute('INSERT OR IGNORE INTO garbage VALUES (?,?)', (row['blob'], row['size']))
+                db.execute('DELETE FROM versions WHERE id=?', (row['id'],))
+
+    def collect_garbage(self):
+        # Only explicitly retired objects: never scan live assembly targets.
+        # File opens use the same DB write lock; opened descriptors survive unlink.
+        try:
+            with self.transaction() as db:
+                rows = db.execute('SELECT * FROM garbage LIMIT 256').fetchall()
+                for row in rows:
+                    referenced = db.execute('SELECT 1 FROM entries WHERE blob=? UNION SELECT 1 FROM versions WHERE blob=?',
+                                            (row['blob'], row['blob'])).fetchone()
+                    if referenced:
+                        continue
+                    (self.blobs / row['blob']).unlink(missing_ok=True)
+                sync_dir(self.blobs)
+                for row in rows:
+                    # Referenced objects retain their marker for a safe retry.
+                    db.execute('DELETE FROM garbage WHERE blob=? AND NOT EXISTS (SELECT 1 FROM entries WHERE blob=?) AND NOT EXISTS (SELECT 1 FROM versions WHERE blob=?)',
+                               (row['blob'], row['blob'], row['blob']))
+        except (OSError, sqlite3.Error):
+            logger.warning('Cloud object cleanup deferred')
+
+    def open_content(self, ident):
+        with self.transaction() as db:
+            entry = self._entry(db, ident)
+            if entry['kind'] != 'file':
+                raise CloudError('not_found', 404)
+            source = (self.blobs / entry['blob']).open('rb')
+        return entry, source
+
+    def open_version(self, entry):
+        with self.transaction() as db:
+            referenced = db.execute('SELECT 1 FROM entries WHERE blob=? UNION SELECT 1 FROM versions WHERE blob=?',
+                                    (entry['blob'], entry['blob'])).fetchone()
+            if not referenced:
+                raise CloudError('not_found', 404)
+            return (self.blobs / entry['blob']).open('rb')
+
+    def delete_file(self, device, ident, revision, idem):
+        if not revision:
+            raise CloudError('precondition_required', 428)
+        if not isinstance(idem, str) or not re.fullmatch('[A-Za-z0-9_-]{16,128}', idem):
+            raise CloudError('invalid_idempotency_key')
+        with self.transaction() as db:
+            self._active(db, device)
+            previous = db.execute('SELECT * FROM deletions WHERE device=? AND idem=?', (device, idem)).fetchone()
+            if previous:
+                if (previous['file_id'], previous['revision']) != (ident, revision):
+                    raise CloudError('idempotency_conflict', 409)
+                return json.loads(previous['result'])
+            entry = self._entry(db, ident)
+            if entry['kind'] != 'file':
+                raise CloudError('not_a_file', 409)
+            if revision != '"' + entry['revision'] + '"':
+                raise CloudError('version_conflict', 412, current=self.public(entry))
+            db.execute('INSERT INTO tombstones VALUES (?,?,?,?,?)',
+                       (ident, entry['parent'], entry['name'], entry['revision'], time.time()))
+            for row in db.execute("SELECT id,spec FROM uploads WHERE state='pending'").fetchall():
+                spec = json.loads(row['spec'])
+                if spec['parent_id'] == entry['parent'] and spec['name'] == entry['name']:
+                    db.execute("UPDATE uploads SET state='invalidated' WHERE id=?", (row['id'],))
+            db.execute('INSERT OR IGNORE INTO garbage VALUES (?,?)', (entry['blob'], entry['size']))
+            db.execute('INSERT OR IGNORE INTO garbage SELECT blob,size FROM versions WHERE file_id=?', (ident,))
+            db.execute('DELETE FROM versions WHERE file_id=?', (ident,))
+            db.execute('DELETE FROM entries WHERE id=?', (ident,))
+            self._touch(db, entry['parent'])
+            result = self.envelope(deleted=True, file_id=ident, revision=entry['revision'])
+            db.execute('INSERT INTO deletions VALUES (?,?,?,?,?)', (device, idem, ident, revision, json.dumps(result)))
+        self.collect_expired()
+        self.collect_garbage()
+        return result
 
     @staticmethod
     def _active(db, device):
@@ -278,6 +381,7 @@ class Store:
                            (ident, parent, name, 'directory', new_id(), None, 0, None, time.time()))
             except sqlite3.IntegrityError:
                 raise CloudError('name_conflict', 409) from None
+            self._touch(db, parent)
             return self.envelope(entry=self.public(self._entry(db, ident)))
 
     def _parent(self, db, ident, revision):
@@ -294,7 +398,7 @@ class Store:
     def _reserved(db):
         # Failed cleanup remains charged, including expired/cancelled/committed parts.
         rows = db.execute("SELECT spec FROM uploads WHERE state='pending' OR cleanup_pending=1").fetchall()
-        return sum(json.loads(r['spec'])['size'] for r in rows)
+        return sum(json.loads(r['spec'])['size'] for r in rows) + db.execute('SELECT COALESCE(SUM(size),0) FROM garbage').fetchone()[0]
 
     def status(self, device):
         with self.connection() as db:
@@ -302,11 +406,14 @@ class Store:
             return self.envelope(state='ready', device_id=device, quota_bytes=self.settings.quota,
                                  used_bytes=self._usage(db), reserved_bytes=self._reserved(db),
                                  max_file_bytes=self.settings.max_file, chunk_bytes=self.settings.chunk_size,
-                                 root=self.public(self._entry(db, 'root')), webdav='read_only')
+                                 root=self.public(self._entry(db, 'root')), webdav='read_only',
+                                 features=self.features(), max_old_versions=self.settings.max_versions,
+                                 garbage_bytes=db.execute('SELECT COALESCE(SUM(size),0) FROM garbage').fetchone()[0])
 
     def create_upload(self, device, spec, idem):
         # The caller supplies a complete immutable intent, not a filename used as a disk path.
         self.collect_expired()
+        self.collect_garbage()
         spec = dict(spec)
         spec['name'] = name_checked(spec.get('name'))
         digest_checked(spec.get('sha256'))
@@ -328,7 +435,7 @@ class Store:
                     raise CloudError('idempotency_conflict', 409)
                 return self._upload_response(db, old)
             self._parent(db, spec.get('parent_id'), spec.get('parent_revision'))
-            if db.execute("SELECT COUNT(*) FROM uploads WHERE state='pending' AND expires>?", (time.time(),)).fetchone()[0] >= self.settings.max_uploads:
+            if db.execute("SELECT COUNT(*) FROM uploads WHERE device=? AND state='pending' AND expires>?", (device, time.time())).fetchone()[0] >= self.settings.max_uploads:
                 raise CloudError('too_many_transfers', 429)
             reserved = self._reserved(db)
             if self._usage(db) + reserved + size > self.settings.quota:
@@ -349,6 +456,8 @@ class Store:
         return row
 
     def _pending(self, row):
+        if row['state'] == 'invalidated':
+            raise CloudError('upload_invalidated', 410)
         if row['state'] == 'expired' or (row['state'] == 'pending' and row['expires'] < time.time()):
             raise CloudError('upload_expired', 410)
         if row['state'] != 'pending':
@@ -405,6 +514,7 @@ class Store:
                 return self._commit(device, ident)
             finally:
                 self._cleanup_terminal(ident)
+                self.collect_garbage()
 
     def _commit(self, device, ident):
         with self.connection() as db:
@@ -440,7 +550,6 @@ class Store:
                 if current['state'] == 'committed':
                     return self._upload_response(db, current)
                 self._pending(current)
-                self._parent(db, spec['parent_id'], spec['parent_revision'])
                 existing = db.execute('SELECT * FROM entries WHERE parent=? AND name=?',
                                       (spec['parent_id'], spec['name'])).fetchone()
                 name = spec['name']
@@ -457,6 +566,7 @@ class Store:
                         name = name_checked(stem[:80] + ' (' + str(number) + ')' + suffix[:30])
                         number += 1
                     existing = None
+                self._parent(db, spec['parent_id'], spec['parent_revision'])
                 now, revision = time.time(), new_id()
                 if existing:
                     db.execute('INSERT INTO versions VALUES (?,?,?,?,?,?)',
@@ -468,6 +578,8 @@ class Store:
                     entry_id = new_id()
                     db.execute('INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?)',
                                (entry_id, spec['parent_id'], name, 'file', revision, blob, total, spec['sha256'], now))
+                self._touch(db, spec['parent_id'])
+                self._trim_versions(db, entry_id)
                 result = self.public(self._entry(db, entry_id))
                 db.execute("UPDATE uploads SET state='committed',result=? WHERE id=?", (json.dumps(result), ident))
                 response = self._upload_response(db, self._get_upload(db, device, ident))
@@ -493,7 +605,7 @@ class Store:
     def cancel(self, device, ident):
         with self.transaction() as db:
             row = self._get_upload(db, device, ident)
-            if row['state'] != 'committed':
+            if row['state'] == 'pending':
                 db.execute("UPDATE uploads SET state='cancelled' WHERE id=?", (ident,))
             response = self._upload_response(db, self._get_upload(db, device, ident))
         self.collect_expired(ident)

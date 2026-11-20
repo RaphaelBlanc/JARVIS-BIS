@@ -1,6 +1,6 @@
 # Installer et tester le cloud distant
 
-Le cloud est optionnel et fonctionne uniquement en mode `server`. La mise à jour du serveur reste une opération explicite. L’interface et les patchs pour Noctalia se trouvent dans `integrations/noctalia-config/cloud/`.
+Le cloud est optionnel et fonctionne uniquement en mode `server`. La mise à jour du serveur reste une opération explicite. Le client officiel Noctalia est suivi dans [l’issue #46](https://github.com/abcdef123456-wq/noctalia-config/issues/46) ; les patchs du prototype sont des références, pas des changements officiels du rice.
 
 ## Installation sur le serveur
 
@@ -18,6 +18,8 @@ Depuis le checkout JARVIS :
 
 La clé ne doit pas figurer dans le `.env` racine, chargé également par le runner, ni dans `home-runner/.env`. Les synchronisations de configuration filtrent les paramètres cloud et préservent ceux du gateway. `deploy.sh start` retire aussi la clé de l’environnement transmis au processus runner.
 
+Cette séparation évite de transmettre inutilement le secret au runner ; elle **ne l’isole pas du même compte Unix**. Un runner disposant d’un outil shell peut encore lire `gateway/.env` et `deploy/cloud.env` si ces fichiers appartiennent à son compte. Une isolation réelle exige des comptes distincts et des permissions adaptées pour le runner et le couple gateway/stockage. Le conteneur non privilégié ne fournit pas cette séparation à lui seul.
+
 Si une ancienne installation a copié la clé dans le `.env` racine ou du runner, `cloud configure` retire ces copies et génère automatiquement une nouvelle clé. Pour imposer une rotation même sans copie détectée :
 
 ```bash
@@ -33,11 +35,23 @@ Le port du stockage `8091` est publié sur **127.0.0.1 uniquement**, pour un gat
 
 Le volume Compose `jarvis-cloud-data` contient fichiers, versions, morceaux et base SQLite. Le conteneur tourne sans root, avec son système de fichiers en lecture seule, un répertoire temporaire borné et aucune capacité Linux. Le poste Noctalia n’a pas besoin de Docker ou Podman pour accéder au drive.
 
-Les limites se règlent dans `deploy/cloud.env` : `CLOUD_QUOTA_BYTES`, `CLOUD_MAX_FILE_BYTES`, `CLOUD_CHUNK_BYTES` et `CLOUD_UPLOAD_TTL`. Recréer le conteneur avec `cloud up` après modification. Le `CLOUD_INTERNAL_KEY` doit être identique côté stockage et gateway. Une rotation se fait en changeant ces deux configurations, puis en redémarrant les deux services.
+Les limites se règlent dans `deploy/cloud.env` : `CLOUD_QUOTA_BYTES`, `CLOUD_MAX_FILE_BYTES`, `CLOUD_CHUNK_BYTES`, `CLOUD_UPLOAD_TTL`, `CLOUD_MAX_UPLOADS` (8 par appareil) et `CLOUD_MAX_VERSIONS` (10 anciennes versions par fichier, de 0 à 10). Recréer le conteneur avec `cloud up` après modification. Le `CLOUD_INTERNAL_KEY` doit être identique côté stockage et gateway. Une rotation se fait en changeant ces deux configurations, puis en redémarrant les deux services.
+
+L’image Python est figée par digest ; `cloud/requirements.lock` fixe aussi les dépendances indirectes du stockage. `pip check` valide leur cohérence pendant la construction, qui ne résout pas de dépendance supplémentaire. Lors d’une mise à jour de dépendances, reconstruire un environnement Python 3.12 propre depuis `cloud/requirements.txt`, exporter toute sa fermeture avec `pip freeze`, relire le lock et le digest puis rejouer les tests et le parcours conteneur. Le verrouillage décrit les versions validées, pas une promesse de maintenance de sécurité automatique. [Installations reproductibles, documentation pip](https://pip.pypa.io/en/stable/topics/repeatable-installs/).
+
+## Configuration et démarrage hors Noctalia
+
+Avec le déploiement autonome `deploy.sh`, le **`.env` racine fait foi pour tous les réglages communs**, dont `DEPLOY_MODE`. Les `CLOUD_*` du gateway font foi pour le cloud ; ceux de la racine ne sont pas recopiés. Les variables déjà définies dans l’environnement du service, notamment par `EnvironmentFile` de systemd, gardent priorité. Sans `.env` racine, une installation par composant conserve sa configuration propre.
+
+`setup`, l’installation et `start` synchronisent les copies : les réglages non cloud absents à la racine sont retirés des `.env` des composants. Mettre donc les paramètres communs à conserver à la racine avant de lancer ces commandes. `cloud configure` met également le mode racine à `server` lorsqu’un fichier racine existe ; un `setup` conservant ce mode ne désactive pas le cloud. Un passage explicite à `local` ou `pc-agent` le désactive toujours.
+
+Au démarrage, une liaison dotenv non cloud invalide ou contenant des octets non UTF-8 est ignorée avec un avertissement indiquant fichier et ligne, sans afficher sa valeur. Les autres paramètres restent chargés. Un lien symbolique ordinaire peut être lu ; la synchronisation ne remplace pas ce lien. Les réglages cloud ou de mode mal formés restent refusés, ainsi qu’une ancienne clé cloud à retirer d’un fichier lié. Les commandes qui éditent explicitement la configuration cloud restent strictes et refusent les liens symboliques. Les valeurs modifiées conservent leurs vraies lignes multiples plutôt que des échappements JSON, conformément à [EnvironmentFile de systemd](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#EnvironmentFile=).
+
+Avec Noctalia, utiliser son déployeur et ses services habituels ; seules les commandes `./deploy.sh cloud configure|up|status|down` concernent le conteneur. Ne pas lancer `deploy.sh start` ou `setup` pour piloter l’installation du rice.
 
 ## Depuis Noctalia
 
-Installer le patch Noctalia livré, puis conserver la connexion JARVIS distante habituelle. Dans les réglages « Agents IA (coucou) », ouvrir « Cloud JARVIS distant », associer le PC et activer l’affichage dans la barre. Les commandes équivalentes sont :
+Conserver la connexion JARVIS distante habituelle. Théo écrit le client officiel depuis le contrat API ; sa disponibilité et ses commandes sont à vérifier dans le rice. Dans le prototype local déjà installé pour les essais, l’association et l’affichage utilisent :
 
 ```bash
 nc-cloud associer
@@ -49,7 +63,7 @@ Le trousseau Secret Service doit être disponible et déverrouillé (`secret-too
 
 `nc-cloud ouvrir` monte le drive à la demande avec Gio, puis ajoute le favori « Cloud JARVIS » sans toucher aux autres favoris. L’accès natif est en lecture seule. Les envois passent par le glisser-déposer dans la barre/fenêtre, `nc-cloud deposer /chemin/fichier`, ou « Scripts → Envoyer vers Cloud JARVIS » dans Nautilus.
 
-L’icône est placée près du centre de la barre supérieure, une surface par écran. Son décalage est réglable avec `CLOUD_BARRE_DECALAGE`, par défaut `100` pixels logiques. Théo pourra ajuster l’emplacement à la composition officielle de la barre.
+Le prototype utilise une icône près du centre de la barre. L’intégration officielle prévue par Théo utilise l’île elle-même comme zone de dépôt, puis ajoutera l’ouverture dans Fichiers ; les commandes ci-dessus ne promettent pas que cette interface officielle est déjà disponible.
 
 ## Vérifications avec deux PC
 
@@ -67,11 +81,15 @@ Le client ne supprime jamais les sources après dépôt. La v1 accepte jusqu’�
 
 ## Entretien et sauvegarde
 
-Les anciennes versions sont conservées sans purge automatique et comptent dans le quota. Les reçus de publication sont conservés. Les morceaux temporaires sont maintenant retirés automatiquement après publication, annulation ou révocation. Une tâche interne au stockage vérifie les expirations et reprend les nettoyages différés toutes les 30 secondes. Ce mécanisme est indépendant du client et de l’icône Noctalia.
+Chaque fichier conserve au plus dix anciennes versions, selon `CLOUD_MAX_VERSIONS`. Les plus anciennes sont retirées lors d’un remplacement ou au démarrage après réduction de la limite. **Cette réduction est définitive : sauvegarder avant mise à jour.** La version courante n’expire jamais automatiquement. La suppression explicite sous `If-Match` retire le fichier et toutes ses versions ; elle est annoncée par `features.file_delete` et doit être proposée avec confirmation côté client.
 
-Un verrou par transfert empêche de supprimer un morceau encore utilisé par un assemblage. En cas d’échec du nettoyage, sa réservation reste comptée pour empêcher de remplir le disque par des annulations répétées ; le service réessaie. Les reçus d’idempotence restent disponibles après suppression des morceaux, avec `chunks=[]` pour un état terminal.
+Les reçus de publication et de suppression restent conservés. Les morceaux temporaires sont retirés après publication, annulation, révocation ou invalidation. Une tâche interne au stockage vérifie les expirations et reprend les nettoyages différés toutes les 30 secondes. Une erreur inattendue est journalisée et le cycle suivant réessaie, au lieu de tuer silencieusement la tâche. Ce mécanisme est indépendant du client et de l’icône Noctalia.
 
-Le schéma SQLite passe automatiquement de la version 1 à la version 2, sans modifier les identités, jetons ou fichiers publiés. Sauvegarder le volume avant mise à jour : l’ancien binaire refuse le schéma 2 et ne constitue pas un retour arrière compatible.
+Les objets retirés après suppression ou réduction d’historique passent par une file persistante. `used_bytes` est le quota logique des versions référencées ; `garbage_bytes` est l’espace des objets retirés restant à récupérer, encore inclus dans `reserved_bytes`. Si un effacement disque échoue, cet espace n’est pas annoncé comme récupéré et reste chargé jusqu’au succès. Un téléchargement déjà ouvert peut se terminer même si l’objet est ensuite retiré du répertoire.
+
+Un ensemble borné de 64 verrous protège les transferts : deux identifiants peuvent partager un verrou et être sérialisés, sans compromettre l’intégrité. Le nettoyage ne supprime pas un morceau encore utilisé par un assemblage. En cas d’échec du nettoyage, sa réservation reste comptée pour empêcher de remplir le disque par des annulations répétées ; le service réessaie. Les reçus d’idempotence restent disponibles après suppression des morceaux, avec `chunks=[]` pour un état terminal.
+
+Le schéma SQLite passe automatiquement de la version 1 ou 2 à la version 3. Les identités, jetons, versions courantes et reçus sont préservés ; l’historique est plafonné comme indiqué ci-dessus. Les anciens reçus sans morceaux présents ne réservent plus inutilement leur taille complète. Sauvegarder le volume avant mise à jour : les anciens binaires refusent le schéma 3 et ne constituent pas un retour arrière compatible.
 
 Les objets complets orphelins d’un arrêt brutal restent récupérables par la maintenance **stockage arrêté**, par exemple avec Docker Compose :
 
@@ -93,7 +111,7 @@ Pour une sauvegarde cohérente, arrêter le stockage, puis exporter **tout le vo
 ```bash
 python3 -m venv /tmp/jarvis-cloud-tests
 /tmp/jarvis-cloud-tests/bin/pip install -r cloud/requirements.txt httpx==0.27.2 python-dotenv==1.0.1 pytest
-/tmp/jarvis-cloud-tests/bin/python -m pytest -q tests/test_cloud.py tests/test_cloud_proxy.py tests/test_cloud_security.py
+/tmp/jarvis-cloud-tests/bin/python -m pytest -q tests/test_cloud.py tests/test_cloud_proxy.py tests/test_cloud_security.py tests/test_cloud_followup.py
 ```
 
 Les tests utilisent des dossiers temporaires et un serveur HTTP loopback. Aucun bot, moteur IA ou serveur de production n’est démarré. Le conteneur peut se construire séparément avec `podman build -f cloud/Dockerfile -t localhost/jarvis-cloud:test .`.

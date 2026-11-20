@@ -4,6 +4,8 @@ Créer un stockage persistant sur le serveur distant JARVIS BIS, commun aux PC a
 
 Ce plan prépare l’implémentation dans JARVIS BIS, puis la transmission à Théo d’une issue accompagnée de patchs Noctalia applicables. Les changements fonctionnels et la publication constituent les étapes suivantes.
 
+État après les revues de l’issue #46 : le backend expose désormais une suppression conditionnelle de fichiers annoncée par capacité, un historique plafonné à dix anciennes versions et un nettoyage en ligne des objets retirés. Le contrat effectif est [CLOUD_API.md](CLOUD_API.md). Le client officiel est écrit par Théo à partir de ce contrat, avec dépôt sur l’île ; les propositions d’interface et patchs de ce plan décrivent le prototype initial.
+
 ## Périmètre de la première version
 
 - Un espace commun pour un propriétaire et ses différents PC, stocké uniquement sur le serveur.

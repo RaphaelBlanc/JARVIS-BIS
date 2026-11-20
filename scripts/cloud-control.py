@@ -33,7 +33,7 @@ def configure(root, rotate_key=False):
     # Parse/render every document before touching any of them. Never rewrite other bindings.
     plan = [(storage, storage.updated({'CLOUD_INTERNAL_KEY': key})),
             (gateway, gateway.updated(changes)),
-            (primary, primary.updated(remove={'CLOUD_INTERNAL_KEY'})),
+            (primary, primary.updated({'DEPLOY_MODE': 'server'} if primary.path.exists() else {}, remove={'CLOUD_INTERNAL_KEY'})),
             (runner, runner.updated(remove={'CLOUD_INTERNAL_KEY'}))]
     for doc, text in plan:
         if text != doc.text or (doc in (storage, gateway) and not doc.path.exists()):

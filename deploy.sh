@@ -19,6 +19,10 @@ env_python() {
     if [ -x "$GATEWAY_DIR/.venv/bin/python" ]; then
         "$GATEWAY_DIR/.venv/bin/python" "$@"
     else
+        if ! python3 -c 'import dotenv.parser' 2>/dev/null; then
+            echo 'Missing python-dotenv: install gateway requirements in gateway/.venv first.' >&2
+            return 1
+        fi
         python3 "$@"
     fi
 }
@@ -54,7 +58,7 @@ case "$ACTION" in
 
     start)
         echo -e "${BLUE}Démarrage de l'Assistant Personnel...${NC}"
-        env_python "$ROOT_DIR/scripts/env_files.py" "$ROOT_DIR" --isolate-runner
+        env_python "$ROOT_DIR/scripts/env_files.py" "$ROOT_DIR" --startup
         env -u CLOUD_INTERNAL_KEY "$HOME_RUNNER_DIR/.venv/bin/uvicorn" main:app --app-dir "$HOME_RUNNER_DIR" --port 8080 &
         RUNNER_PID=$!
         "$GATEWAY_DIR/.venv/bin/uvicorn" main:app --app-dir "$GATEWAY_DIR" --port 8000 &

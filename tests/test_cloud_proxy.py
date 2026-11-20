@@ -99,6 +99,35 @@ def test_proxy_does_not_leak_internal_identity_headers(gateway):
     assert client.post('/api/cloud/v1/%252e%252e/devices', json={'name': 'bad'}).status_code == 404
 
 
+def test_validated_target_ignores_host_path_and_preserves_dav_names(gateway):
+    client, store = gateway
+    device = store.associate('PC')
+    content = b'content'
+    name = 'été #100%?.txt'
+    ident = device['device_id']
+    spec = dict(parent_id='root', parent_revision=store.entry('root')['revision'], name=name,
+                size=len(content), sha256=hashlib.sha256(content).hexdigest(), policy='create')
+    upload = store.create_upload(ident, spec, uuid.uuid4().hex)['upload_id']
+    for index, offset in enumerate(range(0, len(content), 4)):
+        data = content[offset:offset + 4]
+        store.chunk(ident, upload, index, data, hashlib.sha256(data).hexdigest())
+    entry = store.commit(ident, upload)['result']
+    # Starlette's request.url.path can incorporate this Host suffix. Route
+    # parameters and the internal target must remain independent of it.
+    hostile = {'Host': 'evil.invalid/api/cloud/v1/devices', 'Authorization': 'Bearer ' + device['token']}
+    response = client.get('/api/cloud/v1/status', headers=hostile)
+    assert response.status_code == 200 and response.json()['device_id'] == ident
+    from urllib.parse import quote
+    dav = client.get('/cloud/dav/' + quote(name, safe=''), auth=(ident, device['token']),
+                     headers={'Host': 'evil.invalid/elsewhere'})
+    assert dav.status_code == 200 and dav.content == content
+    capability = client.get('/api/cloud/v1/capabilities', headers={'X-Secret-Key': 'admin-only'}).json()
+    assert capability['features']['file_delete']
+    headers = {'Authorization': 'Bearer ' + device['token'], 'If-Match': '"' + entry['revision'] + '"',
+               'Idempotency-Key': uuid.uuid4().hex}
+    assert client.delete('/api/cloud/v1/files/' + entry['id'], headers=headers).status_code == 200
+
+
 def test_proxy_disabled_and_unavailable(gateway, monkeypatch):
     client, _ = gateway
     monkeypatch.setenv('CLOUD_INTERNAL_URL', 'http://127.0.0.1:1')

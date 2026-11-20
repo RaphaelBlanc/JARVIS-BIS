@@ -2,4 +2,5 @@
 !cloud/
 !cloud/*.py
 !cloud/requirements.txt
+!cloud/requirements.lock
 !cloud/Dockerfile

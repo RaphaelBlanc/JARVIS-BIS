@@ -10,10 +10,11 @@ import logging
 import os
 import re
 from typing import Any
-from dotenv import load_dotenv
+from pathlib import Path
+from scripts.env_files import load_shared
 import httpx
 
-load_dotenv()
+load_shared(Path(__file__).resolve().parents[2])
 
 MOODLE_URL = os.getenv("MOODLE_URL", "").rstrip("/")
 MOODLE_API_KEY = os.getenv("MOODLE_API_KEY", "").strip()

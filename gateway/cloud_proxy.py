@@ -1,7 +1,7 @@
 """Optional cloud routes: whitelist requests and stream without AI or body buffering."""
 import os
 import re
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, quote
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -37,6 +37,7 @@ async def capability():
             response = await client.get(url + '/health', headers={'X-Cloud-Internal-Key': key})
             response.raise_for_status()
             data = response.json()
+        result['features'] = data.get('features', {})
         result.update(state='ready', server_id=data['server_id'])
     except (httpx.HTTPError, ValueError, KeyError):
         result['reason'] = 'cloud_unavailable'
@@ -47,12 +48,18 @@ _ALLOWED = {
     'GET': r'(?:status|entries|files/[0-9a-f]{32}/content|uploads/[0-9a-f]{32})',
     'POST': r'(?:directories|uploads|uploads/[0-9a-f]{32}/commit)',
     'PUT': r'uploads/[0-9a-f]{32}/chunks/[0-9]{1,10}',
-    'DELETE': r'uploads/[0-9a-f]{32}',
+    'DELETE': r'(?:uploads|files)/[0-9a-f]{32}',
 }
 _HEADERS = {'authorization', 'content-type', 'content-length', 'idempotency-key', 'x-content-sha256',
             'range', 'if-range', 'if-match', 'if-none-match', 'depth', 'translate'}
 _RESPONSE_HEADERS = {'content-type', 'content-length', 'content-range', 'accept-ranges', 'etag',
                      'last-modified', 'content-disposition', 'www-authenticate', 'dav', 'allow', 'retry-after'}
+
+
+def rate_limited_cloud_route(method, path):
+    return ((method == 'GET' and path == '/api/cloud/v1/capabilities') or
+            (method == 'POST' and path == '/api/cloud/v1/devices') or
+            (method == 'DELETE' and re.fullmatch(r'/api/cloud/v1/devices/[^/]+', path) is not None))
 
 
 def router(require_secret):
@@ -62,7 +69,7 @@ def router(require_secret):
     async def cloud_capabilities():
         return await capability()
 
-    async def proxy(request, admin=False, content=None):
+    async def proxy(request, path, admin=False, content=None):
         _, enabled, url, key = configuration()
         if not enabled:
             return JSONResponse({'error': 'cloud_disabled'}, status_code=403)
@@ -77,9 +84,9 @@ def router(require_secret):
         client = httpx.AsyncClient(timeout=httpx.Timeout(60, connect=3, pool=3), trust_env=False,
                                    follow_redirects=False)
         try:
-            target = url + request.url.path
-            if request.url.query:
-                target += '?' + request.url.query
+            target = url + quote(path, safe='/')
+            if request.scope.get('query_string'):
+                target += '?' + request.scope['query_string'].decode('ascii')
             outgoing = client.build_request(request.method, target, headers=headers,
                                              content=content if content is not None else request.stream())
             upstream = await client.send(outgoing, stream=True)
@@ -105,19 +112,19 @@ def router(require_secret):
 
     @routes.post('/api/cloud/v1/devices', dependencies=[Depends(require_secret)])
     async def associate(request: Request):
-        return await proxy(request, admin=True)
+        return await proxy(request, '/api/cloud/v1/devices', admin=True)
 
     @routes.delete('/api/cloud/v1/devices/{device_id}', dependencies=[Depends(require_secret)])
     async def revoke(device_id: str, request: Request):
         if not re.fullmatch('[0-9a-f]{32}', device_id):
             return JSONResponse({'error': 'not_found'}, status_code=404)
-        return await proxy(request, admin=True)
+        return await proxy(request, '/api/cloud/v1/devices/' + device_id, admin=True)
 
     @routes.api_route('/api/cloud/v1/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD'])
     async def api(path: str, request: Request):
         if not re.fullmatch(_ALLOWED.get(request.method, '(?!)'), path):
             return JSONResponse({'error': 'not_found'}, status_code=404)
-        return await proxy(request)
+        return await proxy(request, '/api/cloud/v1/' + path)
 
     @routes.api_route('/cloud/dav/{path:path}', methods=['GET', 'HEAD', 'PROPFIND', 'OPTIONS', 'PUT', 'DELETE', 'MOVE', 'COPY', 'MKCOL', 'LOCK', 'UNLOCK', 'PROPPATCH'])
     async def dav(path: str, request: Request):
@@ -128,6 +135,6 @@ def router(require_secret):
         except BodyRejected as exc:
             return JSONResponse({'error': exc.code}, status_code=exc.status,
                                 headers={'Cache-Control': 'no-store'})
-        return await proxy(request, content=content)
+        return await proxy(request, '/cloud/dav/' + path, content=content)
 
     return routes

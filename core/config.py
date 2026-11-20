@@ -4,11 +4,11 @@ core/config.py — Configuration globale et chemins d'accès pour l'assistant pe
 
 import os
 from pathlib import Path
-from dotenv import load_dotenv
+from scripts.env_files import load_shared
 
 # Charge les variables depuis .env s'il existe
 ROOT_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(ROOT_DIR / ".env")
+load_shared(ROOT_DIR)
 
 # Répertoire de données central (JSON, persistance, budgets, etc.)
 DATA_DIR = Path(os.getenv("ASSISTANT_DATA_DIR", str(ROOT_DIR / "data")))

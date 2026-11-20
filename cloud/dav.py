@@ -8,6 +8,7 @@ import mimetypes
 
 from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider
 from wsgidav.wsgidav_app import WsgiDAVApp
+from wsgidav.dav_error import DAVError, HTTP_NOT_FOUND
 
 from cloud.storage import CloudError
 
@@ -59,7 +60,10 @@ class File(DAVNonCollection):
         return mimetypes.guess_type(self.entry['name'])[0] or 'application/octet-stream'
 
     def get_content(self):
-        return (self.provider.store.blobs / self.entry['blob']).open('rb')
+        try:
+            return self.provider.store.open_version(self.entry)
+        except CloudError:
+            raise DAVError(HTTP_NOT_FOUND) from None
 
     def get_etag(self):
         return self.entry['revision']
