@@ -107,10 +107,11 @@ def test_delete_contract_preconditions_receipts_and_capability(service):
 def test_delete_invalidates_all_devices_intents_and_survives_restart(service):
     store, _, first = service
     ident = first['device_id']
-    original = published(store, ident)['result']
     second = store.associate('second')['device_id']
-    transfers = []
-    for policy in ('create', 'replace', 'keep_both'):
+    # A create intent can precede another device's publication of that name.
+    transfers = [prepared(store, second)]
+    original = published(store, ident)['result']
+    for policy in ('replace', 'keep_both'):
         spec = intent(store) | {'policy': policy, 'expected_revision': original['revision']}
         transfers.append(prepared(store, second, spec=spec))
     store.delete_file(ident, original['id'], '"' + original['revision'] + '"', uuid.uuid4().hex)
@@ -332,3 +333,103 @@ def test_setup_preserves_pc_agent_mode_with_default_answers(configuration, monke
     wizard.main()
     values = EnvFile(configuration / '.env').values
     assert values['DEPLOY_MODE'] == 'pc-agent' and values['CLOUD_ENABLED'] == '0'
+
+
+def test_entry_by_id_exposes_public_metadata_and_observes_deletion(service):
+    store, client, device = service
+    result = published(store, device['device_id'])['result']
+    root = client.get('/api/cloud/v1/entries/root')
+    assert root.status_code == 200 and root.json()['entry']['kind'] == 'directory'
+    response = client.get('/api/cloud/v1/entries/' + result['id'])
+    assert response.status_code == 200
+    body = response.json()
+    assert body['server_id'] == store.server_id and body['space_id'] == 'personal'
+    assert body['entry'] == result and 'blob' not in body['entry']
+    assert body['entry']['size'] == 5 and len(body['entry']['sha256']) == 64
+    assert client.get('/api/cloud/v1/entries/' + '0' * 32).status_code == 404
+    assert client.get('/api/cloud/v1/entries/' + result['id'], headers={'Authorization': ''}).status_code == 401
+    store.delete_file(device['device_id'], result['id'], '"' + result['revision'] + '"', uuid.uuid4().hex)
+    assert client.get('/api/cloud/v1/entries/' + result['id']).status_code == 404
+
+
+@pytest.mark.parametrize('kind', ['file', 'directory'])
+def test_create_conflict_is_rejected_before_reserving_or_receiving_data(service, kind):
+    store, client, device = service
+    if kind == 'file':
+        existing = published(store, device['device_id'], name='été.txt')['result']
+    else:
+        existing = store.mkdir(device['device_id'], 'root', 'été.txt', store.entry('root')['revision'])['entry']
+    before = store.status(device['device_id'])
+    with store.connection() as db:
+        count = db.execute('SELECT COUNT(*) FROM uploads').fetchone()[0]
+    response = client.post('/api/cloud/v1/uploads', json=intent(store, name='e\u0301te\u0301.txt'),
+                           headers={'Idempotency-Key': uuid.uuid4().hex})
+    assert response.status_code == 412
+    assert response.json()['error'] == 'version_conflict'
+    assert response.json()['current'] == existing
+    assert 'blob' not in response.json()['current']
+    assert store.status(device['device_id']) == before
+    with store.connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM uploads').fetchone()[0] == count
+    assert list(store.parts.iterdir()) == []
+
+
+def test_early_conflict_preserves_replay_of_successful_intent(service):
+    store, _, device = service
+    ident, key = device['device_id'], uuid.uuid4().hex
+    spec = intent(store)
+    transfer = prepared(store, ident, spec=spec, idem=key)
+    result = store.commit(ident, transfer)
+    assert store.create_upload(ident, spec, key) == result
+    entry = result['result']
+    store.delete_file(ident, entry['id'], '"' + entry['revision'] + '"', uuid.uuid4().hex)
+    assert store.create_upload(ident, spec, key) == result
+    assert not store.entries()['entries']
+
+
+@pytest.mark.parametrize('state', ['pending', 'committed', 'cancelled', 'expired', 'invalidated'])
+def test_transfer_contract_chunks_and_terminal_http_status(service, state):
+    import hashlib
+    store, client, device = service
+    ident = device['device_id']
+    transfer = prepared(store, ident)
+    if state == 'committed':
+        store.commit(ident, transfer)
+    elif state == 'cancelled':
+        store.cancel(ident, transfer)
+    elif state == 'expired':
+        with store.transaction() as db:
+            db.execute('UPDATE uploads SET expires=0 WHERE id=?', (transfer,))
+    elif state == 'invalidated':
+        entry = published(store, ident)['result']
+        store.delete_file(ident, entry['id'], '"' + entry['revision'] + '"', uuid.uuid4().hex)
+    response = client.get('/api/cloud/v1/uploads/' + transfer)
+    assert response.status_code == 200 and response.json()['state'] == state
+    chunks = response.json()['chunks']
+    if state == 'pending':
+        assert chunks == [{'idx': 0, 'size': 4, 'sha256': hashlib.sha256(b'hell').hexdigest()},
+                          {'idx': 1, 'size': 1, 'sha256': hashlib.sha256(b'o').hexdigest()}]
+    else:
+        assert chunks == []
+    assert (response.json()['result'] is not None) == (state == 'committed')
+
+
+def test_status_and_name_contract(service):
+    store, client, device = service
+    status = client.get('/api/cloud/v1/status').json()
+    for field in ('quota_bytes', 'used_bytes', 'reserved_bytes', 'max_file_bytes', 'chunk_bytes'):
+        assert type(status[field]) is int
+    assert status['root']['id'] == 'root' and isinstance(status['root']['revision'], str)
+    assert status['features']['entry_by_id'] and status['features']['early_create_conflict']
+    # Limit is UTF-8 bytes after NFC, rather than Python/JSON character count.
+    name = 'e\u0301' * 120
+    accepted = store.mkdir(device['device_id'], 'root', name, store.entry('root')['revision'])
+    assert accepted['entry']['name'] == 'é' * 120
+    for invalid in ('é' * 121, 'a\u200db', 'a\ue000b', 'a\u0378b', 'a\ud800b'):
+        with pytest.raises(CloudError, match='invalid_name'):
+            store.mkdir(device['device_id'], 'root', invalid, store.entry('root')['revision'])
+    import unicodedata
+    decomposed = unicodedata.normalize('NFD', 'ᾄ' * 80)
+    response = client.post('/api/cloud/v1/directories',
+                           json={'parent_id': 'root', 'parent_revision': store.entry('root')['revision'], 'name': decomposed})
+    assert response.status_code == 200 and response.json()['entry']['name'] == 'ᾄ' * 80

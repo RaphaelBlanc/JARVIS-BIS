@@ -45,7 +45,7 @@ async def capability():
 
 
 _ALLOWED = {
-    'GET': r'(?:status|entries|files/[0-9a-f]{32}/content|uploads/[0-9a-f]{32})',
+    'GET': r'(?:status|entries(?:/(?:root|[0-9a-f]{32}))?|files/[0-9a-f]{32}/content|uploads/[0-9a-f]{32})',
     'POST': r'(?:directories|uploads|uploads/[0-9a-f]{32}/commit)',
     'PUT': r'uploads/[0-9a-f]{32}/chunks/[0-9]{1,10}',
     'DELETE': r'(?:uploads|files)/[0-9a-f]{32}',

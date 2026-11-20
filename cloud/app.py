@@ -32,7 +32,7 @@ class Device(Model):
 class Directory(Model):
     parent_id: str = Field(default='root', max_length=64)
     parent_revision: str = Field(max_length=64)
-    name: str = Field(min_length=1, max_length=240)
+    name: str = Field(min_length=1)
 
 
 class Upload(Directory):
@@ -150,6 +150,10 @@ def create_app(settings=None, internal_key=None):
     @app.get(prefix + '/entries')
     def entries(parent_id: str = 'root', cursor: str = '', ident=Depends(device)):
         return store.entries(parent_id, cursor)
+
+    @app.get(prefix + '/entries/{entry_id}')
+    def entry(entry_id: str, ident=Depends(device)):
+        return store.envelope(entry=store.public(store.entry(entry_id)))
 
     @app.post(prefix + '/directories')
     def mkdir(body: Directory, ident=Depends(device)):

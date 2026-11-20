@@ -138,6 +138,28 @@ def test_proxy_disabled_and_unavailable(gateway, monkeypatch):
     assert client.get('/api/cloud/v1/status').status_code == 403
 
 
+def test_entry_by_id_and_early_conflict_through_public_gateway(gateway):
+    client, store = gateway
+    device = store.associate('PC')
+    ident = device['device_id']
+    auth = {'Authorization': 'Bearer ' + device['token']}
+    root = client.get('/api/cloud/v1/entries/root', headers=auth)
+    assert root.status_code == 200 and root.json()['entry']['id'] == 'root'
+    folder = store.mkdir(ident, 'root', 'Dossier', root.json()['entry']['revision'])['entry']
+    metadata = client.get('/api/cloud/v1/entries/' + folder['id'], headers=auth)
+    assert metadata.status_code == 200 and metadata.json()['entry'] == folder
+    assert 'blob' not in metadata.json()['entry']
+    spec = dict(parent_id='root', parent_revision=store.entry('root')['revision'], name='Dossier',
+                size=100, sha256=hashlib.sha256(b'x' * 100).hexdigest(), policy='create')
+    conflict = client.post('/api/cloud/v1/uploads', json=spec, headers=auth | {'Idempotency-Key': uuid.uuid4().hex})
+    assert conflict.status_code == 412 and conflict.json()['current'] == folder
+    assert client.get('/api/cloud/v1/entries/' + folder['id']).status_code == 401
+    assert client.get('/api/cloud/v1/entries/not-an-id', headers=auth).status_code == 404
+    capability = client.get('/api/cloud/v1/capabilities', headers={'X-Secret-Key': 'admin-only'}).json()
+    assert type(capability['api_version']) is int and isinstance(capability['api_path'], str)
+    assert capability['features']['entry_by_id'] and capability['features']['early_create_conflict']
+
+
 @pytest.mark.parametrize('method', ['GET', 'HEAD', 'OPTIONS', 'PROPFIND', 'DELETE', 'COPY', 'MOVE', 'LOCK', 'UNLOCK', 'MKCOL', 'PROPPATCH'])
 def test_gateway_bounds_dav_body_before_forwarding(gateway, monkeypatch, method):
     client, _ = gateway

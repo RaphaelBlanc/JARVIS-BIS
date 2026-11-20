@@ -8,6 +8,21 @@ Version du contrat : `1`, étendue par capacités. Le gateway public sert `/api/
 
 Lorsque le stockage est prêt, `features` annonce `file_delete=true`, `delete_if_match=true`, `delete_idempotency=true` et `max_old_versions` (10 par défaut, de 0 à 10 selon la configuration). `/status` authentifié avec le jeton cloud renvoie les mêmes capacités. Un client ne propose la suppression que si `features.file_delete` est explicitement vrai ; l’absence de ce champ désigne un ancien serveur.
 
+Types de la réponse de découverte :
+
+| Champ | Type JSON | Valeur ou sens |
+| --- | --- | --- |
+| `api_version` | entier | `1` |
+| `enabled` | booléen | Activation effective en mode serveur |
+| `state` | chaîne | `disabled`, `unavailable` ou `ready` |
+| `reason` | chaîne ou `null` | `local_deployment`, `not_configured`, `cloud_unavailable` ou `null` |
+| `server_id` | chaîne ou `null` | Identité persistante lorsque le stockage répond |
+| `api_path` | chaîne | `/api/cloud/v1`, chemin relatif à l’origine du gateway |
+| `dav_path` | chaîne | `/cloud/dav/` |
+| `features` | objet, optionnel | Présent lorsque le stockage répond ; ne pas présumer une capacité absente |
+
+Cette révision annonce également `features.entry_by_id=true` et `features.early_create_conflict=true`. Ces booléens permettent de détecter les deux ajouts ci-dessous sur un serveur v1 ; leur absence ne change pas les routes historiques de navigation et de transfert.
+
 `enabled=false` signifie que le mode est local ou que l’option est désactivée. `enabled=true,state=unavailable` signifie que le stockage est configuré mais injoignable. Un mode local refuse toutes les routes de données, y compris avec un ancien jeton cloud.
 
 L’administration utilise `X-Secret-Key` :
@@ -25,11 +40,29 @@ Les réponses du service incluent `api_version`, `server_id` et `space_id`. La v
 | --- | --- | --- |
 | `GET /status` | Aucun | `state`, `root`, `device_id`, quotas, réservations, taille de morceau, taille maximale et `webdav=read_only` |
 | `GET /entries` | `parent_id=root`, `cursor` optionnel | `parent`, `entries`, `next_cursor` ; pages de 100 entrées |
+| `GET /entries/{id}` | Identifiant opaque ou `root` | Enveloppe `api_version`, `server_id`, `space_id` et `entry` ; `404 not_found` si absente |
 | `POST /directories` | `parent_id`, `parent_revision`, `name` | `entry` du nouveau dossier ; `409` si le nom existe ou le parent a changé |
 | `GET /files/{id}/content` | `Range` et `If-Range` optionnels | Flux binaire, `ETag`, `Accept-Ranges: bytes` ; une plage simple est prise en charge |
 | `DELETE /files/{id}` | `If-Match: "revision"`, `Idempotency-Key` | Suppression transactionnelle du fichier courant et de ses anciennes versions ; voir ci-dessous |
 
 Les chemins du tableau sont relatifs à `/api/cloud/v1`. Une entrée contient `id`, `parent`, `name`, `kind` (`directory` ou `file`), `revision`, `size`, `sha256` et `modified`. `root` est l’identifiant du dossier racine. Une révision est opaque ; les horloges des clients ne permettent pas d’arbitrer un conflit.
+
+`id`, `name`, `kind` et `revision` sont des chaînes ; `parent` est une chaîne ou `null` pour la racine ; `size` est un entier en octets et `modified` un nombre de secondes Unix. `sha256` est l’empreinte hexadécimale minuscule du contenu d’un fichier, ou `null` pour un dossier. Un dossier a `size=0`. La lecture par identifiant utilise le jeton cloud et renvoie une seule entrée, sans parcourir les pages du parent, sans champ privé `blob` ni chemin disque. Les identifiants exposés sont `root` ou 32 caractères hexadécimaux minuscules. Un fichier supprimé retourne 404 ; un appareil révoqué reste refusé avec 403.
+
+Les noms d’entrée sont normalisés en **Unicode NFC** avant comparaison et validation. Ils doivent être non vides, faire **au plus 240 octets UTF-8 après NFC**, différer de `.` et `..`, et ne contenir ni `/`, ni `\`, ni caractère d’une catégorie Unicode **C*** (`Cc`, `Cf`, `Cs`, `Co`, `Cn` : contrôles, formats, substituts, usage privé et points non attribués). La limite ne correspond pas au nombre de caractères JSON avant normalisation. Un nom invalide produit `400 invalid_name` ; deux graphies équivalentes après NFC désignent le même nom.
+
+Champs de `GET /api/cloud/v1/status` après authentification cloud :
+
+| Champ | Type JSON | Sens |
+| --- | --- | --- |
+| `api_version`, `server_id`, `space_id` | entier, chaîne, chaîne | Enveloppe commune (`1`, identité persistante, `personal`) |
+| `state`, `device_id` | chaîne, chaîne | `ready` et appareil authentifié |
+| `quota_bytes`, `used_bytes`, `reserved_bytes` | entiers | Quota partagé, octets référencés et réservations incluant les nettoyages différés |
+| `max_file_bytes`, `chunk_bytes` | entiers | Taille maximale d’un fichier et taille d’un morceau en octets |
+| `root` | objet entrée | Métadonnées du dossier racine, dont sa révision actuelle |
+| `webdav` | chaîne | `read_only` |
+| `features` | objet | Capacités de cette révision |
+| `max_old_versions`, `garbage_bytes` | entiers | Limite d’historique et objets retirés restant à récupérer |
 
 La révision du parent change à chaque création de sous-dossier, publication, remplacement ou suppression d’un enfant direct. Une mutation dans un sous-dossier ne modifie pas tous ses ancêtres. La création d’un dossier ou d’un transfert, puis son commit, vérifient `parent_revision`. Une destination périmée produit `409 destination_changed` ; actualiser l’arborescence, faire confirmer la destination et créer une nouvelle intention. Pour plusieurs fichiers, relire le parent après chaque publication ; des intentions ouvertes sur une même ancienne révision peuvent se gêner, sans écrasement silencieux.
 
@@ -70,11 +103,25 @@ Si un remplacement gagne avant la suppression, l’ancien `If-Match` échoue. Si
 
 La clé d’idempotence est liée à l’appareil et à l’intention complète. La réutiliser avec une autre destination ou un autre contenu produit `409 idempotency_conflict`. La renvoyer avec la même intention retrouve le transfert initial, même après perte de sa réponse de création. Les reçus publiés sont conservés, y compris après nettoyage des morceaux.
 
+`chunks` est toujours une **liste d’objets** `{"idx": 0, "sha256": "<64 caractères hexadécimaux minuscules>", "size": 4194304}`, et non une liste d’index. `idx` est un entier à partir de zéro, `size` un entier en octets ; la liste est triée par `idx`. `expires` est un nombre de secondes Unix. `upload_id` et `state` sont des chaînes, `chunk_bytes` un entier, `result` une entrée publiée ou `null`.
+
+Les **cinq états** de transfert sont :
+
+| `state` | Sens | `chunks` | `result` |
+| --- | --- | --- | --- |
+| `pending` | Transfert ouvert non expiré | Morceaux validés déjà reçus, éventuellement `[]` | `null` |
+| `committed` | Publication réussie | `[]` | Entrée publiée au moment du succès, même si modifiée ou supprimée depuis |
+| `cancelled` | Annulation ou révocation avant publication | `[]` | `null` |
+| `expired` | Durée de réservation écoulée | `[]` | `null` |
+| `invalidated` | Suppression ayant invalidé la destination de cette intention | `[]` | `null` |
+
+Pour un appareil encore autorisé et propriétaire du transfert, **`GET /uploads/{id}` répond 200 dans ces cinq états**, y compris après annulation, expiration ou invalidation. Il ne faut pas confondre cette consultation avec un nouvel envoi de morceau ou un commit : ces mutations répondent `410 upload_expired`, `410 upload_invalidated` ou `409 upload_not_pending` selon l’état. Un transfert inconnu ou appartenant à un autre appareil produit 404 ; un appareil révoqué produit 403. Annuler ne réactive jamais un transfert terminal et ne supprime pas un fichier déjà publié. Les états terminaux exposent `chunks=[]` même si le nettoyage physique doit encore réessayer.
+
 Chaque appareil ne voit que ses propres transferts. Les limites par défaut sont 5 Gio par fichier, morceaux de 4 Mio, 8 transferts non expirés **par appareil** et 20 Gio de quota partagé incluant les versions conservées. Le quota est réservé à la création et les réservations concurrentes sont additionnées. La limite disque réelle reste indépendante du quota logique. Les routes d’administration (`capabilities`, association, révocation) gardent la limitation de débit du gateway ; les morceaux ne consomment pas ce compteur.
 
 ## Conflits
 
-- `policy=create` : le nom doit être libre au moment du commit.
+- `policy=create` : si une entrée de même nom normalisé existe déjà dans le parent, `POST /uploads` refuse avec `412 version_conflict` et `current` avant de créer le transfert, réserver du quota ou recevoir les morceaux. La précondition du parent est vérifiée avant ce contrôle ; un parent périmé produit donc `409 destination_changed`. Les requêtes rejouant exactement une intention existante retrouvent d’abord leur reçu, même si le nom est désormais occupé. Le nom doit toujours être libre au commit : deux intentions concurrentes créées lorsque le nom était libre peuvent être acceptées, puis une seule publier. Le contrôle initial ne réserve pas le nom et ne remplace pas le contrôle transactionnel final.
 - `policy=keep_both` : si le nom existe, le serveur réserve un nom numéroté libre dans la même transaction.
 - `policy=replace` : fournir `expected_revision`, correspondant à la version montrée à l’utilisateur. Sans révision : `428 precondition_required`. Si elle a changé ou si le fichier a disparu : `412 version_conflict`.
 
@@ -100,6 +147,18 @@ Pour toutes les méthodes WebDAV, le gateway et le service refusent un corps dé
 
 ## Erreurs et confidentialité
 
-Les erreurs du stockage contiennent `error` et les identités de contrat. Codes principaux : `cloud_disabled`, `cloud_unavailable`, `authentication_required`, `device_revoked`, `version_conflict`, `destination_changed`, `upload_expired`, `upload_invalidated`, `upload_not_pending`, `quota_exceeded`, `storage_full`, `integrity_error`, `incomplete_upload`, `chunk_conflict`, `idempotency_conflict`, `not_a_file` et `precondition_required`. Un en-tête `Range` mal formé, démesuré ou hors fichier retourne `416`, sans erreur interne. Les erreurs de schéma utilisent le `422` FastAPI habituel.
+Les erreurs métier du stockage contiennent `error` et les identités de contrat. Codes principaux : `cloud_disabled`, `cloud_unavailable`, `authentication_required`, `device_revoked`, `version_conflict`, `destination_changed`, `upload_expired`, `upload_invalidated`, `upload_not_pending`, `quota_exceeded`, `storage_full`, `integrity_error`, `incomplete_upload`, `chunk_conflict`, `idempotency_conflict`, `not_a_file`, `invalid_name` et `precondition_required`. Autres codes à traiter explicitement :
+
+| Code `error` | HTTP | Sens |
+| --- | --- | --- |
+| `name_conflict` | 409 | Nom déjà occupé à la création d’un dossier |
+| `too_many_transfers` | 429 | Limite d’intentions non expirées atteinte pour cet appareil |
+| `storage_error` | 503 | Erreur d’entrée/sortie du stockage ; aucun détail interne exposé |
+| `file_too_large` | 413 | Taille déclarée dépassant la limite configurée |
+| `not_found` | 404 | Entrée ou transfert introuvable dans le périmètre autorisé |
+
+Les refus précoces du gateway ou du middleware peuvent n’avoir que `{"error":"…"}`, sans l’enveloppe complète. **Une clé JARVIS absente ou incorrecte**, sur une route protégée par `X-Secret-Key`, donne **`401 {"detail":"Clé API invalide"}` sans champ `error`**. Les erreurs de schéma utilisent le `422` FastAPI habituel avec `detail`. Le limiteur du gateway répond 429 avec `detail` et `Retry-After`, à distinguer de `too_many_transfers`. Un client doit donc examiner le statut HTTP puis `error` ou `detail`, sans présumer que toutes les erreurs ont la même forme.
+
+Un en-tête `Range` mal formé, démesuré ou hors fichier retourne `416`, sans erreur interne.
 
 Le gateway reconstruit ses en-têtes internes et refuse les routes non prévues. Les clés et jetons sont envoyés dans les en-têtes, jamais dans la query string. Les réponses ne sont pas mises en cache. Les URL internes et les traces d’erreur du serveur ne doivent pas être affichées par le client.

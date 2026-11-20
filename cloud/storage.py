@@ -53,8 +53,9 @@ def name_checked(name):
     if not isinstance(name, str):
         raise CloudError('invalid_name')
     name = unicodedata.normalize('NFC', name)
-    if (not name or name in ('.', '..') or len(name.encode()) > 240
-            or any(c in '/\\' or unicodedata.category(c).startswith('C') for c in name)):
+    if (not name or name in ('.', '..')
+            or any(c in '/\\' or unicodedata.category(c).startswith('C') for c in name)
+            or len(name.encode()) > 240):
         raise CloudError('invalid_name')
     return name
 
@@ -214,6 +215,7 @@ class Store:
 
     def features(self):
         return {'file_delete': True, 'delete_if_match': True, 'delete_idempotency': True,
+                'entry_by_id': True, 'early_create_conflict': True,
                 'max_old_versions': self.settings.max_versions}
 
     @staticmethod
@@ -435,6 +437,11 @@ class Store:
                     raise CloudError('idempotency_conflict', 409)
                 return self._upload_response(db, old)
             self._parent(db, spec.get('parent_id'), spec.get('parent_revision'))
+            if spec['policy'] == 'create':
+                current = db.execute('SELECT * FROM entries WHERE parent=? AND name=?',
+                                     (spec['parent_id'], spec['name'])).fetchone()
+                if current:
+                    raise CloudError('version_conflict', 412, current=self.public(dict(current)))
             if db.execute("SELECT COUNT(*) FROM uploads WHERE device=? AND state='pending' AND expires>?", (device, time.time())).fetchone()[0] >= self.settings.max_uploads:
                 raise CloudError('too_many_transfers', 429)
             reserved = self._reserved(db)
