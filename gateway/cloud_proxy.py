@@ -134,6 +134,8 @@ def router(require_secret):
             try:
                 data = json.loads(await upstream.aread())
                 data['webdav'] = 'read_only'
+                if isinstance(data.get('features'), dict):
+                    data['features']['webdav_write'] = False
             finally:
                 await upstream.aclose()
                 await client.aclose()

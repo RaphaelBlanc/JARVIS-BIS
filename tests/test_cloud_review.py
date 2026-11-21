@@ -105,6 +105,7 @@ def test_gateway_flag_blocks_writes_when_storage_still_allows_them(writable, mon
         assert response.status_code == 403
         status = client.get('/api/cloud/v1/status', headers={'Authorization': 'Bearer ' + device['token']})
         assert status.json()['webdav'] == 'read_only'
+        assert status.json()['features']['webdav_write'] is False
         assert client.get('/api/cloud/v1/capabilities').json()['features']['webdav_write'] is False
     assert store.entries()['entries'] == []
 
