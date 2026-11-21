@@ -109,6 +109,7 @@ class Store:
                     sha256 TEXT,modified REAL NOT NULL,UNIQUE(parent,name));
                 CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY,file_id TEXT NOT NULL,
                     blob TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,created REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS versions_by_file ON versions(file_id);
                 CREATE TABLE IF NOT EXISTS uploads(id TEXT PRIMARY KEY,device TEXT NOT NULL,
                     idem TEXT NOT NULL,spec TEXT NOT NULL,state TEXT NOT NULL,expires REAL NOT NULL,
                     result TEXT,cleanup_pending INTEGER NOT NULL DEFAULT 1,UNIQUE(device,idem));

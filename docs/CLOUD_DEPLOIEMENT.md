@@ -192,3 +192,9 @@ Pour le mode d’écriture, `python scripts/check-cloud-gvfs-write.py` lance un 
 
 
 Un appareil associé possède des droits de suppression définitive sur l’espace personnel. Révoquer immédiatement un appareil perdu ou un jeton compromis ; conserver des sauvegardes indépendantes. L’historique plafonné peut être évincé par des remplacements répétés et ne protège pas contre le vol d’un jeton.
+
+### Réglages DAV cohérents et reçus persistants
+
+L’écriture DAV exige `CLOUD_DAV_WRITE=1` dans `gateway/.env` et `deploy/cloud.env`. Le gateway refuse ses mutations quand sa valeur est 0, même si le stockage est encore à 1 ; capacités et statut publics annoncent alors la lecture seule. `cloud configure --dav-write` synchronise les deux valeurs ; recréer le conteneur et redémarrer le gateway après un changement. Avant tout PUT, le gateway vérifie le Basic Auth auprès du stockage sans lire le fichier. Les deux couches imposent une heure de durée totale et le gateway refuse les redirections DAV. Un PUT sans taille annoncée réserve seulement les morceaux reçus, sous quota transactionnel.
+
+Les reçus serveur restent persistants conformément au contrat v1 ; seul l’historique local du panneau est nettoyé à 24 h. Une purge SQL manuelle briserait les garanties de rejeu et ne doit pas servir de nettoyage courant. L’index `versions_by_file` est créé automatiquement au démarrage, sans suppression de données ni changement de version du schéma.

@@ -38,7 +38,7 @@ Les réponses du service incluent `api_version`, `server_id` et `space_id`. La v
 
 | Requête | Corps ou paramètres | Résultat |
 | --- | --- | --- |
-| `GET /status` | Aucun | `state`, `root`, `device_id`, quotas, réservations, taille de morceau, taille maximale et `webdav=read_only` |
+| `GET /status` | Aucun | `state`, `root`, `device_id`, quotas, réservations, taille de morceau, taille maximale et `webdav=read_only` ou `read_write` |
 | `GET /entries` | `parent_id=root`, `cursor` optionnel | `parent`, `entries`, `next_cursor` ; pages de 100 entrées |
 | `GET /entries/{id}` | Identifiant opaque ou `root` | Enveloppe `api_version`, `server_id`, `space_id` et `entry` ; `404 not_found` si absente |
 | `POST /directories` | `parent_id`, `parent_revision`, `name` | `entry` du nouveau dossier ; `409` si le nom existe ou le parent a changé |
@@ -60,7 +60,7 @@ Champs de `GET /api/cloud/v1/status` après authentification cloud :
 | `quota_bytes`, `used_bytes`, `reserved_bytes` | entiers | Quota partagé, octets référencés et réservations incluant les nettoyages différés |
 | `max_file_bytes`, `chunk_bytes` | entiers | Taille maximale d’un fichier et taille d’un morceau en octets |
 | `root` | objet entrée | Métadonnées du dossier racine, dont sa révision actuelle |
-| `webdav` | chaîne | `read_only` |
+| `webdav` | chaîne | `read_only` par défaut ; `read_write` seulement si les deux couches autorisent DAV en écriture |
 | `features` | objet | Capacités de cette révision |
 | `max_old_versions`, `garbage_bytes` | entiers | Limite d’historique et objets retirés restant à récupérer |
 
@@ -78,11 +78,11 @@ Les capacités additives `entry_move`, `directory_delete` et `delete_preview` an
 | --- | --- | --- |
 | `GET /entries/{id}/delete-preview` | Aucune mutation | `entry`, `tree_revision`, `files`, `directories`, `size` |
 | `POST /entries/{id}/move` | `If-Match: "revision"`, `Idempotency-Key` ; `parent_id`, `parent_revision`, `name` | `entry`, `moved=true` |
-| `DELETE /entries/{id}` | `If-Match: "revision"`, `Idempotency-Key` ; `recursive` (faux par défaut), `tree_revision` optionnel | `deleted=true`, `entry_id`, `count` |
+| `DELETE /entries/{id}` | `If-Match: "revision"`, `Idempotency-Key` ; corps JSON obligatoire (au moins `{}`) : `recursive` (faux par défaut), `tree_revision` optionnel | `deleted=true`, `entry_id`, `count` |
 
-Les chemins sont relatifs à `/api/cloud/v1`. Déplacement et renommage sont la même opération : l’identifiant, les octets et l’historique restent conservés. L’opération refuse la racine (`409 root_protected`), un dossier déplacé dans lui-même ou sa descendance (`409 invalid_destination`), et un nom déjà occupé (`409 name_conflict`), sans écraser la destination. Les révisions de la source et de la destination sont vérifiées dans la transaction. Les intentions de transfert visant l’ancien nom sont invalidées ; les transferts visant un enfant d’un dossier déplacé restent liés à son identifiant et peuvent terminer.
+Les chemins sont relatifs à `/api/cloud/v1`. `parent_id` est obligatoire sur un déplacement, y compris un renommage dans le même dossier : aucun repli implicite vers la racine. `DELETE /entries/{id}` sans corps JSON produit 422. Son corps est limité à 8 Kio au gateway et au stockage avant l’authentification d’appareil, y compris sans `Content-Length`. Déplacement et renommage sont la même opération : l’identifiant, les octets et l’historique restent conservés. L’opération refuse la racine (`409 root_protected`), un dossier déplacé dans lui-même ou sa descendance (`409 invalid_destination`), et un nom déjà occupé (`409 name_conflict`), sans écraser la destination. Les révisions de la source et de la destination sont vérifiées dans la transaction. Les intentions de transfert visant l’ancien nom sont invalidées ; les transferts visant un enfant d’un dossier déplacé restent liés à son identifiant et peuvent terminer.
 
-Une suppression non récursive de dossier occupé est refusée (`409 directory_not_empty`). Une suppression récursive exige le `tree_revision` du dernier aperçu. Cette empreinte inclut tous les identifiants, parents, noms et révisions du sous-arbre, pas seulement la révision de son sommet : une modification profonde produit `412 tree_changed` et exige un nouvel aperçu puis une nouvelle confirmation. Le compteur `directories` inclut le dossier sélectionné. La transaction retire le contenu et son historique, invalide les transferts dans les dossiers supprimés, et utilise la même file de récupération physique que la suppression de fichiers.
+Une suppression non récursive de dossier occupé est refusée (`409 directory_not_empty`). Une suppression récursive exige le `tree_revision` du dernier aperçu, même pour un dossier vide : son absence, comme l’absence de `If-Match`, produit `428 precondition_required`. Cette empreinte inclut tous les identifiants, parents, noms et révisions du sous-arbre, pas seulement la révision de son sommet : une modification profonde produit `412 tree_changed` et exige un nouvel aperçu puis une nouvelle confirmation. Le compteur `directories` inclut le dossier sélectionné. La transaction retire le contenu et son historique, invalide les transferts de tous les appareils dans les dossiers supprimés (`state=invalidated`, mutations refusées par `410 upload_invalidated`), et utilise la même file de récupération physique que la suppression de fichiers.
 
 Les reçus de ces opérations sont persistants, liés à l’appareil et à la demande complète. Une reprise explicite avec la même clé et le même corps retrouve le résultat, y compris après suppression ou redémarrage. Un fichier vide se crée avec le protocole d’envoi existant : taille zéro, SHA-256 du contenu vide, aucun morceau, puis commit.
 
@@ -157,21 +157,23 @@ Les morceaux sont effacés automatiquement après publication, annulation, révo
 
 ## WebDAV
 
-`/cloud/dav/` expose le même espace en **lecture seule**, avec Basic Auth : utilisateur `device_id`, mot de passe `token`. HTTPS avec certificat vérifié est requis hors boucle locale, LAN privé de confiance ou tunnel chiffré établi. Un nom `*.ts.net` seul ne prouve pas l’emploi du tunnel : vérifier le chemin Tailscale effectif ou utiliser HTTPS. Cette règle couvre association, API et WebDAV, sans repli vers HTTP ni redirection d’identifiants vers une autre origine. Les identifiants ne figurent jamais ensemble dans l’URL.
+`/cloud/dav/` expose le même espace en **lecture seule par défaut**, avec Basic Auth : utilisateur `device_id`, mot de passe `token`. HTTPS avec certificat vérifié est requis hors boucle locale, LAN privé de confiance ou tunnel chiffré établi. Un nom `*.ts.net` seul ne prouve pas l’emploi du tunnel : vérifier le chemin Tailscale effectif ou utiliser HTTPS. Cette règle couvre association, API et WebDAV, sans repli vers HTTP ni redirection d’identifiants vers une autre origine. Les identifiants ne figurent jamais ensemble dans l’URL.
 
-`OPTIONS`, `PROPFIND`, `GET` et `HEAD` sont permis. Toutes les mutations, dont `PUT`, `MKCOL`, `MOVE`, `COPY`, `DELETE`, `LOCK` et `PROPPATCH`, sont refusées. Le contournement du dialogue de conflit par un éditeur ou un gestionnaire de fichiers est ainsi impossible dans cette version. Les écritures s’effectuent par `nc-cloud`, la fenêtre ou le script Nautilus.
+`OPTIONS`, `PROPFIND`, `GET` et `HEAD` sont permis. Dans ce mode par défaut, toutes les mutations, dont `PUT`, `MKCOL`, `MOVE`, `COPY`, `DELETE`, `LOCK` et `PROPPATCH`, sont refusées. Les écritures passent alors par `nc-cloud`, la fenêtre ou le script Nautilus. Le mode facultatif ci-dessous permet aussi les écritures natives.
 
-Pour toutes les méthodes WebDAV, le gateway et le service refusent un corps dépassant 8 Kio (`413`), même sans Basic Auth et sans `Content-Length`. La lecture du corps est limitée à 5 secondes (`408`). Le contrôle précède le pont WSGI et sa collecte en mémoire. Ces limites ne s’appliquent pas au contenu des réponses de téléchargement ni aux morceaux binaires de l’API de transfert.
+Hors PUT en mode écriture explicitement activé, le gateway et le service refusent un corps dépassant 8 Kio (`413`), même sans Basic Auth et sans `Content-Length`. La lecture du corps est limitée à 5 secondes (`408`). Le contrôle précède le pont WSGI et sa collecte en mémoire. Ces limites ne s’appliquent pas au contenu des réponses de téléchargement ni aux morceaux binaires de l’API de transfert.
 
 ### Écritures WebDAV optionnelles
 
-Le mode précédent reste le défaut. Après activation explicite de `CLOUD_DAV_WRITE=1` côté gateway **et** stockage, `features.webdav_write=true` et `/status.webdav=read_write` annoncent l’extension. Les clients existants peuvent continuer d’utiliser l’API d’envoi et ses confirmations.
+Le mode précédent reste le défaut. Après activation explicite de `CLOUD_DAV_WRITE=1` côté gateway **et** stockage, `features.webdav_write=true` et `/status.webdav=read_write` annoncent l’extension. Le gateway refuse toute mutation DAV si son propre réglage est désactivé, même si le stockage permet encore l’écriture. Il masque alors également `webdav_write` dans les capacités et annonce `webdav=read_only`. Les clients existants peuvent continuer d’utiliser l’API d’envoi et ses confirmations.
 
 `PUT`, `MKCOL`, `MOVE` et `DELETE` sont alors acceptés avec la même authentification Basic. Le provider expose les autorisations d’écriture à GVfs. `OPTIONS` annonce uniquement les méthodes disponibles ; les verrous DAV, `COPY` et les propriétés arbitraires ne sont pas implémentés. Un déplacement vers un nom occupé est refusé, y compris avec `Overwrite: T` ; un remplacement de contenu passe par `PUT` et conserve les anciennes versions.
 
-`PUT` est traité en ASGI, sans passer par l’adaptateur WSGI. Le gateway relaie le flux ; le stockage réserve le quota, écrit au plus un morceau en mémoire à la fois, calcule le SHA-256 complet, puis publie avec le même moteur transactionnel que l’API. Sans taille annoncée, la réservation initiale vaut la taille maximale d’un fichier et se réduit à la fin du flux. Une coupure annule le transfert et récupère ses morceaux sans modifier une version publiée. Aucun envoi DAV n’est repris automatiquement. La limite de 8 Kio continue de s’appliquer aux autres méthodes ; les flux PUT ont une limite de taille, 60 secondes d’inactivité et une durée totale maximale d’une heure.
+`PUT` est traité en ASGI, sans passer par l’adaptateur WSGI. Le gateway vérifie d’abord le Basic Auth auprès du stockage par un OPTIONS sans corps ; un refus ou une indisponibilité ne lit aucun octet du fichier. Il refuse aussi toute redirection DAV (301, 302, 303, 307, 308), sans la suivre ni transmettre de Location. Après authentification, il relaie le flux ; le stockage réserve le quota, écrit au plus un morceau en mémoire à la fois, calcule le SHA-256 complet, puis publie avec le même moteur transactionnel que l’API. Sans taille annoncée, la réservation initiale vaut zéro puis grandit au fil des octets reçus, arrondie au morceau et plafonnée à la taille maximale. Chaque augmentation revérifie atomiquement quota et espace disque ; un dépassement annule l’intention et nettoie ses morceaux. La réservation se réduit à la taille exacte à la fin du flux. Une coupure annule le transfert et récupère ses morceaux sans modifier une version publiée. Aucun envoi DAV n’est repris automatiquement. La limite de 8 Kio continue de s’appliquer aux autres méthodes ; les flux PUT ont une limite de taille, 60 secondes d’inactivité et une durée totale maximale d’une heure, imposée au gateway et au stockage.
 
-Un `PUT` ou une mutation portant `If-Match` vérifie la révision. Pour interopérer avec GVfs, DAV accepte aussi l’identifiant hexadécimal exact sans guillemets ; les ETags faibles et listes ne sont pas acceptés. L’API JSON conserve son contrat strict avec guillemets. Sans `If-Match`, DAV prend la révision au début de la requête puis vérifie celle-ci au commit : deux écritures concurrentes ne gagnent pas toutes deux. Cela ne peut pas détecter une ancienne copie éditée si l’application n’en transmet pas la révision ; utiliser un éditeur transmettant l’ETag ou la fenêtre Cloud pour une précondition portant sur la version affichée.
+Un `PUT` ou une mutation portant `If-Match` vérifie la révision. Pour interopérer avec GVfs, DAV accepte aussi l’identifiant hexadécimal exact sans guillemets ; les ETags faibles, listes et en-têtes présents mais vides ne sont pas acceptés (412). L’API JSON conserve son contrat strict avec guillemets. Sans `If-Match`, DAV prend la révision au début de la requête puis vérifie celle-ci au commit : deux écritures concurrentes ne gagnent pas toutes deux. Cela ne peut pas détecter une ancienne copie éditée si l’application n’en transmet pas la révision ; utiliser un éditeur transmettant l’ETag ou la fenêtre Cloud pour une précondition portant sur la version affichée.
+
+Les erreurs des routes DAV d’écriture sont en XML `DAV:` (les refus précoces du gateway/middleware peuvent être en JSON). MKCOL sur un nom existant répond 409 ; MOVE répond 201, même pour un renommage.
 
 Les suppressions DAV de dossiers s’appliquent au contenu présent lors de l’opération, avec contrôle du sous-arbre entre aperçu interne et transaction. La confirmation utilisateur relève du gestionnaire de fichiers. La fenêtre Cloud fournit, elle, un aperçu et une confirmation explicites avant suppression récursive.
 
@@ -185,6 +187,11 @@ Les erreurs métier du stockage contiennent `error` et les identités de contrat
 | `too_many_transfers` | 429 | Limite d’intentions non expirées atteinte pour cet appareil |
 | `storage_error` | 503 | Erreur d’entrée/sortie du stockage ; aucun détail interne exposé |
 | `file_too_large` | 413 | Taille déclarée dépassant la limite configurée |
+| `root_protected` | 409 en API (403 pour certaines écritures DAV à la racine) | La racine ne peut pas être déplacée ou supprimée |
+| `invalid_destination` | 409 en API | Cycle ou destination interdite ; un en-tête Destination DAV invalide peut produire 400 |
+| `directory_not_empty` | 409 | Suppression non récursive d’un dossier occupé |
+| `tree_changed` | 412 | Sous-arbre modifié depuis l’aperçu confirmé |
+| `invalid_idempotency_key` | 400 | Clé absente ou hors format 16–128 caractères alphanumériques, `_`, `-` |
 | `not_found` | 404 | Entrée ou transfert introuvable dans le périmètre autorisé |
 
 Les refus précoces du gateway ou du middleware peuvent n’avoir que `{"error":"…"}`, sans l’enveloppe complète. **Une clé JARVIS absente ou incorrecte**, sur une route protégée par `X-Secret-Key`, donne **`401 {"detail":"Clé API invalide"}` sans champ `error`**. Les erreurs de schéma utilisent le `422` FastAPI habituel avec `detail`. Le limiteur du gateway répond 429 avec `detail` et `Retry-After`, à distinguer de `too_many_transfers`. Un client doit donc examiner le statut HTTP puis `error` ou `detail`, sans présumer que toutes les erreurs ont la même forme.
@@ -197,3 +204,5 @@ Le gateway reconstruit ses en-têtes internes et refuse les routes non prévues.
 ## Portée des jetons et conservation
 
 Un jeton cloud autorise les opérations sur tout l’espace personnel, y compris la suppression définitive des fichiers et de toutes leurs versions. Un jeton volé peut donc effacer les données ; des remplacements répétés peuvent aussi évincer les anciennes versions de l’historique plafonné. Révoquer immédiatement un appareil perdu ou compromis via `DELETE /devices/{device_id}` avec la clé JARVIS, et conserver des sauvegardes indépendantes du service. L’historique de versions ne remplace pas ces sauvegardes.
+
+Les reçus serveur (`uploads`, `mutations`, `deletions`) n’ont pas de purge automatique dans la v1 : le contrat promet leur rejeu après redémarrage et après suppression. Les retirer sans nouveau mécanisme d’expiration pourrait transformer un ancien rejeu en nouvelle création et ressusciter un nom supprimé. Ce stockage de métadonnées croît donc avec les opérations ; le nettoyage à 24 h du panneau concerne uniquement son historique local et ne change pas cette garantie. Une rétention serveur bornée demandera un contrat d’expiration explicite avant activation.

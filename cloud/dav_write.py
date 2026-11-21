@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import re
+import shutil
 from urllib.parse import unquote, urlsplit
 import uuid
 
@@ -74,13 +75,34 @@ def finish_intent(store, device, upload, size, digest):
                    (json.dumps(spec, sort_keys=True, separators=(',', ':')), upload))
 
 
+def reserve_intent(store, device, upload, size):
+    """Unknown-length PUTs reserve only received chunks, atomically under quota."""
+    with store._upload_lock(upload), store.transaction() as db:
+        row = store._get_upload(db, device, upload)
+        store._pending(row)
+        spec = json.loads(row['spec'])
+        growth = size - spec['size']
+        if growth <= 0:
+            return
+        if size > store.settings.max_file:
+            raise CloudError('file_too_large', 413)
+        reserved = store._reserved(db)
+        if store._usage(db) + reserved + growth > store.settings.quota:
+            raise CloudError('quota_exceeded', 507)
+        if shutil.disk_usage(store.root).free < 2 * (reserved + growth) + 1024**2:
+            raise CloudError('storage_full', 507)
+        spec['size'] = size
+        db.execute('UPDATE uploads SET spec=? WHERE id=?',
+                   (json.dumps(spec, sort_keys=True, separators=(',', ':')), upload))
+
+
 async def put(store, device, path, request):
     parent, name = await run_in_threadpool(target, store, path)
     entry = await run_in_threadpool(current, store, path)
     if entry and entry['kind'] != 'file':
         raise CloudError('not_a_file', 409)
     match = match_header(request.headers.get('if-match'))
-    if match:
+    if match is not None:
         if not entry or (match != '*' and match != '"' + entry['revision'] + '"'):
             raise CloudError('version_conflict', 412)
     if request.headers.get('if-none-match') == '*' and entry:
@@ -89,7 +111,7 @@ async def put(store, device, path, request):
         declared = int(request.headers['content-length']) if 'content-length' in request.headers else None
     except ValueError:
         raise CloudError('invalid_length') from None
-    size = declared if declared is not None else store.settings.max_file
+    size = declared if declared is not None else 0
     if not 0 <= size <= store.settings.max_file:
         raise CloudError('file_too_large', 413)
     spec = dict(parent_id=parent['id'], parent_revision=parent['revision'], name=name, size=size,
@@ -101,8 +123,12 @@ async def put(store, device, path, request):
     published = False
     try:
         async with asyncio.timeout(3600):
-            async for data in bounded_dav_stream(request.scope, request.receive, limit=size):
+            async for data in bounded_dav_stream(request.scope, request.receive, limit=declared if declared is not None else store.settings.max_file):
                 total += len(data)
+                if declared is None:
+                    reserved_size = min(store.settings.max_file,
+                                        ((total + store.settings.chunk_size - 1) // store.settings.chunk_size) * store.settings.chunk_size)
+                    await run_in_threadpool(reserve_intent, store, device, upload, reserved_size)
                 digest.update(data)
                 # Copy at most one configured chunk into our accumulation buffer.
                 offset = 0

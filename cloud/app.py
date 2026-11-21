@@ -15,7 +15,7 @@ from starlette.middleware.wsgi import WSGIMiddleware
 from starlette.background import BackgroundTask
 
 from cloud.storage import CloudError, Settings, Store
-from cloud.body_limit import DavBodyLimit
+from cloud.body_limit import DavBodyLimit, JsonBodyLimit
 
 PART_CLEANUP_INTERVAL = 30
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ class Upload(Directory):
 
 
 class Move(Directory):
-    pass
+    parent_id: str = Field(max_length=64)
 
 
 class Removal(Model):
@@ -104,7 +104,7 @@ def create_app(settings=None, internal_key=None):
         supplied = request.headers.get('X-Cloud-Internal-Key', '')
         if not supplied or not hmac.compare_digest(key, supplied):
             return JSONResponse({'error': 'authentication_required'}, status_code=401)
-        if request.method in ('POST', 'PUT', 'PATCH'):
+        if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
             limit = (settings.max_file if settings.dav_write and request.method == 'PUT' and request.url.path.startswith('/cloud/dav/')
                      else settings.chunk_size if '/chunks/' in request.url.path else 8192)
             # Count streamed bodies too: Content-Length alone is not a size limit.
@@ -259,4 +259,5 @@ def create_app(settings=None, internal_key=None):
     from cloud.dav import application
     app.mount('/cloud/dav', WSGIMiddleware(application(store)))
     app.add_middleware(DavBodyLimit, allow_put=settings.dav_write)
+    app.add_middleware(JsonBodyLimit)
     return app

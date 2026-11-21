@@ -5,6 +5,7 @@ from starlette.responses import JSONResponse
 
 DAV_BODY_BYTES = 8192
 DAV_BODY_TIMEOUT = 5
+DAV_UPLOAD_TIMEOUT = 3600
 
 
 class BodyRejected(Exception):
@@ -68,7 +69,33 @@ class DavBodyLimit:
         return await self.app(scope, replay, send)
 
 
-async def bounded_dav_stream(scope, receive, limit, timeout=60):
+class JsonBodyLimit:
+    """Bound small API bodies before FastAPI parses JSON or resolves auth."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (scope['type'] != 'http' or not scope.get('path', '').startswith('/api/cloud/v1/')
+                or scope.get('method') not in ('POST', 'PATCH', 'DELETE')):
+            return await self.app(scope, receive, send)
+        try:
+            body = await bounded_dav_body(scope, receive)
+        except BodyRejected as exc:
+            return await JSONResponse({'error': exc.code}, status_code=exc.status,
+                                      headers={'Cache-Control': 'no-store'})(scope, receive, send)
+        delivered = False
+
+        async def replay():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {'type': 'http.request', 'body': body, 'more_body': False}
+            return await receive()
+
+        return await self.app(scope, replay, send)
+
+
+async def bounded_dav_stream(scope, receive, limit, timeout=60, total_timeout=DAV_UPLOAD_TIMEOUT):
     """PUT streaming: cap bytes and idle time without collecting the file."""
     try:
         length = int(dict(scope.get('headers', [])).get(b'content-length', b'0'))
@@ -77,9 +104,13 @@ async def bounded_dav_stream(scope, receive, limit, timeout=60):
     if length < 0 or length > limit:
         raise BodyRejected('body_too_large', 413)
     total = 0
+    deadline = asyncio.get_running_loop().time() + total_timeout
     while True:
         try:
-            message = await asyncio.wait_for(receive(), timeout)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError
+            message = await asyncio.wait_for(receive(), min(timeout, remaining))
         except TimeoutError:
             raise BodyRejected('body_timeout', 408) from None
         if message['type'] == 'http.disconnect':
